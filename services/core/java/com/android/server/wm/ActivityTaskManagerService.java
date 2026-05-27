@@ -393,6 +393,9 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
     /** The starting activities which are waiting for their processes to attach. */
     final ArrayList<ActivityRecord> mStartingProcessActivities = new ArrayList<>();
 
+    /** Display IDs registered as Agent displays, exempt from singleTask reuse. */
+    final ArraySet<Integer> mAgentDisplayIds = new ArraySet<>();
+
     /* Global service lock used by the package the owns this service. */
     final WindowManagerGlobalLock mGlobalLock = new WindowManagerGlobalLock();
     /**
@@ -7696,5 +7699,24 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
                     && !isArc && !isTv;
         }
         return sIsPip2ExperimentEnabled;
+    }
+
+    /** @hide */
+    public void registerAgentDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+            mAgentDisplayIds.add(displayId);
+        }
+    }
+
+    /** @hide */
+    public void unregisterAgentDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+            mAgentDisplayIds.remove(displayId);
+        }
+    }
+
+    /** @hide */
+    boolean isAgentDisplay(int displayId) {
+        return displayId != 0; // TEMP: all non-primary displays are agent displays
     }
 }

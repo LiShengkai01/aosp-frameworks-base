@@ -58,6 +58,7 @@ import static android.os.Process.INVALID_UID;
 import static android.security.Flags.preventIntentRedirectAbortOrThrowException;
 import static android.security.Flags.preventIntentRedirectShowToast;
 import static android.view.Display.DEFAULT_DISPLAY;
+import static android.view.Display.INVALID_DISPLAY;
 import static android.view.WindowManager.TRANSIT_FLAG_AVOID_MOVE_TO_FRONT;
 import static android.view.WindowManager.TRANSIT_OPEN;
 import static android.window.TaskFragmentOperation.OP_TYPE_START_ACTIVITY_IN_TASK_FRAGMENT;
@@ -3030,6 +3031,12 @@ class ActivityStarter {
         // an explicit task to launch in to, and we can find a task that was started with this
         // same component, then instead of launching bring that one to the front.
         putIntoExistingTask &= mInTask == null && mStartActivity.resultTo == null;
+        // Agent Display exemption: allow new singleTask instance on agent displays.
+        if (putIntoExistingTask && mOptions != null
+                && mOptions.getLaunchDisplayId() != INVALID_DISPLAY
+                && mService.isAgentDisplay(mOptions.getLaunchDisplayId())) {
+            return null;
+        }
         ActivityRecord intentActivity = null;
         if (putIntoExistingTask) {
             if (LAUNCH_SINGLE_INSTANCE == mLaunchMode) {
