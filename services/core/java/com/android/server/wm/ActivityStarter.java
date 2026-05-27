@@ -51,6 +51,7 @@ import static android.content.pm.ActivityInfo.DOCUMENT_LAUNCH_ALWAYS;
 import static android.content.pm.ActivityInfo.FLAG_SHOW_FOR_ALL_USERS;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE_PER_TASK;
+import static android.content.pm.ActivityInfo.LAUNCH_MULTIPLE;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_TASK;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_TOP;
 import static android.content.pm.ActivityInfo.launchModeToString;
@@ -2742,6 +2743,20 @@ class ActivityStarter {
         mPreferredWindowingMode = mLaunchParams.mWindowingMode;
 
         mLaunchMode = r.launchMode;
+
+        // Agent Display: force MULTIPLE_TASK on agent displays to ensure a new task
+        // is created instead of reusing existing one (via taskAffinity or singleTask).
+        final int preferredDisplayId = mPreferredTaskDisplayArea != null
+                ? mPreferredTaskDisplayArea.getDisplayId() : -1;
+        final boolean isAgent = mService.isAgentDisplay(preferredDisplayId);
+        Slog.i("AgentDisplay", "setInitialState: activity=" + r.shortComponentName
+                + " displayId=" + preferredDisplayId + " isAgent=" + isAgent
+                + " origLaunchMode=" + r.launchMode);
+        if (isAgent) {
+            mLaunchMode = LAUNCH_MULTIPLE;
+            mLaunchFlags |= FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_MULTIPLE_TASK;
+            Slog.i("AgentDisplay", "Overriding to LAUNCH_MULTIPLE + MULTIPLE_TASK");
+        }
 
         mLaunchFlags = adjustLaunchFlagsToDocumentMode(
                 r, LAUNCH_SINGLE_INSTANCE == mLaunchMode,
