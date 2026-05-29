@@ -312,6 +312,12 @@ void RenderProxy::dumpProfileInfo(int fd, int dumpFlags) {
     });
 }
 
+void RenderProxy::dumpDisplayList(int fd) {
+    mRenderThread.queue().runSync([&]() {
+        mContext->dumpDisplayList(fd);
+    });
+}
+
 void RenderProxy::resetProfileInfo() {
     mRenderThread.queue().runSync([this]() {
         std::lock_guard lock(mRenderThread.getJankDataMutex());

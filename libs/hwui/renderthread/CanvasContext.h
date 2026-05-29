@@ -173,6 +173,7 @@ public:
     std::mutex& profilerLock() { return mFrameInfoMutex; }
 
     void dumpFrames(int fd);
+    void dumpDisplayList(int fd);
     void resetFrameStats();
 
     void setName(const std::string&& name);

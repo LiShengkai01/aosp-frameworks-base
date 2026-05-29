@@ -119,6 +119,7 @@ public:
     void notifyGpuLoadUp();
 
     void dumpProfileInfo(int fd, int dumpFlags);
+    void dumpDisplayList(int fd);
     // Not exported, only used for testing
     void resetProfileInfo();
     uint32_t frameTimePercentile(int p);

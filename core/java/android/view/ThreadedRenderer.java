@@ -670,6 +670,13 @@ public final class ThreadedRenderer extends HardwareRenderer {
      */
     void dumpGfxInfo(PrintWriter pw, FileDescriptor fd, String[] args) {
         pw.flush();
+        // Check if displaylist dump is requested: 'dumpsys gfxinfo <pkg> displaylist'
+        for (String arg : args) {
+            if ("displaylist".equals(arg)) {
+                dumpDisplayList(fd);
+                return;
+            }
+        }
         dumpProfileInfo(fd, dumpArgsToFlags(args));
     }
 

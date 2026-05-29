@@ -17,6 +17,7 @@
 #include "CanvasContext.h"
 
 #include <apex/window.h>
+#include <cstdio>
 #include <fcntl.h>
 
 #ifdef __ANDROID__
@@ -47,6 +48,8 @@
 #include "pipeline/skia/SkiaGpuPipeline.h"
 #include "pipeline/skia/SkiaOpenGLPipeline.h"
 #include "pipeline/skia/SkiaVulkanPipeline.h"
+#include "pipeline/skia/RenderNodeDrawable.h"
+#include "pipeline/skia/FlatExportOpsCanvas.h"
 #include "thread/CommonPool.h"
 #include "utils/GLUtils.h"
 #include "utils/TimeUtils.h"
@@ -1075,6 +1078,51 @@ DeferredLayerUpdater* CanvasContext::createTextureLayer() {
 void CanvasContext::dumpFrames(int fd) {
     mJankTracker.dumpStats(fd);
     mJankTracker.dumpFrames(fd);
+}
+
+void CanvasContext::dumpDisplayList(int fd) {
+    // Use the same render path as GPU rendering (SkiaPipeline::renderFrameImpl)
+    // to ensure we capture every RenderNode in the tree, including nested
+    // HardwareLayers and child RenderNodes that don't appear in mRootNode's
+    // own DisplayList.
+    //
+    // RenderNodeDrawable.draw() recursively traverses the entire subtree by
+    // replaying each node's DisplayList ops onto the canvas. The default
+    // SkCanvas::onDrawDrawable() inlines each drawable into the current
+    // canvas via drawable->draw(this), giving us full visibility into the
+    // tree even when complex apps use HardwareLayers.
+    std::ostringstream oss;
+    oss << "{\"frame\":\"flat_render\",\"width\":" << mLastFrameWidth
+        << ",\"height\":" << mLastFrameHeight
+        << ",\"nodes\":[";
+
+    int width = std::max(mLastFrameWidth, 1);
+    int height = std::max(mLastFrameHeight, 1);
+
+    bool firstNode = true;
+    for (const sp<RenderNode>& node : mRenderNodes) {
+        if (!firstNode) oss << ",";
+        firstNode = false;
+        oss << "{\"name\":\"" << node->getName() << "\",\"ops\":[";
+        if (!node->nothingToDraw()) {
+            // Create a FlatExportOpsCanvas with frame dimensions. SkCanvas with
+            // explicit dimensions creates a "no-draw" canvas where draw ops
+            // route through onDraw* virtuals (our overrides) without any GPU
+            // rasterization.
+            skiapipeline::FlatExportOpsCanvas canvas(oss, width, height);
+            // Wrap the RenderNode in a RenderNodeDrawable and force-draw onto
+            // our canvas. forceDraw() is what SkiaPipeline uses internally;
+            // it handles RenderLayer composition and recursively renders
+            // child RenderNodes by calling canvas->drawDrawable(child), which
+            // our FlatExportOpsCanvas captures as nested drawDrawable ops.
+            skiapipeline::RenderNodeDrawable drawable(node.get(), &canvas, false);
+            drawable.forceDraw(&canvas);
+        }
+        oss << "]}";
+    }
+    oss << "]}\n";
+    std::string result = oss.str();
+    dprintf(fd, "%s", result.c_str());
 }
 
 void CanvasContext::resetFrameStats() {

@@ -165,6 +165,7 @@ public:
     void draw(SkCanvas* canvas) { mDisplayList.draw(canvas); }
 
     void output(std::ostream& output, uint32_t level) const;
+    void exportOps(std::ostream& output, uint32_t level) const;
 
     LinearAllocator allocator;
 

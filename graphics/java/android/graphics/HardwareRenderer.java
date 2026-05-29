@@ -950,6 +950,16 @@ public class HardwareRenderer {
     }
 
     /**
+     * Dumps the current DisplayList ops as structured JSON to the given file descriptor.
+     * This outputs the raw rendering operations (drawRect, drawText, drawImage, etc.)
+     * with full parameters, not the View tree or accessibility information.
+     * @hide
+     */
+    public void dumpDisplayList(FileDescriptor fd) {
+        nDumpDisplayList(mNativeProxy, fd);
+    }
+
+    /**
      * To avoid unnecessary overdrawing of the main content all additionally passed render nodes
      * will be prevented to overdraw this area. It will be synchronized with the draw call.
      * This should be updated in the content view's draw call.
@@ -1670,6 +1680,8 @@ public class HardwareRenderer {
 
     private static native void nDumpProfileInfo(long nativeProxy, FileDescriptor fd,
             @DumpFlags int dumpFlags);
+
+    private static native void nDumpDisplayList(long nativeProxy, FileDescriptor fd);
 
     private static native void nDumpGlobalProfileInfo(FileDescriptor fd, @DumpFlags int dumpFlags);
 

@@ -22,6 +22,7 @@
 // clang-format off
 #include "FunctorDrawable.h" // Must be included before DumpOpsCanvas.h
 #include "DumpOpsCanvas.h"
+#include "ExportOpsCanvas.h"
 // clang-format on
 #include "SkiaPipeline.h"
 #include "TreeInfo.h"
@@ -189,6 +190,11 @@ void SkiaDisplayList::reset() {
 
 void SkiaDisplayList::output(std::ostream& output, uint32_t level) const {
     DumpOpsCanvas canvas(output, level, *this);
+    mDisplayList.draw(&canvas);
+}
+
+void SkiaDisplayList::exportOps(std::ostream& output, uint32_t level) const {
+    ExportOpsCanvas canvas(output, level, *this);
     mDisplayList.draw(&canvas);
 }
 

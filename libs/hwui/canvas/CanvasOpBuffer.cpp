@@ -35,6 +35,10 @@ void CanvasOpBuffer::output(std::ostream& output, uint32_t level) const {
     LOG_ALWAYS_FATAL("TODO");
 }
 
+void CanvasOpBuffer::exportOps(std::ostream& output, uint32_t level) const {
+    LOG_ALWAYS_FATAL("TODO");
+}
+
 bool CanvasOpBuffer::prepareListAndChildren(
             TreeObserver& observer, TreeInfo& info, bool functorsNeedLayer,
             std::function<void(RenderNode*, TreeObserver&, TreeInfo&, bool)> childFn) {

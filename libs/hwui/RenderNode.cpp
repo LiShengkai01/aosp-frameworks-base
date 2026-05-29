@@ -112,6 +112,10 @@ void RenderNode::output(std::ostream& output, uint32_t level) {
     output << std::endl;
 }
 
+void RenderNode::exportDisplayList(std::ostream& output, uint32_t level) const {
+    mDisplayList.exportOps(output, level);
+}
+
 void RenderNode::visit(std::function<void(const RenderNode&)> func) const {
     func(*this);
     if (mDisplayList) {

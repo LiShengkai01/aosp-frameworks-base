@@ -105,6 +105,7 @@ public:
     void discardStagingDisplayList();
 
     void output();
+    void exportDisplayList(std::ostream& output, uint32_t level) const;
     int getUsageSize();
     int getAllocatedSize();
 
