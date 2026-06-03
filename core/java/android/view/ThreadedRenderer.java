@@ -799,6 +799,31 @@ public final class ThreadedRenderer extends HardwareRenderer {
      * @param view The view to draw.
      * @param attachInfo AttachInfo tied to the specified view.
      */
+    /**
+     * Agent no-draw sync: record the View tree's DisplayList and sync it to the
+     * RenderThread (staging->active) but skip the GPU draw. Mirrors {@link #draw}
+     * minus the actual frame draw, giving an up-to-date DisplayList with zero
+     * GPU/SurfaceFlinger work.
+     */
+    void syncForAgent(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
+        attachInfo.mViewRootImpl.mViewFrameInfo.markDrawStart();
+        updateRootDisplayList(view, callbacks);
+        if (attachInfo.mPendingAnimatingRenderNodes != null) {
+            final int count = attachInfo.mPendingAnimatingRenderNodes.size();
+            for (int i = 0; i < count; i++) {
+                registerAnimatingRenderNode(
+                        attachInfo.mPendingAnimatingRenderNodes.get(i));
+            }
+            attachInfo.mPendingAnimatingRenderNodes.clear();
+            attachInfo.mPendingAnimatingRenderNodes = null;
+        }
+        final FrameInfo frameInfo = attachInfo.mViewRootImpl.getUpdatedFrameInfo();
+        // Skip GPU draw; the DrawFrameTask still runs syncFrameState which pushes the
+        // staging DisplayList to active.
+        setSyncOnlyNextFrame();
+        syncAndDrawFrame(frameInfo);
+    }
+
     void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
         attachInfo.mViewRootImpl.mViewFrameInfo.markDrawStart();
 

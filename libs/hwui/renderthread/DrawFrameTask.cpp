@@ -107,6 +107,13 @@ void DrawFrameTask::run() {
         canDrawThisFrame = !info.out.skippedFrameReason.has_value();
         solelyTextureViewUpdates = info.out.solelyTextureViewUpdates;
 
+        // Agent no-draw mode: the staging DisplayList has been synced to active
+        // by syncFrameState above; skip the GPU draw entirely (zero GPU/SF work).
+        if (mSyncOnlyFrame) {
+            canDrawThisFrame = false;
+            mSyncOnlyFrame = false;
+        }
+
         if (mFrameCommitCallback) {
             mContext->addFrameCommitListener(std::move(mFrameCommitCallback));
             mFrameCommitCallback = nullptr;

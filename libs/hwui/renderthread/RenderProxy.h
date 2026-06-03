@@ -92,6 +92,7 @@ public:
     void setRenderSdrHdrRatio(float ratio);
     int64_t* frameInfo();
     void forceDrawNextFrame();
+    void setSyncOnlyNextFrame();
     int syncAndDrawFrame();
     void destroy();
 

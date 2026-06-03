@@ -96,6 +96,9 @@ public:
 
     void forceDrawNextFrame() { mForceDrawFrame = true; }
 
+    // Agent no-draw mode: sync the staging DisplayList to active but skip GPU draw.
+    void setSyncOnlyNextFrame() { mSyncOnlyFrame = true; }
+
     void setHardwareBufferRenderParams(const HardwareBufferRenderParams& params) {
         mHardwareBufferParams = params;
     }
@@ -132,6 +135,7 @@ private:
     std::function<void()> mFrameCompleteCallback;
 
     bool mForceDrawFrame = false;
+    bool mSyncOnlyFrame = false;
 };
 
 } /* namespace renderthread */

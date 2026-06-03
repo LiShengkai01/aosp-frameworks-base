@@ -182,6 +182,10 @@ int RenderProxy::syncAndDrawFrame() {
     return mDrawFrameTask.drawFrame();
 }
 
+void RenderProxy::setSyncOnlyNextFrame() {
+    mDrawFrameTask.setSyncOnlyNextFrame();
+}
+
 void RenderProxy::destroy() {
     // destroyCanvasAndSurface() needs a fence as when it returns the
     // underlying BufferQueue is going to be released from under

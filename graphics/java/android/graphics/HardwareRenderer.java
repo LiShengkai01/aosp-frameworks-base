@@ -960,6 +960,16 @@ public class HardwareRenderer {
     }
 
     /**
+     * Marks the next frame to sync the staging DisplayList to active but skip the
+     * GPU draw (zero GPU/SurfaceFlinger work). Used by the agent no-draw path so a
+     * forced traversal updates the DisplayList without rasterizing.
+     * @hide
+     */
+    public void setSyncOnlyNextFrame() {
+        nSetSyncOnlyNextFrame(mNativeProxy);
+    }
+
+    /**
      * To avoid unnecessary overdrawing of the main content all additionally passed render nodes
      * will be prevented to overdraw this area. It will be synchronized with the draw call.
      * This should be updated in the content view's draw call.
@@ -1682,6 +1692,7 @@ public class HardwareRenderer {
             @DumpFlags int dumpFlags);
 
     private static native void nDumpDisplayList(long nativeProxy, FileDescriptor fd);
+    private static native void nSetSyncOnlyNextFrame(long nativeProxy);
 
     private static native void nDumpGlobalProfileInfo(FileDescriptor fd, @DumpFlags int dumpFlags);
 

@@ -420,6 +420,12 @@ static void android_view_ThreadedRenderer_dumpDisplayList(JNIEnv* env, jobject c
     proxy->dumpDisplayList(fd);
 }
 
+static void android_view_ThreadedRenderer_setSyncOnlyNextFrame(JNIEnv* env, jobject clazz,
+        jlong proxyPtr) {
+    RenderProxy* proxy = reinterpret_cast<RenderProxy*>(proxyPtr);
+    proxy->setSyncOnlyNextFrame();
+}
+
 static void android_view_ThreadedRenderer_dumpGlobalProfileInfo(JNIEnv* env, jobject clazz,
                                                                 jobject javaFileDescriptor,
                                                                 jint dumpFlags) {
@@ -1032,6 +1038,8 @@ static const JNINativeMethod gMethods[] = {
          (void*)android_view_ThreadedRenderer_dumpProfileInfo},
         {"nDumpDisplayList", "(JLjava/io/FileDescriptor;)V",
          (void*)android_view_ThreadedRenderer_dumpDisplayList},
+        {"nSetSyncOnlyNextFrame", "(J)V",
+         (void*)android_view_ThreadedRenderer_setSyncOnlyNextFrame},
         {"nDumpGlobalProfileInfo", "(Ljava/io/FileDescriptor;I)V",
          (void*)android_view_ThreadedRenderer_dumpGlobalProfileInfo},
         {"setupShadersDiskCache", "(Ljava/lang/String;Ljava/lang/String;)V",

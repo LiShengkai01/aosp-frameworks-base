@@ -649,6 +649,51 @@ public final class WindowManagerGlobal {
         FileOutputStream fout = new FileOutputStream(fd);
         PrintWriter pw = new FastPrintWriter(fout);
         try {
+            // 'dumpsys gfxinfo <pkg> displaylist fresh [nodraw] [vsync[N]] [reset]':
+            // fresh     -> force on-demand traversal (dual-phase: settle then record)
+            // nodraw    -> skip GPU draw (sync-only, zero GPU/SF)
+            // vsyncN    -> pump up to N synthetic VSYNC frames during Phase 1 settle
+            // freeze    -> freeze agent window (stop real-VSYNC-driven self-rendering)
+            // unfreeze  -> unfreeze agent window
+            // reset     -> reset per-window agent profiling counters before fresh
+            boolean fresh = false, noDraw = false, reset = false;
+            int vsyncFrames = 0;
+            int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
+            for (String arg : args) {
+                if ("fresh".equals(arg)) fresh = true;
+                else if ("nodraw".equals(arg)) noDraw = true;
+                else if ("reset".equals(arg)) reset = true;
+                else if ("freeze".equals(arg)) freeze = 1;
+                else if ("unfreeze".equals(arg)) freeze = -1;
+                else if (arg.startsWith("vsync")) {
+                    String n = arg.substring(5);
+                    try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
+                    catch (NumberFormatException e) { vsyncFrames = 3; }
+                }
+            }
+            if (fresh || freeze != 0 || reset) {
+                final ViewRootImpl[] roots;
+                synchronized (mLock) {
+                    roots = mRoots.toArray(new ViewRootImpl[0]);
+                }
+                final boolean nd = noDraw;
+                final int vf = vsyncFrames;
+                final int fz = freeze;
+                final boolean doFresh = fresh;
+                final boolean doReset = reset;
+                for (final ViewRootImpl root : roots) {
+                    try {
+                        root.mHandler.runWithScissors(() -> {
+                            if (doReset) root.resetAgentStats();
+                            if (fz == 1) root.setAgentFrozen(true);
+                            if (doFresh) root.forceTraversalForAgent(nd, vf);
+                            if (fz == -1) root.setAgentFrozen(false);
+                        }, 2000);
+                    } catch (Exception e) {
+                        // Best-effort; fall through to dumping whatever is current.
+                    }
+                }
+            }
             synchronized (mLock) {
                 final int count = mViews.size();
 
@@ -657,7 +702,10 @@ public final class WindowManagerGlobal {
                 for (int i = 0; i < count; i++) {
                     ViewRootImpl root = mRoots.get(i);
                     String name = getWindowName(root);
-                    pw.printf("\n\t%s (visibility=%d)", name, root.getHostVisibility());
+                    // Append agent profiling stats to the window header so the agent
+                    // can parse settled/traversal counts per window without extra RPCs.
+                    pw.printf("\n\t%s (visibility=%d)%s", name, root.getHostVisibility(),
+                            root.getAgentStatsJson());
 
                     ThreadedRenderer renderer =
                             root.getView().mAttachInfo.mThreadedRenderer;

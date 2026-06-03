@@ -1191,6 +1191,27 @@ public final class Choreographer {
         }
     }
 
+    /**
+     * Synthetic VSYNC pump for agent on-demand traversal. Runs the full doFrame
+     * callback chain (INPUT/ANIMATION/INSETS_ANIMATION/TRAVERSAL/COMMIT) on the UI
+     * thread without waiting for a real display VSYNC. This advances animations,
+     * frame callbacks and content (image decode commits, lazy-load) so the recorded
+     * DisplayList reflects settled content even while the display is STATE_OFF.
+     * Must be called on this Choreographer's looper thread.
+     * @hide
+     */
+    public void doFrameForAgent() {
+        final long now = System.nanoTime();
+        synchronized (mLock) {
+            // doFrame early-returns "no work to do" unless a frame is scheduled.
+            mFrameScheduled = true;
+        }
+        DisplayEventReceiver.VsyncEventData data = new DisplayEventReceiver.VsyncEventData();
+        // ~60Hz interval; a real value (not -1) so jitter/timeline logic stays sane.
+        data.frameInterval = 16_666_666L;
+        doFrame(now, 0, data);
+    }
+
     void doScheduleVsync() {
         synchronized (mLock) {
             if (mFrameScheduled) {

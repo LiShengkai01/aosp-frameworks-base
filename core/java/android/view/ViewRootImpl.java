@@ -727,6 +727,27 @@ public final class ViewRootImpl implements ViewParent,
     /** Set to true while in performTraversals for detecting when die(true) is called from internal
      * callbacks such as onMeasure, onPreDraw, onDraw and deferring doDie() until later. */
     boolean mIsInTraversal;
+    // Agent forced-traversal no-draw mode: record DisplayList + sync staging->active,
+    // but skip GPU draw (zero GPU/SF). Set only on the UI thread for the duration of
+    // a forceTraversalForAgent() call.
+    boolean mAgentNoDraw;
+    // Agent freeze: when true this window stops scheduling its own traversal/draw on
+    // real VSYNC (app self-rendering for this window halts, zero GPU). The agent still
+    // updates the DisplayList on demand via forceTraversalForAgent(), which calls
+    // performTraversals() directly. Gated to agent displays only (never the main display).
+    boolean mAgentFrozen;
+    // Agent dual-phase: skip draw-command recording in Phase 1 (measure+layout only).
+    boolean mAgentSkipRecord;
+    // Per-window invalidate counter: incremented on every invalidate() call.
+    // Used by forceTraversalForAgent to detect when the view tree has settled.
+    long mAgentDirtyTick;
+    // Per-window profiling counters for E3 experiment (reset via 'fresh reset').
+    // mAgentPhase1Count: measure+layout-only traversals during settle phase.
+    // mAgentPhase2Count: full record traversals (one per forceTraversalForAgent call).
+    // mAgentSettled: true if the last call exited via early-break, false if bound was hit.
+    int mAgentPhase1Count;
+    int mAgentPhase2Count;
+    boolean mAgentSettled;
     boolean mApplyInsetsRequested;
     boolean mLayoutRequested;
     boolean mFirst;
@@ -2609,6 +2630,7 @@ public final class ViewRootImpl implements ViewParent,
     @UnsupportedAppUsage
     void invalidate() {
         mDirty.set(0, 0, mWidth, mHeight);
+        mAgentDirtyTick++;
         if (!mWillDrawSoon) {
             scheduleTraversals();
         }
@@ -3040,6 +3062,11 @@ public final class ViewRootImpl implements ViewParent,
 
     @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.R, trackingBug = 170729553)
     void scheduleTraversals() {
+        // Agent-frozen window: do not subscribe to real VSYNC / schedule traversal.
+        // The DisplayList is advanced only on demand via forceTraversalForAgent().
+        if (mAgentFrozen) {
+            return;
+        }
         if (!mTraversalScheduled) {
             mTraversalScheduled = true;
             mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
@@ -3075,6 +3102,153 @@ public final class ViewRootImpl implements ViewParent,
                 mProfile = false;
             }
         }
+    }
+
+    /**
+     * Force a single measure/layout/draw-record traversal on demand, bypassing VSYNC.
+     * When {@code noDraw} is true the DisplayList is recorded and synced to the
+     * RenderThread but the GPU draw is skipped (zero GPU/SurfaceFlinger work), which
+     * is what lets an agent read a fresh DisplayList from an unbound or STATE_OFF
+     * display. Must be called on the UI thread (use mHandler.runWithScissors from
+     * other threads).
+     * @hide
+     */
+    public void forceTraversalForAgent(boolean noDraw) {
+        forceTraversalForAgent(noDraw, 0);
+    }
+
+    /**
+     * Force on-demand traversal with an optional fake-VSYNC pump (dual-phase).
+     *
+     * <p><b>Phase 1 (settle):</b> Repeatedly synthesizes frame-clock signals via
+     * {@link Choreographer#doFrameForAgent} and runs measure+layout (skipping
+     * drawing-command recording) until the view tree settles—no new invalidation,
+     * no pending layout, no active hardware animations—or until {@code vsyncFrames}
+     * synthetic frames have been delivered, whichever comes first. This advances
+     * property animations, frame callbacks, and async content while paying only the
+     * CPU cost of measure and layout per iteration.
+     *
+     * <p><b>Phase 2 (record):</b> A single full traversal records drawing commands
+     * into the DisplayList and syncs to the RenderThread. {@code noDraw} keeps the
+     * renderer in sync-only mode (zero GPU/SurfaceFlinger work).
+     *
+     * <p>Must be called on the UI thread.
+     * @hide
+     */
+    public void forceTraversalForAgent(boolean noDraw, int vsyncFrames) {
+        if (mView == null || !mAdded || mIsInTraversal) {
+            return;
+        }
+        final boolean prevNoDraw = mAgentNoDraw;
+        final boolean prevSkipRecord = mAgentSkipRecord;
+        try {
+            // === Phase 1: pump animations + settle view tree (no DL recording) ===
+            mAgentNoDraw = true;
+            mAgentSkipRecord = true;
+            long lastTick = mAgentDirtyTick;
+            boolean settled = true;
+
+            for (int i = 0; i < vsyncFrames; i++) {
+                mChoreographer.doFrameForAgent();
+                // Run full traversal (measure+layout) to consume any invalidate/requestLayout
+                // produced by animation callbacks; performDraw returns immediately due to
+                // mAgentSkipRecord.
+                if (mTraversalScheduled) {
+                    mTraversalScheduled = false;
+                    mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+                }
+                mFullRedrawNeeded = true;
+                performTraversals();
+                mAgentPhase1Count++;
+
+                // Stability check: no new invalidation since last iteration, no pending
+                // layout, no pending hardware animations.
+                if (mAgentDirtyTick == lastTick
+                        && !mLayoutRequested
+                        && (mAttachInfo == null
+                            || mAttachInfo.mPendingAnimatingRenderNodes == null
+                            || mAttachInfo.mPendingAnimatingRenderNodes.isEmpty())) {
+                    break;
+                }
+                lastTick = mAgentDirtyTick;
+                if (i == vsyncFrames - 1) settled = false;  // ran out of budget
+            }
+            mAgentSettled = settled;
+
+            // === Phase 2: view tree settled (or bound reached), record DL once ===
+            mAgentNoDraw = noDraw;
+            mAgentSkipRecord = false;
+            if (mTraversalScheduled) {
+                mTraversalScheduled = false;
+                mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+            }
+            mFullRedrawNeeded = true;
+            performTraversals();
+            mAgentPhase2Count++;
+        } finally {
+            mAgentNoDraw = prevNoDraw;
+            mAgentSkipRecord = prevSkipRecord;
+        }
+    }
+
+    /**
+     * Returns true if the view tree has no pending traversal/layout work, i.e. the
+     * DisplayList obtained right now reflects a settled UI. Note this does not detect
+     * asynchronous work (network/decode) that has not yet posted back to the UI thread.
+     * @hide
+     */
+    public boolean isViewTreeStable() {
+        return !mTraversalScheduled && !mLayoutRequested && !mIsInTraversal
+                && (mAttachInfo == null || mAttachInfo.mPendingAnimatingRenderNodes == null
+                        || mAttachInfo.mPendingAnimatingRenderNodes.isEmpty());
+    }
+
+    /**
+     * Freeze/unfreeze this window's real-VSYNC-driven self-rendering. Only honored on
+     * agent displays (never the main display 0) so the user's UI is never frozen. While
+     * frozen, scheduleTraversals() is a no-op (the app stops rendering this window on
+     * VSYNC, zero GPU); the agent advances the DisplayList on demand via
+     * forceTraversalForAgent(). Unfreezing schedules a traversal to resume normal rendering.
+     * Must be called on the UI thread.
+     * @hide
+     */
+    public void setAgentFrozen(boolean frozen) {
+        if (frozen && getDisplayId() == Display.DEFAULT_DISPLAY) {
+            return; // never freeze the main display
+        }
+        if (mAgentFrozen == frozen) {
+            return;
+        }
+        mAgentFrozen = frozen;
+        if (!frozen) {
+            scheduleTraversals();
+        }
+    }
+
+    /**
+     * Returns agent profiling stats as a compact JSON object:
+     * {"settled":bool,"phase1_traversals":N,"phase2_traversals":N}
+     * settled=true  → last forceTraversalForAgent exited via early-break (view tree stable)
+     * settled=false → ran out of vsyncFrames budget (perpetual animation or too few frames)
+     * phase1_traversals → cumulative measure+layout-only passes since last resetAgentStats()
+     * phase2_traversals → cumulative full-record passes since last resetAgentStats()
+     * @hide
+     */
+    public String getAgentStatsJson() {
+        return "{\"settled\":" + mAgentSettled
+                + ",\"phase1_traversals\":" + mAgentPhase1Count
+                + ",\"phase2_traversals\":" + mAgentPhase2Count + "}";
+    }
+
+    /**
+     * Reset per-window agent profiling counters. Called when agent passes 'reset'
+     * subparam to 'dumpsys gfxinfo ... displaylist fresh reset'.
+     * @hide
+     */
+    public void resetAgentStats() {
+        mAgentPhase1Count = 0;
+        mAgentPhase2Count = 0;
+        mAgentSettled = false;
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {
@@ -5459,6 +5633,19 @@ public final class ViewRootImpl implements ViewParent,
 
     private boolean performDraw(@Nullable SurfaceSyncGroup surfaceSyncGroup) {
         mLastPerformDrawSkippedReason = null;
+        if (mAgentSkipRecord) {
+            // Phase 1 of dual-phase agent traversal: measure+layout done, skip record entirely.
+            return true;
+        }
+        if (mAgentNoDraw) {
+            // Agent no-draw path: record the DisplayList and sync staging->active on the
+            // RenderThread, but skip the GPU draw. Works even when the display is STATE_OFF
+            // or the surface is unbound, so we deliberately bypass the screen_off guard below.
+            if (mView != null && mAttachInfo.mThreadedRenderer != null) {
+                mAttachInfo.mThreadedRenderer.syncForAgent(mView, mAttachInfo, this);
+            }
+            return true;
+        }
         if (mAttachInfo.mDisplayState == Display.STATE_OFF && !mReportNextDraw) {
             mLastPerformDrawSkippedReason = "screen_off";
             if (!mLastDrawScreenOff) {
