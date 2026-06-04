@@ -38,8 +38,10 @@ Three components spanning the windowing system and rendering pipeline:
 | `libs/hwui/jni/android_graphics_HardwareRenderer.cpp` | JNI bridge for setSyncOnlyNextFrame |
 | `libs/hwui/renderthread/DrawFrameTask.{h,cpp}` | `mSyncOnlyFrame` skips GPU draw after syncFrameState |
 | `libs/hwui/renderthread/RenderProxy.{h,cpp}` | setSyncOnlyNextFrame passthrough |
+| `libs/hwui/pipeline/skia/FlatExportOpsCanvas.h` | C2 export canvas: maps all op bounds to device (screen) space via `getLocalToDeviceAs3x3()`; emits per-run `{font, glyphs}` for external reverse-cmap |
 | `services/core/.../wm/ActivityStarter.java` | C1: detect agent display, override to LAUNCH_MULTIPLE |
 | `services/core/.../wm/ActivityTaskManagerService.java` | `isAgentDisplay()` / mAgentDisplayIds registry |
+| `tools/dlglyph/dl_glyph_decode.py` | Host-side post-processor: reverses glyph IDs back to UTF-8 via fontTools |
 
 ## Quick Start: Build & Deploy
 
@@ -92,6 +94,25 @@ Per-window header with agent stats followed by DL JSON:
 - `settled=false`: Phase 1 exhausted vsyncN budget (perpetual animation present)
 - `phase1_traversals`: cumulative measure+layout-only passes since last reset
 - `phase2_traversals`: cumulative full-record passes since last reset
+
+Each op's `bounds`/`dst` is in **device (screen) coordinates** — the export
+canvas maps every local-space input through `SkCanvas::getLocalToDeviceAs3x3()`
+at the time of capture, so rectangles can be used directly as tap targets
+without further math.
+
+`drawText` ops additionally carry the SkTextBlob's raw runs:
+
+```json
+{"op":"drawText","x":221,"y":309,"bounds":[224,322,565,355],"size":33,
+ "color":"#ff30323b",
+ "runs":[{"font":"Roboto","glyphs":[51,74,89,92,84,87,80,5,11,5,78,83,89,74,87,83,74,89]}]}
+```
+
+The framework intentionally does NOT do glyph→UTF-8 reverse-cmap inline. That
+step is a pure font-table lookup; doing it in C++ would require shipping
+GSUB/cmap logic and font fallback into HWUI for no benefit. Instead, the host
+script `tools/dlglyph/dl_glyph_decode.py` performs the reverse with `fontTools`
+(see *DisplayList Usability* section below).
 
 ## Usage Examples
 
@@ -146,6 +167,113 @@ adb shell "dumpsys gfxinfo com.example.app displaylist fresh nodraw" | \
 adb shell "dumpsys gfxinfo com.example.app" | grep "Total frames rendered"
 ```
 
+## DisplayList Usability
+
+This section quantifies what the DL representation actually delivers as an
+agent-side input, relative to screenshots and the AccessibilityService XML.
+
+### What the export captures
+
+Each `drawText`/`drawRect`/`drawPath`/`drawImage`/... op in the JSON carries:
+- **Device-space bounds** — directly usable as tap targets, no matrix math
+  on the consumer side
+- **Color** (ARGB hex), **font size**, **stroke style** where applicable
+- For text: **font family name** + **raw glyph ID array** per Skia run
+- For nested RenderNodes: hierarchical `drawDrawable.ops[...]` blocks that
+  preserve the rendering tree (incl. HardwareLayers)
+
+Three things the export does NOT carry, by design:
+1. **Image pixel content** — `drawImage` emits dst rect + source w×h only.
+   This is the only inherent limit of the DisplayList channel; agents that
+   need image semantics still need a vision model for that subregion.
+2. **View identity / clickable flags** — the op stream is a rendering view;
+   `View.isClickable()` is application semantics and belongs in a thin
+   side-channel (~50 bytes per interactive View), not in the op stream itself.
+3. **UTF-8 text** — only glyph IDs are emitted (Skia loses the source text
+   once it shapes into a TextBlob). Recovered by the host-side script below.
+
+### Glyph → UTF-8 recovery (deterministic, model-free)
+
+`tools/dlglyph/dl_glyph_decode.py` walks each `runs[]` entry and reverse-maps
+glyph IDs to Unicode codepoints via `fontTools.ttLib`. For TrueType
+Collections (Noto CJK ships as a TTC of 5 region variants), the cmaps of all
+sub-fonts are unioned under the same family name.
+
+```bash
+# One-time: pull device fonts
+adb -s <serial> pull /system/fonts/Roboto-Regular.ttf       ~/fonts/
+adb -s <serial> pull /system/fonts/NotoSansCJK-Regular.ttc  ~/fonts/
+
+# Optional: pull app-private fonts (rarely needed)
+adb -s <serial> shell pm path <pkg> | sed 's/^package://' | \
+  xargs -I {} adb -s <serial> pull {} /tmp/app.apk
+unzip -j /tmp/app.apk "assets/*.ttf" "assets/*.otf" -d ~/fonts/
+
+# Capture + decode
+adb -s <serial> exec-out "dumpsys gfxinfo <pkg> displaylist fresh nodraw" \
+  > /tmp/dl.json
+tools/dlglyph/dl_glyph_decode.py --fonts ~/fonts /tmp/dl.json \
+  -o /tmp/dl_decoded.json
+```
+
+The decoded JSON has the same structure as the raw output, with each
+`drawText` op gaining a `text` field:
+
+```json
+{"op":"drawText","bounds":[224,322,565,355],"size":33,
+ "color":"#ff30323b","text":"Network & internet", ...}
+```
+
+### Empirical recovery rate
+
+Measured on Settings home, Zhihu home, Bilibili home (Android 16 GSI, Pixel 10
+Pro) — every `drawText` op extracted, every glyph in every run reverse-mapped:
+
+| App      | Total glyphs | Recovered | Rate    |
+|----------|-------------:|----------:|--------:|
+| Settings |          735 |       735 | 100.0%  |
+| Zhihu    |          990 |       990 | 100.0%  |
+| Bilibili |          288 |       287 |  99.7%  |
+
+By font:
+
+| Font                    | Glyphs | Recovered | Rate    |
+|-------------------------|-------:|----------:|--------:|
+| Roboto (Latin/digits)   |  1,519 |     1,519 | 100.0%  |
+| Noto Sans CJK SC        |    493 |       493 | 100.0%  |
+| App-private iconfont    |      1 |         0 |   0.0%  |
+
+The single missed glyph on Bilibili comes from an in-app font name reported
+by `SkTypeface::getFamilyName()` as `"bilibili"`. The corresponding glyph is
+not present in any of the system fonts; if the app's `assets/*.ttf` is
+unpacked and supplied via `--fonts`, that gap closes too.
+
+### Known limitations (and what each costs)
+
+| Source of loss | Effect | Severity for Chinese/English UI |
+|----------------|--------|---------------------------------|
+| App-private fonts not unpacked from APK | Glyphs in that font reverse to `�` | 0.05% on the test set; fix is one-time per app |
+| GSUB ligatures (Latin `fi`, `ffi`) | Reverse yields one codepoint instead of two | Negligible — apps rarely use Latin ligatures |
+| Complex shaping (Arabic, Devanagari) | Glyph order ≠ logical char order; positional variants need GSUB reverse | Out of scope for our target apps |
+| Unicode variant codepoints (e.g. Kangxi radical "⻔" vs "门") | Decoded char is visually identical but has a different codepoint | Visual equivalence preserved; downstream string match needs normalization |
+| Image content (`drawImage`) | Only dst-rect + w/h, no pixels | Inherent to DL channel; out of scope |
+
+### What this means relative to existing channels
+
+- **vs Screenshot**: the DL op stream carries equivalent visual information
+  (modulo image internals) in structured form — a button rendered as
+  drawRRect-background + centered drawText is recognizable from the op
+  attributes the same way a VLM recognizes it from pixels, but at a fraction
+  of the token cost.
+- **vs AccessibilityService**: DL captures every glyph that is drawn,
+  including text rendered by custom `canvas.drawText` calls that the a11y
+  layer cannot see. Conversely, DL does not carry `clickable`/`focusable`
+  flags — those come from `View` state and require a thin side-channel.
+- **Limits that remain after this work**: only image pixel content (the one
+  inherent limit) and the optional `{id, clickable, role}` side-channel
+  (~50 bytes/View) the agent needs to disambiguate semantically-clickable-
+  but-visually-passive elements.
+
 ## Experiment Notes
 
 1. **Never `adb reboot`** — overlayfs is tmpfs, hard reboot loses all pushed changes.
@@ -175,6 +303,7 @@ adb shell "dumpsys gfxinfo com.example.app" | grep "Total frames rendered"
 ## Commit History
 
 ```
+ecc7907  DisplayList Export: device-space op bounds + per-run glyph IDs + reverse-cmap script
 cc6eead  Agent Rendering: on-demand DL, GPU bypass, stability detection, profiling
 bbb8b05  DisplayList Export: dump RenderNode tree as JSON for agent UI perception
 fc63e2b  Agent Display: approach B - override launchMode in setInitialState

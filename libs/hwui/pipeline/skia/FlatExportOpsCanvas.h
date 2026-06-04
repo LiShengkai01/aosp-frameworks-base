@@ -28,6 +28,8 @@
 #include <SkPath.h>
 #include <SkRegion.h>
 #include <SkPicture.h>
+#include <SkString.h>
+#include <SkTypeface.h>
 
 namespace android {
 namespace uirenderer {
@@ -41,9 +43,22 @@ namespace skiapipeline {
  * a drawable's content via drawable->draw(this), so nested RenderNodes are
  * captured recursively.
  *
+ * All bounds and points emitted are in DEVICE (screen) space:
+ * every onDrawXxx callback maps its local-space inputs through the current
+ * local-to-device matrix maintained by SkCanvas (which is updated by the
+ * save()/concat() calls RenderNodeDrawable issues as it walks the tree).
+ *
+ * For drawText, in addition to the device-space bounds/baseline, each run of
+ * the SkTextBlob is exported with its typeface family name and raw glyph IDs:
+ * an external Python script using fontTools can reverse-map glyph IDs to UTF-8
+ * by walking the font's cmap. The reverse cmap is intentionally NOT done in
+ * the framework — it is a pure data transformation that does not benefit from
+ * being inside HWUI.
+ *
  * Output format:
  *   {"op":"clipRect","bounds":[...]},
- *   {"op":"drawText","x":..,"y":..,...},
+ *   {"op":"drawText","x":..,"y":..,"bounds":[...],"size":..,"color":"..",
+ *     "runs":[{"font":"<family>","glyphs":[g1,g2,...]}, ...]},
  *   {"op":"drawDrawable","ops":[                  <- nested RenderNode
  *     {"op":"drawRect",...},
  *     {"op":"drawDrawable","ops":[...]},
@@ -60,19 +75,19 @@ protected:
     // ── State ─────────────────────────────────────────────────────────
     void onClipRect(const SkRect& rect, SkClipOp, ClipEdgeStyle) override {
         sep();
-        mOutput << indent() << "{\"op\":\"clipRect\",\"bounds\":" << rectJson(rect) << "}";
+        mOutput << indent() << "{\"op\":\"clipRect\",\"bounds\":" << rectJsonDevice(rect) << "}";
     }
 
     void onClipRRect(const SkRRect& rrect, SkClipOp, ClipEdgeStyle) override {
         sep();
-        mOutput << indent() << "{\"op\":\"clipRRect\",\"bounds\":" << rectJson(rrect.rect())
+        mOutput << indent() << "{\"op\":\"clipRRect\",\"bounds\":" << rectJsonDevice(rrect.rect())
                 << ",\"rx\":" << rrect.getSimpleRadii().x()
                 << ",\"ry\":" << rrect.getSimpleRadii().y() << "}";
     }
 
     void onClipPath(const SkPath& path, SkClipOp, ClipEdgeStyle) override {
         sep();
-        mOutput << indent() << "{\"op\":\"clipPath\",\"bounds\":" << rectJson(path.getBounds())
+        mOutput << indent() << "{\"op\":\"clipPath\",\"bounds\":" << rectJsonDevice(path.getBounds())
                 << "}";
     }
 
@@ -94,14 +109,14 @@ protected:
 
     void onDrawRect(const SkRect& rect, const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawRect\",\"bounds\":" << rectJson(rect)
+        mOutput << indent() << "{\"op\":\"drawRect\",\"bounds\":" << rectJsonDevice(rect)
                 << ",\"color\":\"" << colorHex(paint) << "\""
                 << paintStyle(paint) << "}";
     }
 
     void onDrawRRect(const SkRRect& rrect, const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawRRect\",\"bounds\":" << rectJson(rrect.rect())
+        mOutput << indent() << "{\"op\":\"drawRRect\",\"bounds\":" << rectJsonDevice(rrect.rect())
                 << ",\"rx\":" << rrect.getSimpleRadii().x()
                 << ",\"ry\":" << rrect.getSimpleRadii().y()
                 << ",\"color\":\"" << colorHex(paint) << "\""
@@ -111,46 +126,79 @@ protected:
     void onDrawDRRect(const SkRRect& outer, const SkRRect& inner,
                       const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawDRRect\",\"outer\":" << rectJson(outer.rect())
-                << ",\"inner\":" << rectJson(inner.rect())
+        mOutput << indent() << "{\"op\":\"drawDRRect\",\"outer\":" << rectJsonDevice(outer.rect())
+                << ",\"inner\":" << rectJsonDevice(inner.rect())
                 << ",\"color\":\"" << colorHex(paint) << "\"}";
     }
 
     void onDrawOval(const SkRect& rect, const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawOval\",\"bounds\":" << rectJson(rect)
+        mOutput << indent() << "{\"op\":\"drawOval\",\"bounds\":" << rectJsonDevice(rect)
                 << ",\"color\":\"" << colorHex(paint) << "\"}";
     }
 
     void onDrawArc(const SkRect& rect, SkScalar startAngle, SkScalar sweepAngle,
                    bool, const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawArc\",\"bounds\":" << rectJson(rect)
+        mOutput << indent() << "{\"op\":\"drawArc\",\"bounds\":" << rectJsonDevice(rect)
                 << ",\"start\":" << startAngle << ",\"sweep\":" << sweepAngle
                 << ",\"color\":\"" << colorHex(paint) << "\"}";
     }
 
     void onDrawPath(const SkPath& path, const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawPath\",\"bounds\":" << rectJson(path.getBounds())
+        mOutput << indent() << "{\"op\":\"drawPath\",\"bounds\":" << rectJsonDevice(path.getBounds())
                 << ",\"color\":\"" << colorHex(paint) << "\"}";
     }
 
     void onDrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y,
                         const SkPaint& paint) override {
         sep();
-        SkRect bounds = blob ? blob->bounds().makeOffset(x, y) : SkRect::MakeEmpty();
-        mOutput << indent() << "{\"op\":\"drawText\",\"x\":" << x << ",\"y\":" << y
-                << ",\"bounds\":" << rectJson(bounds)
-                << ",\"size\":" << bounds.height()
-                << ",\"color\":\"" << colorHex(paint) << "\"}";
+        // Bounds and baseline in DEVICE (screen) space.
+        SkRect localBounds = blob ? blob->bounds().makeOffset(x, y) : SkRect::MakeEmpty();
+        SkScalar bx = x, by = y;
+        pointToDevice(&bx, &by);
+        mOutput << indent() << "{\"op\":\"drawText\""
+                << ",\"x\":" << bx << ",\"y\":" << by
+                << ",\"bounds\":" << rectJsonDevice(localBounds)
+                << ",\"size\":" << localBounds.height()
+                << ",\"color\":\"" << colorHex(paint) << "\"";
+
+        // Emit raw glyph IDs per run for external Python reverse-cmap.
+        // Skia's SkTextBlob::Iter exposes typeface + glyph array per run; the
+        // run does not carry UTF-8 once shaped, hence the side-channel reverse
+        // map. Family name + glyph IDs is the minimal set required.
+        if (blob) {
+            mOutput << ",\"runs\":[";
+            bool firstRun = true;
+            SkTextBlob::Iter iter(*blob);
+            SkTextBlob::Iter::Run run;
+            while (iter.next(&run)) {
+                if (!firstRun) mOutput << ",";
+                firstRun = false;
+                SkString family;
+                if (run.fTypeface) {
+                    run.fTypeface->getFamilyName(&family);
+                }
+                mOutput << "{\"font\":\"";
+                writeEscaped(family.c_str());
+                mOutput << "\",\"glyphs\":[";
+                for (int i = 0; i < run.fGlyphCount; ++i) {
+                    if (i) mOutput << ",";
+                    mOutput << (unsigned int)run.fGlyphIndices[i];
+                }
+                mOutput << "]}";
+            }
+            mOutput << "]";
+        }
+        mOutput << "}";
     }
 
     void onDrawImageRect2(const SkImage* image, const SkRect& src, const SkRect& dst,
                           const SkSamplingOptions&, const SkPaint*,
                           SrcRectConstraint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawImage\",\"dst\":" << rectJson(dst);
+        mOutput << indent() << "{\"op\":\"drawImage\",\"dst\":" << rectJsonDevice(dst);
         if (image) {
             mOutput << ",\"w\":" << image->width() << ",\"h\":" << image->height();
         }
@@ -160,7 +208,7 @@ protected:
     void onDrawImageLattice2(const SkImage*, const Lattice&, const SkRect& dst,
                              SkFilterMode, const SkPaint*) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawImageLattice\",\"dst\":" << rectJson(dst) << "}";
+        mOutput << indent() << "{\"op\":\"drawImageLattice\",\"dst\":" << rectJsonDevice(dst) << "}";
     }
 
     void onDrawPoints(SkCanvas::PointMode, size_t count, const SkPoint[],
@@ -185,20 +233,19 @@ protected:
      * marker, preserving RenderNode hierarchy in the output. The default Skia
      * behavior (drawable->draw(this)) inlines the drawable's content through
      * our other onDrawXXX overrides, recursively handling nested RenderNodes.
+     *
+     * The drawable's own bounds are emitted in device space using the CURRENT
+     * matrix (i.e. the outer RenderNode's transform), captured BEFORE we
+     * concat the inner matrix and recurse.
      */
     void onDrawDrawable(SkDrawable* drawable, const SkMatrix* matrix) override {
         if (!drawable) return;
         sep();
-        // Use bounds for the drawable as a rough hint to the agent
         SkRect b = drawable->getBounds();
-        mOutput << indent() << "{\"op\":\"drawDrawable\",\"bounds\":" << rectJson(b)
+        mOutput << indent() << "{\"op\":\"drawDrawable\",\"bounds\":" << rectJsonDevice(b)
                 << ",\"ops\":[";
-        // Push new nesting level
         mLevel++;
         mFirstStack.push_back(true);
-        // Inline the drawable's content. drawable->draw(this) calls our
-        // onDrawXXX/onDrawDrawable overrides recursively. For RenderNodeDrawable,
-        // this traverses the entire child RenderNode subtree.
         if (matrix) {
             this->save();
             this->concat(*matrix);
@@ -207,7 +254,6 @@ protected:
         } else {
             drawable->draw(this);
         }
-        // Pop nesting level
         mFirstStack.pop_back();
         mLevel--;
         mOutput << "]}";
@@ -223,6 +269,34 @@ private:
 
     std::string indent() const {
         return std::string((mLevel + 1) * 2, ' ');
+    }
+
+    // ── Coordinate mapping helpers ────────────────────────────────────
+    //
+    // Every onDrawXxx callback runs with SkCanvas's local-to-device matrix
+    // updated by all preceding save()/concat() calls (notably the ones issued
+    // by RenderNodeDrawable while it walks the tree). We snapshot that matrix
+    // here and use it to map local geometry to device (screen) space.
+    //
+    // For pure translate+scale transforms (the common UI case), SkMatrix::mapRect
+    // is exact. For rotations/perspective, it returns the axis-aligned bounding
+    // box of the transformed quad — acceptable for agent layout reasoning.
+
+    SkMatrix currentMatrix() const {
+        return this->getLocalToDeviceAs3x3();
+    }
+
+    std::string rectJsonDevice(const SkRect& localRect) {
+        SkRect device;
+        currentMatrix().mapRect(&device, localRect);
+        return rectJson(device);
+    }
+
+    void pointToDevice(SkScalar* x, SkScalar* y) {
+        SkPoint p = {*x, *y};
+        currentMatrix().mapPoints(&p, &p, 1);
+        *x = p.fX;
+        *y = p.fY;
     }
 
     static std::string rectJson(const SkRect& r) {
@@ -246,6 +320,31 @@ private:
             return s.str();
         }
         return "";
+    }
+
+    // JSON-escape and write a C-string to mOutput. Font family names from
+    // SkTypeface are usually plain ASCII (e.g. "Roboto", "sans-serif",
+    // "NotoSerifCJK-Regular"), but guard against quotes/backslashes anyway.
+    void writeEscaped(const char* s) {
+        if (!s) return;
+        for (; *s; ++s) {
+            char c = *s;
+            switch (c) {
+                case '"':  mOutput << "\\\""; break;
+                case '\\': mOutput << "\\\\"; break;
+                case '\n': mOutput << "\\n";  break;
+                case '\r': mOutput << "\\r";  break;
+                case '\t': mOutput << "\\t";  break;
+                default:
+                    if ((unsigned char)c < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)(unsigned char)c);
+                        mOutput << buf;
+                    } else {
+                        mOutput << c;
+                    }
+            }
+        }
     }
 
     std::ostream& mOutput;
