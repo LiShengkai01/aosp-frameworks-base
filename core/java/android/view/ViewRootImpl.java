@@ -204,6 +204,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
+import android.os.MessageQueue;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.RemoteException;
@@ -748,6 +749,26 @@ public final class ViewRootImpl implements ViewParent,
     int mAgentPhase1Count;
     int mAgentPhase2Count;
     boolean mAgentSettled;
+
+    // === Agent on-demand idle-driven settle (foreground-yielding) ===
+    // Async counterpart of forceTraversalForAgent(): instead of running the whole
+    // settle loop synchronously (blocking the foreground), one settle pass is run
+    // per main-thread idle slot via mAgentSettleIdler. The IdleHandler only runs
+    // when the MessageQueue has no due messages, so the foreground's VSYNC doFrame
+    // always takes priority; each pass returns to the queue, re-checking for
+    // foreground work before the next pass. See docs/c3_ondemand_scheduling_design.md.
+    boolean mAgentObserveActive;        // an async observe session is in progress
+    boolean mAgentObserveNoDraw;        // noDraw flag captured for this session's Phase 2
+    int mAgentObserveBudget;            // max Phase 1 settle passes for this session
+    int mAgentObservePass;              // Phase 1 passes already run this session
+    long mAgentObserveLastTick;         // mAgentDirtyTick snapshot from previous pass
+    long mAgentObserveStartNanos;       // wall-clock start, for profiling
+    Runnable mAgentObserveOnDone;       // optional callback fired (on UI thread) at Phase 2 end
+    MessageQueue.IdleHandler mAgentSettleIdler; // the single registered idle handler
+    // Profiling: number of times a settle pass was deferred because the foreground
+    // had pending frame/traversal work (i.e. agent yielded to the foreground).
+    int mAgentYieldCount;
+
     boolean mApplyInsetsRequested;
     boolean mLayoutRequested;
     boolean mFirst;
@@ -3149,25 +3170,10 @@ public final class ViewRootImpl implements ViewParent,
             boolean settled = true;
 
             for (int i = 0; i < vsyncFrames; i++) {
-                mChoreographer.doFrameForAgent();
-                // Run full traversal (measure+layout) to consume any invalidate/requestLayout
-                // produced by animation callbacks; performDraw returns immediately due to
-                // mAgentSkipRecord.
-                if (mTraversalScheduled) {
-                    mTraversalScheduled = false;
-                    mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
-                }
-                mFullRedrawNeeded = true;
-                performTraversals();
-                mAgentPhase1Count++;
-
+                agentRunOneSettlePass();
                 // Stability check: no new invalidation since last iteration, no pending
                 // layout, no pending hardware animations.
-                if (mAgentDirtyTick == lastTick
-                        && !mLayoutRequested
-                        && (mAttachInfo == null
-                            || mAttachInfo.mPendingAnimatingRenderNodes == null
-                            || mAttachInfo.mPendingAnimatingRenderNodes.isEmpty())) {
+                if (mAgentDirtyTick == lastTick && agentIsFrameworkStable()) {
                     break;
                 }
                 lastTick = mAgentDirtyTick;
@@ -3178,6 +3184,60 @@ public final class ViewRootImpl implements ViewParent,
             // === Phase 2: view tree settled (or bound reached), record DL once ===
             mAgentNoDraw = noDraw;
             mAgentSkipRecord = false;
+            agentRecordPhase2();
+        } finally {
+            mAgentNoDraw = prevNoDraw;
+            mAgentSkipRecord = prevSkipRecord;
+        }
+    }
+
+    // ===================================================================================
+    // Agent on-demand shared helpers + idle-driven (foreground-yielding) settle.
+    // See docs/c3_ondemand_scheduling_design.md (§2 scheduling, §4 settle, §5 animation).
+    // ===================================================================================
+
+    /**
+     * Returns true if the agent view tree is framework-stable: no pending layout and
+     * no active hardware animations. (Caller separately compares mAgentDirtyTick to
+     * detect new invalidations between passes.)
+     */
+    private boolean agentIsFrameworkStable() {
+        return !mLayoutRequested
+                && (mAttachInfo == null
+                    || mAttachInfo.mPendingAnimatingRenderNodes == null
+                    || mAttachInfo.mPendingAnimatingRenderNodes.isEmpty());
+    }
+
+    /**
+     * Run one Phase-1 settle pass on the agent window: advance this window's own
+     * animations, then one measure+layout traversal with DisplayList recording
+     * skipped (mAgentSkipRecord). Caller must have set mAgentNoDraw/mAgentSkipRecord.
+     */
+    private void agentRunOneSettlePass() {
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentSettlePass");
+        try {
+            // Part B: advance only this agent window's animations. Property animations
+            // (ValueAnimator) share a single thread-wide AnimationHandler callback and
+            // cannot be split per-display here, so we do NOT pump them; they ride the
+            // foreground's real VSYNC. We drive only this window's frame-clock callbacks
+            // (View#postOnAnimation actions + hardware animators) via doFrameForAgent.
+            mChoreographer.doFrameForAgent();
+            if (mTraversalScheduled) {
+                mTraversalScheduled = false;
+                mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+            }
+            mFullRedrawNeeded = true;
+            performTraversals();
+            mAgentPhase1Count++;
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    /** Phase-2: one full traversal that records the DisplayList and syncs to RT. */
+    private void agentRecordPhase2() {
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentRecordPhase2");
+        try {
             if (mTraversalScheduled) {
                 mTraversalScheduled = false;
                 mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
@@ -3186,8 +3246,136 @@ public final class ViewRootImpl implements ViewParent,
             performTraversals();
             mAgentPhase2Count++;
         } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    /**
+     * True if the foreground (main display) has pending frame work this looper is
+     * about to service. Used by the idle-driven settle to yield: when the foreground
+     * has a scheduled frame, the agent defers its next pass so the foreground VSYNC
+     * doFrame runs first.
+     */
+    private boolean agentForegroundHasPendingWork() {
+        // mChoreographer is the shared per-thread instance; if a frame is scheduled on
+        // it, a foreground doFrame is pending. Also honor any pending traversal that is
+        // not our own frozen agent window.
+        return mChoreographer != null && mChoreographer.isFrameScheduledForAgentCheck();
+    }
+
+    /**
+     * Begin an asynchronous, foreground-yielding on-demand observe. Runs at most
+     * {@code vsyncFrames} Phase-1 settle passes — one per main-thread idle slot — then
+     * a single Phase-2 record pass, then invokes {@code onDone} (on the UI thread).
+     *
+     * <p>Unlike {@link #forceTraversalForAgent}, this never blocks the foreground: each
+     * settle pass runs only when the MessageQueue has no due messages, and yields back
+     * to the queue between passes so foreground VSYNC frames are serviced first.
+     *
+     * <p>Must be called on the UI thread.
+     * @hide
+     */
+    public void beginAgentObserve(boolean noDraw, int vsyncFrames, Runnable onDone) {
+        if (mView == null || !mAdded) {
+            if (onDone != null) onDone.run();
+            return;
+        }
+        if (mAgentObserveActive) {
+            // Already running; ignore re-entrant request (single handler invariant).
+            return;
+        }
+        mAgentObserveActive = true;
+        mAgentObserveNoDraw = noDraw;
+        mAgentObserveBudget = Math.max(1, vsyncFrames);
+        mAgentObservePass = 0;
+        mAgentObserveLastTick = mAgentDirtyTick;
+        mAgentObserveStartNanos = System.nanoTime();
+        mAgentObserveOnDone = onDone;
+        mAgentSettled = true;
+        Trace.asyncTraceBegin(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
+
+        if (mAgentSettleIdler == null) {
+            mAgentSettleIdler = new MessageQueue.IdleHandler() {
+                @Override
+                public boolean queueIdle() {
+                    return agentOnIdleSettle();
+                }
+            };
+        }
+        mHandler.getLooper().getQueue().addIdleHandler(mAgentSettleIdler);
+    }
+
+    /**
+     * One iteration of the idle-driven settle, invoked by the MessageQueue when it has
+     * no due messages. Returns true to keep the handler registered (more passes needed),
+     * false to remove it (session complete). Runs at most one settle pass per call so the
+     * looper re-checks for foreground work between passes.
+     */
+    private boolean agentOnIdleSettle() {
+        if (!mAgentObserveActive || mView == null || !mAdded) {
+            agentFinishObserve();
+            return false;
+        }
+        // Yield: if the foreground has a frame scheduled, defer this pass so the
+        // foreground doFrame is serviced first. Keep the handler registered.
+        if (agentForegroundHasPendingWork()) {
+            mAgentYieldCount++;
+            Trace.instant(Trace.TRACE_TAG_VIEW, "agentYieldToForeground");
+            return true;
+        }
+        if (mIsInTraversal) {
+            // Defensive: never re-enter traversal.
+            return true;
+        }
+
+        final boolean prevNoDraw = mAgentNoDraw;
+        final boolean prevSkipRecord = mAgentSkipRecord;
+        boolean keep;
+        try {
+            // Phase 1 pass.
+            mAgentNoDraw = true;
+            mAgentSkipRecord = true;
+            agentRunOneSettlePass();
+            mAgentObservePass++;
+
+            final boolean stable =
+                    (mAgentDirtyTick == mAgentObserveLastTick) && agentIsFrameworkStable();
+            mAgentObserveLastTick = mAgentDirtyTick;
+
+            if (stable || mAgentObservePass >= mAgentObserveBudget) {
+                // Settled or budget exhausted → Phase 2 record, then finish.
+                mAgentSettled = stable;
+                mAgentNoDraw = mAgentObserveNoDraw;
+                mAgentSkipRecord = false;
+                agentRecordPhase2();
+                keep = false;
+            } else {
+                keep = true;
+            }
+        } finally {
             mAgentNoDraw = prevNoDraw;
             mAgentSkipRecord = prevSkipRecord;
+        }
+
+        if (!keep) {
+            agentFinishObserve();
+        }
+        return keep;
+    }
+
+    private void agentFinishObserve() {
+        if (!mAgentObserveActive) {
+            return;
+        }
+        mAgentObserveActive = false;
+        Trace.asyncTraceEnd(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
+        final Runnable onDone = mAgentObserveOnDone;
+        mAgentObserveOnDone = null;
+        if (mAgentSettleIdler != null) {
+            mHandler.getLooper().getQueue().removeIdleHandler(mAgentSettleIdler);
+        }
+        if (onDone != null) {
+            onDone.run();
         }
     }
 
@@ -3237,7 +3425,9 @@ public final class ViewRootImpl implements ViewParent,
     public String getAgentStatsJson() {
         return "{\"settled\":" + mAgentSettled
                 + ",\"phase1_traversals\":" + mAgentPhase1Count
-                + ",\"phase2_traversals\":" + mAgentPhase2Count + "}";
+                + ",\"phase2_traversals\":" + mAgentPhase2Count
+                + ",\"yield_count\":" + mAgentYieldCount
+                + ",\"observe_active\":" + mAgentObserveActive + "}";
     }
 
     /**
@@ -3249,6 +3439,7 @@ public final class ViewRootImpl implements ViewParent,
         mAgentPhase1Count = 0;
         mAgentPhase2Count = 0;
         mAgentSettled = false;
+        mAgentYieldCount = 0;
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {

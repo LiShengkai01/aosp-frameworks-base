@@ -659,12 +659,14 @@ public final class WindowManagerGlobal {
             boolean fresh = false, noDraw = false, reset = false;
             int vsyncFrames = 0;
             int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
+            boolean asyncSettle = false; // use idle-driven foreground-yielding settle
             for (String arg : args) {
                 if ("fresh".equals(arg)) fresh = true;
                 else if ("nodraw".equals(arg)) noDraw = true;
                 else if ("reset".equals(arg)) reset = true;
                 else if ("freeze".equals(arg)) freeze = 1;
                 else if ("unfreeze".equals(arg)) freeze = -1;
+                else if ("asyncsettle".equals(arg)) asyncSettle = true;
                 else if (arg.startsWith("vsync")) {
                     String n = arg.substring(5);
                     try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
@@ -681,14 +683,42 @@ public final class WindowManagerGlobal {
                 final int fz = freeze;
                 final boolean doFresh = fresh;
                 final boolean doReset = reset;
+                final boolean doAsync = asyncSettle;
                 for (final ViewRootImpl root : roots) {
                     try {
-                        root.mHandler.runWithScissors(() -> {
-                            if (doReset) root.resetAgentStats();
-                            if (fz == 1) root.setAgentFrozen(true);
-                            if (doFresh) root.forceTraversalForAgent(nd, vf);
-                            if (fz == -1) root.setAgentFrozen(false);
-                        }, 2000);
+                        if (doFresh && doAsync) {
+                            // Idle-driven (foreground-yielding) settle. It must NOT run
+                            // inside runWithScissors: that would block the UI thread and
+                            // prevent the MessageQueue from ever going idle (where the
+                            // settle passes run). Post the start and wait bounded on a
+                            // latch fired from the observe's onDone callback.
+                            if (doReset || fz == 1) {
+                                root.mHandler.runWithScissors(() -> {
+                                    if (doReset) root.resetAgentStats();
+                                    if (fz == 1) root.setAgentFrozen(true);
+                                }, 1000);
+                            }
+                            final java.util.concurrent.CountDownLatch done =
+                                    new java.util.concurrent.CountDownLatch(1);
+                            root.mHandler.post(() ->
+                                    root.beginAgentObserve(nd, vf, done::countDown));
+                            try {
+                                done.await(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                            }
+                            if (fz == -1) {
+                                root.mHandler.runWithScissors(
+                                        () -> root.setAgentFrozen(false), 1000);
+                            }
+                        } else {
+                            root.mHandler.runWithScissors(() -> {
+                                if (doReset) root.resetAgentStats();
+                                if (fz == 1) root.setAgentFrozen(true);
+                                if (doFresh) root.forceTraversalForAgent(nd, vf);
+                                if (fz == -1) root.setAgentFrozen(false);
+                            }, 2000);
+                        }
                     } catch (Exception e) {
                         // Best-effort; fall through to dumping whatever is current.
                     }

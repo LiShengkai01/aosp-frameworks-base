@@ -1212,6 +1212,18 @@ public final class Choreographer {
         doFrame(now, 0, data);
     }
 
+    /**
+     * Whether a frame is currently scheduled on this (shared, per-thread) Choreographer.
+     * Used by the agent on-demand idle-driven settle to yield to the foreground: if a
+     * foreground frame is pending, the agent defers its next settle pass.
+     * @hide
+     */
+    public boolean isFrameScheduledForAgentCheck() {
+        synchronized (mLock) {
+            return mFrameScheduled;
+        }
+    }
+
     void doScheduleVsync() {
         synchronized (mLock) {
             if (mFrameScheduled) {
