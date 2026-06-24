@@ -50,6 +50,7 @@
 #include "pipeline/skia/SkiaVulkanPipeline.h"
 #include "pipeline/skia/RenderNodeDrawable.h"
 #include "pipeline/skia/FlatExportOpsCanvas.h"
+#include "pipeline/skia/SemanticHashCanvas.h"
 #include "thread/CommonPool.h"
 #include "utils/GLUtils.h"
 #include "utils/TimeUtils.h"
@@ -1123,6 +1124,23 @@ void CanvasContext::dumpDisplayList(int fd) {
     oss << "]}\n";
     std::string result = oss.str();
     dprintf(fd, "%s", result.c_str());
+}
+
+uint64_t CanvasContext::computeSemanticHash() {
+    // Walk the same RenderNode tree as dumpDisplayList(), but fold only the
+    // agent-stable semantic content (text glyphs + device-space layout bounds)
+    // into a 64-bit fingerprint. No JSON, no allocation per op.
+    int width = std::max(mLastFrameWidth, 1);
+    int height = std::max(mLastFrameHeight, 1);
+    skiapipeline::SemanticHashCanvas canvas(width, height);
+    for (const sp<RenderNode>& node : mRenderNodes) {
+        if (node->nothingToDraw()) {
+            continue;
+        }
+        skiapipeline::RenderNodeDrawable drawable(node.get(), &canvas, false);
+        drawable.forceDraw(&canvas);
+    }
+    return canvas.hash();
 }
 
 void CanvasContext::resetFrameStats() {

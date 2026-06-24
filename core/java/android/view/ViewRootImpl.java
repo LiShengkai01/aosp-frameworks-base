@@ -754,6 +754,46 @@ public final class ViewRootImpl implements ViewParent,
     int mAgentPhase2Count;
     boolean mAgentSettled;
 
+    // === Agent UI identification (launch-origin, NOT foreground/display-based) ===
+    // An "agent UI" is a UI instance launched by an agent via the agent-display API
+    // (C1), as opposed to a "main UI" launched by user interaction. Per design, the
+    // distinction is by launch origin and must follow windows derived from an agent
+    // UI (e.g. dialogs/sub-activities the agent navigates to), even if such a window
+    // were to surface on the physical display.
+    //
+    // Current identification: a window is agent UI iff it lives on a non-default
+    // display. This holds because agent UIs are launched on agent VirtualDisplays
+    // and the user's UI owns the default display; navigation-spawned windows inherit
+    // the agent display and are thus correctly classified. The fully launch-origin
+    // plumb (a flag propagated from ActivityStarter's agent override through to the
+    // client window token) is the robust long-term form; see isAgentUi().
+    private int mIsAgentUiCache = -1; // -1 unknown, 0 no, 1 yes
+
+    // === Layer 1: agent-UI traversal decoupled from VSYNC (foreground-yielding) ===
+    // When enabled on an agent UI, a scheduled traversal is NOT bound to the shared
+    // VSYNC CALLBACK_TRAVERSAL queue (which would compete with the user's frame and
+    // post a sync barrier on the main looper). Instead it is posted as a deferred
+    // runnable that yields to the foreground: it runs the traversal only when the
+    // shared Choreographer has no foreground frame pending, re-posting otherwise.
+    // Continuation is automatic — if a traversal causes new invalidate/requestLayout,
+    // scheduleTraversals() re-arms the deferred runnable; "stable" = no more arming.
+    // This is independent of GPU bypass (Layer 2 / mAgentNoDraw): Layer 1 keeps normal
+    // GPU draw so the agent VirtualDisplay's ImageReader still receives frames.
+    boolean mAgentDecoupleEnabled;      // master switch for Layer 1 on this window
+    boolean mAgentTraversalScheduled;   // a deferred agent traversal is posted
+    int mAgentDeferredCount;            // profiling: deferred traversals run
+    Runnable mAgentDeferredTraversalRunnable; // the foreground-yielding traversal step
+    static final long AGENT_YIELD_DELAY_MS = 2; // re-post delay when yielding to foreground
+    // Layer 3: DL semantic-hash stability detection.
+    // When enabled, settle stability is judged by comparing the agent-consumable
+    // semantic fingerprint (text glyphs + device-space layout bounds, computed on
+    // the RenderThread) between consecutive passes, instead of (or in addition to)
+    // framework dirty flags. This settles "framework-perpetual" pages (spinners,
+    // periodic invalidates) as soon as their *content* stops changing.
+    boolean mAgentHashStabilityEnabled;
+    long mAgentLastSemanticHash;
+    boolean mAgentHasLastHash;
+
     // === Agent on-demand idle-driven settle (foreground-yielding) ===
     // Async counterpart of forceTraversalForAgent(): instead of running the whole
     // settle loop synchronously (blocking the foreground), one settle pass is run
@@ -3088,8 +3128,15 @@ public final class ViewRootImpl implements ViewParent,
     @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.R, trackingBug = 170729553)
     void scheduleTraversals() {
         // Agent-frozen window: do not subscribe to real VSYNC / schedule traversal.
-        // The DisplayList is advanced only on demand via forceTraversalForAgent().
+        // The DisplayList is advanced only on demand (idle省电, Layer-1 disabled).
         if (mAgentFrozen) {
+            return;
+        }
+        // Layer 1: agent UI with decouple enabled — route the traversal off the shared
+        // VSYNC TRAVERSAL queue into a foreground-yielding deferred runnable instead of
+        // posting a sync barrier + CALLBACK_TRAVERSAL (which competes with the user frame).
+        if (mAgentDecoupleEnabled && isAgentUi()) {
+            scheduleAgentDeferredTraversal();
             return;
         }
         if (!mTraversalScheduled) {
@@ -3102,7 +3149,71 @@ public final class ViewRootImpl implements ViewParent,
         }
     }
 
+    /**
+     * Layer 1: arm a deferred, foreground-yielding traversal for this agent window.
+     * Posted as an ordinary main-thread message (no sync barrier), so the foreground's
+     * VSYNC doFrame — delivered as an async message — is serviced ahead of it. The
+     * runnable yields (re-posts) while the shared Choreographer has a frame pending.
+     */
+    private void scheduleAgentDeferredTraversal() {
+        if (mAgentTraversalScheduled) {
+            return;
+        }
+        mAgentTraversalScheduled = true;
+        if (mAgentDeferredTraversalRunnable == null) {
+            mAgentDeferredTraversalRunnable = this::doAgentDeferredTraversal;
+        }
+        mHandler.post(mAgentDeferredTraversalRunnable);
+    }
+
+    private void doAgentDeferredTraversal() {
+        if (!mAgentTraversalScheduled) {
+            return;
+        }
+        if (mAgentFrozen || mView == null || !mAdded) {
+            mAgentTraversalScheduled = false;
+            return;
+        }
+        // Yield to the foreground: if the shared Choreographer has a frame scheduled,
+        // the user UI is about to render — defer this agent traversal.
+        if (agentForegroundHasPendingWork() || mIsInTraversal) {
+            mAgentYieldCount++;
+            Trace.instant(Trace.TRACE_TAG_VIEW, "agentDeferTraversalYield");
+            mHandler.postDelayed(mAgentDeferredTraversalRunnable, AGENT_YIELD_DELAY_MS);
+            return;
+        }
+        mAgentTraversalScheduled = false;
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentDeferredTraversal");
+        try {
+            // The traversal's draw() calls Choreographer.getFrameTimeNanos(), which
+            // requires mCallbacksRunning==true (i.e. running INSIDE doFrame's callback
+            // dispatch). Calling performTraversals() bare from a plain Handler message
+            // throws. So we register this window's real traversal callback and pump a
+            // synthetic frame: doFrameForAgent() runs doFrame, which invokes the
+            // TRAVERSAL callback (mTraversalRunnable -> doTraversal -> performTraversals)
+            // while a frame is in progress. GPU draw stays ON (Layer 1 independent of
+            // Layer-2 noDraw) so the agent VD's ImageReader receives the frame.
+            if (!mTraversalScheduled) {
+                mTraversalScheduled = true;
+                mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+                mChoreographer.postCallback(
+                        Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+            }
+            mFullRedrawNeeded = true;
+            mChoreographer.doFrameForAgent();
+            mAgentDeferredCount++;
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
     void unscheduleTraversals() {
+        if (mAgentTraversalScheduled) {
+            mAgentTraversalScheduled = false;
+            if (mAgentDeferredTraversalRunnable != null) {
+                mHandler.removeCallbacks(mAgentDeferredTraversalRunnable);
+            }
+        }
         if (mTraversalScheduled) {
             mTraversalScheduled = false;
             mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
@@ -3166,18 +3277,29 @@ public final class ViewRootImpl implements ViewParent,
         }
         final boolean prevNoDraw = mAgentNoDraw;
         final boolean prevSkipRecord = mAgentSkipRecord;
+        final boolean hashMode = mAgentHashStabilityEnabled;
+        mAgentHasLastHash = false; // reset hash baseline for this observe
         try {
-            // === Phase 1: pump animations + settle view tree (no DL recording) ===
+            // === Phase 1: pump animations + settle view tree ===
+            // In hash mode we MUST record during settle (skip-record produces no DL
+            // to fingerprint), so the hash reflects current content each pass.
             mAgentNoDraw = true;
-            mAgentSkipRecord = true;
+            mAgentSkipRecord = !hashMode;
             long lastTick = mAgentDirtyTick;
             boolean settled = true;
 
             for (int i = 0; i < vsyncFrames; i++) {
                 agentRunOneSettlePass();
-                // Stability check: no new invalidation since last iteration, no pending
-                // layout, no pending hardware animations.
-                if (mAgentDirtyTick == lastTick && agentIsFrameworkStable()) {
+                boolean stable;
+                if (hashMode) {
+                    // Layer 3: settle when agent-consumable content stops changing,
+                    // even if framework dirty flags keep firing (spinner/periodic).
+                    stable = agentIsContentStable();
+                } else {
+                    // Framework-stable: no new invalidation, no pending layout/hw-anim.
+                    stable = (mAgentDirtyTick == lastTick) && agentIsFrameworkStable();
+                }
+                if (stable) {
                     break;
                 }
                 lastTick = mAgentDirtyTick;
@@ -3213,6 +3335,32 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     /**
+     * Layer 3: current DL semantic fingerprint (text + layout), or 0 if unavailable.
+     * Computed synchronously on the RenderThread; requires a recorded DisplayList,
+     * so only meaningful after a recording traversal (not a skip-record pass).
+     */
+    private long agentSemanticHash() {
+        if (mAttachInfo != null && mAttachInfo.mThreadedRenderer != null) {
+            return mAttachInfo.mThreadedRenderer.computeSemanticHash();
+        }
+        return 0;
+    }
+
+    /**
+     * Layer 3: returns true if the agent-consumable content (text+layout) has not
+     * changed since the previous pass, i.e. the semantic fingerprint repeated.
+     * Updates the stored hash. The first call after reset always returns false
+     * (no prior hash to compare). Use to settle framework-perpetual pages.
+     */
+    private boolean agentIsContentStable() {
+        long h = agentSemanticHash();
+        boolean stable = mAgentHasLastHash && (h == mAgentLastSemanticHash);
+        mAgentLastSemanticHash = h;
+        mAgentHasLastHash = true;
+        return stable;
+    }
+
+    /**
      * Run one Phase-1 settle pass on the agent window: advance this window's own
      * animations, then one measure+layout traversal with DisplayList recording
      * skipped (mAgentSkipRecord). Caller must have set mAgentNoDraw/mAgentSkipRecord.
@@ -3242,6 +3390,10 @@ public final class ViewRootImpl implements ViewParent,
     private void agentRecordPhase2() {
         Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentRecordPhase2");
         try {
+            // Phase 2 runs with mAgentNoDraw set by the caller: performDraw routes
+            // through syncForAgent (record + RT sync, no GPU draw), which does NOT
+            // call Choreographer.getFrameTimeNanos(), so no frame-in-progress context
+            // is required here.
             if (mTraversalScheduled) {
                 mTraversalScheduled = false;
                 mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
@@ -3302,6 +3454,7 @@ public final class ViewRootImpl implements ViewParent,
         mAgentObserveStartNanos = System.nanoTime();
         mAgentObserveOnDone = onDone;
         mAgentSettled = true;
+        mAgentHasLastHash = false; // reset hash baseline for this observe
         Trace.asyncTraceBegin(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
 
         if (mAgentSettleRunnable == null) {
@@ -3341,16 +3494,22 @@ public final class ViewRootImpl implements ViewParent,
 
         final boolean prevNoDraw = mAgentNoDraw;
         final boolean prevSkipRecord = mAgentSkipRecord;
+        final boolean hashMode = mAgentHashStabilityEnabled;
         boolean done = false;
         try {
-            // Phase 1 pass.
+            // Phase 1 pass. In hash mode, record during settle so the content
+            // fingerprint reflects the current frame.
             mAgentNoDraw = true;
-            mAgentSkipRecord = true;
+            mAgentSkipRecord = !hashMode;
             agentRunOneSettlePass();
             mAgentObservePass++;
 
-            final boolean stable =
-                    (mAgentDirtyTick == mAgentObserveLastTick) && agentIsFrameworkStable();
+            final boolean stable;
+            if (hashMode) {
+                stable = agentIsContentStable();
+            } else {
+                stable = (mAgentDirtyTick == mAgentObserveLastTick) && agentIsFrameworkStable();
+            }
             mAgentObserveLastTick = mAgentDirtyTick;
 
             if (stable || mAgentObservePass >= mAgentObserveBudget) {
@@ -3411,8 +3570,8 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public void setAgentFrozen(boolean frozen) {
-        if (frozen && getDisplayId() == Display.DEFAULT_DISPLAY) {
-            return; // never freeze the main display
+        if (frozen && !isAgentUi()) {
+            return; // never freeze a main (user) UI window
         }
         if (mAgentFrozen == frozen) {
             return;
@@ -3421,6 +3580,48 @@ public final class ViewRootImpl implements ViewParent,
         if (!frozen) {
             scheduleTraversals();
         }
+    }
+
+    /**
+     * Layer 1: enable/disable decoupling this agent window's traversal from the shared
+     * VSYNC. When enabled (agent UI only), scheduled traversals run as foreground-yielding
+     * deferred passes instead of binding to the VSYNC TRAVERSAL queue. Independent of
+     * freeze and of GPU bypass. No-op on a main (user) UI window.
+     * @hide
+     */
+    public void setAgentDecoupleEnabled(boolean enabled) {
+        if (enabled && !isAgentUi()) {
+            return;
+        }
+        mAgentDecoupleEnabled = enabled;
+    }
+
+    /**
+     * Layer 3: enable/disable DL semantic-hash stability detection for on-demand
+     * settle. When enabled, settle passes record the DisplayList and the loop exits
+     * when the agent-consumable content fingerprint repeats (settles spinner/periodic
+     * pages); when disabled, framework dirty-flag stability is used.
+     * @hide
+     */
+    public void setAgentHashStabilityEnabled(boolean enabled) {
+        mAgentHashStabilityEnabled = enabled;
+    }
+
+    /**
+     * Whether this window belongs to an agent UI (launched by an agent via the
+     * agent-display API), as opposed to a main UI (user-launched). Layer-1 callback
+     * rerouting, freeze, and on-demand observe all key off this. The classification
+     * follows the launch origin and its derived windows; see mIsAgentUiCache.
+     * @hide
+     */
+    public boolean isAgentUi() {
+        if (mIsAgentUiCache < 0) {
+            // Agent UIs are launched on agent (non-default) displays; the user's UI
+            // owns the default display. Navigation-spawned windows inherit the agent
+            // display and are thus classified as agent UI as well.
+            mIsAgentUiCache = (getDisplayId() != Display.DEFAULT_DISPLAY) ? 1 : 0;
+        }
+        return mIsAgentUiCache == 1;
     }
 
     /**
@@ -3434,7 +3635,12 @@ public final class ViewRootImpl implements ViewParent,
      */
     public String getAgentStatsJson() {
         return "{\"display\":" + getDisplayId()
+                + ",\"agent_ui\":" + isAgentUi()
                 + ",\"frozen\":" + mAgentFrozen
+                + ",\"decouple\":" + mAgentDecoupleEnabled
+                + ",\"deferred_traversals\":" + mAgentDeferredCount
+                + ",\"hash_stability\":" + mAgentHashStabilityEnabled
+                + ",\"last_hash\":\"" + Long.toHexString(mAgentLastSemanticHash) + "\""
                 + ",\"settled\":" + mAgentSettled
                 + ",\"phase1_traversals\":" + mAgentPhase1Count
                 + ",\"phase2_traversals\":" + mAgentPhase2Count
@@ -3452,6 +3658,7 @@ public final class ViewRootImpl implements ViewParent,
         mAgentPhase2Count = 0;
         mAgentSettled = false;
         mAgentYieldCount = 0;
+        mAgentDeferredCount = 0;
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {

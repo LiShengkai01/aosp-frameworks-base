@@ -420,6 +420,12 @@ static void android_view_ThreadedRenderer_dumpDisplayList(JNIEnv* env, jobject c
     proxy->dumpDisplayList(fd);
 }
 
+static jlong android_view_ThreadedRenderer_computeSemanticHash(JNIEnv* env, jobject clazz,
+        jlong proxyPtr) {
+    RenderProxy* proxy = reinterpret_cast<RenderProxy*>(proxyPtr);
+    return (jlong)proxy->computeSemanticHash();
+}
+
 static void android_view_ThreadedRenderer_setSyncOnlyNextFrame(JNIEnv* env, jobject clazz,
         jlong proxyPtr) {
     RenderProxy* proxy = reinterpret_cast<RenderProxy*>(proxyPtr);
@@ -1038,6 +1044,8 @@ static const JNINativeMethod gMethods[] = {
          (void*)android_view_ThreadedRenderer_dumpProfileInfo},
         {"nDumpDisplayList", "(JLjava/io/FileDescriptor;)V",
          (void*)android_view_ThreadedRenderer_dumpDisplayList},
+        {"nComputeSemanticHash", "(J)J",
+         (void*)android_view_ThreadedRenderer_computeSemanticHash},
         {"nSetSyncOnlyNextFrame", "(J)V",
          (void*)android_view_ThreadedRenderer_setSyncOnlyNextFrame},
         {"nDumpGlobalProfileInfo", "(Ljava/io/FileDescriptor;I)V",

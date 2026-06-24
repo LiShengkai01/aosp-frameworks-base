@@ -322,6 +322,14 @@ void RenderProxy::dumpDisplayList(int fd) {
     });
 }
 
+uint64_t RenderProxy::computeSemanticHash() {
+    uint64_t result = 0;
+    mRenderThread.queue().runSync([&]() {
+        result = mContext->computeSemanticHash();
+    });
+    return result;
+}
+
 void RenderProxy::resetProfileInfo() {
     mRenderThread.queue().runSync([this]() {
         std::lock_guard lock(mRenderThread.getJankDataMutex());

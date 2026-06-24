@@ -660,6 +660,8 @@ public final class WindowManagerGlobal {
             int vsyncFrames = 0;
             int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
             boolean asyncSettle = false; // use idle-driven foreground-yielding settle
+            int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
+            int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
             for (String arg : args) {
                 if ("fresh".equals(arg)) fresh = true;
                 else if ("nodraw".equals(arg)) noDraw = true;
@@ -667,13 +669,17 @@ public final class WindowManagerGlobal {
                 else if ("freeze".equals(arg)) freeze = 1;
                 else if ("unfreeze".equals(arg)) freeze = -1;
                 else if ("asyncsettle".equals(arg)) asyncSettle = true;
+                else if ("decouple".equals(arg)) decouple = 1;
+                else if ("undecouple".equals(arg)) decouple = -1;
+                else if ("hashstable".equals(arg)) hashStable = 1;
+                else if ("nohashstable".equals(arg)) hashStable = -1;
                 else if (arg.startsWith("vsync")) {
                     String n = arg.substring(5);
                     try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
                     catch (NumberFormatException e) { vsyncFrames = 3; }
                 }
             }
-            if (fresh || freeze != 0 || reset) {
+            if (fresh || freeze != 0 || reset || decouple != 0 || hashStable != 0) {
                 final ViewRootImpl[] roots;
                 synchronized (mLock) {
                     roots = mRoots.toArray(new ViewRootImpl[0]);
@@ -684,6 +690,8 @@ public final class WindowManagerGlobal {
                 final boolean doFresh = fresh;
                 final boolean doReset = reset;
                 final boolean doAsync = asyncSettle;
+                final int dec = decouple;
+                final int hs = hashStable;
                 for (final ViewRootImpl root : roots) {
                     try {
                         if (doFresh && doAsync) {
@@ -692,9 +700,13 @@ public final class WindowManagerGlobal {
                             // prevent the MessageQueue from ever going idle (where the
                             // settle passes run). Post the start and wait bounded on a
                             // latch fired from the observe's onDone callback.
-                            if (doReset || fz == 1) {
+                            if (doReset || fz == 1 || dec != 0 || hs != 0) {
                                 root.mHandler.runWithScissors(() -> {
                                     if (doReset) root.resetAgentStats();
+                                    if (dec == 1) root.setAgentDecoupleEnabled(true);
+                                    if (dec == -1) root.setAgentDecoupleEnabled(false);
+                                    if (hs == 1) root.setAgentHashStabilityEnabled(true);
+                                    if (hs == -1) root.setAgentHashStabilityEnabled(false);
                                     if (fz == 1) root.setAgentFrozen(true);
                                 }, 1000);
                             }
@@ -714,6 +726,10 @@ public final class WindowManagerGlobal {
                         } else {
                             root.mHandler.runWithScissors(() -> {
                                 if (doReset) root.resetAgentStats();
+                                if (dec == 1) root.setAgentDecoupleEnabled(true);
+                                if (dec == -1) root.setAgentDecoupleEnabled(false);
+                                if (hs == 1) root.setAgentHashStabilityEnabled(true);
+                                if (hs == -1) root.setAgentHashStabilityEnabled(false);
                                 if (fz == 1) root.setAgentFrozen(true);
                                 if (doFresh) root.forceTraversalForAgent(nd, vf);
                                 if (fz == -1) root.setAgentFrozen(false);

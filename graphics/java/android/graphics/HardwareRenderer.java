@@ -960,6 +960,17 @@ public class HardwareRenderer {
     }
 
     /**
+     * Layer-3 stability detection (C3): returns a 64-bit fingerprint of the
+     * agent-consumable semantic content (text glyphs + device-space layout bounds)
+     * of the last recorded frame. Stable under cosmetic churn; changes when text
+     * or layout changes. Runs synchronously on the RenderThread.
+     * @hide
+     */
+    public long computeSemanticHash() {
+        return nComputeSemanticHash(mNativeProxy);
+    }
+
+    /**
      * Marks the next frame to sync the staging DisplayList to active but skip the
      * GPU draw (zero GPU/SurfaceFlinger work). Used by the agent no-draw path so a
      * forced traversal updates the DisplayList without rasterizing.
@@ -1692,6 +1703,7 @@ public class HardwareRenderer {
             @DumpFlags int dumpFlags);
 
     private static native void nDumpDisplayList(long nativeProxy, FileDescriptor fd);
+    private static native long nComputeSemanticHash(long nativeProxy);
     private static native void nSetSyncOnlyNextFrame(long nativeProxy);
 
     private static native void nDumpGlobalProfileInfo(FileDescriptor fd, @DumpFlags int dumpFlags);

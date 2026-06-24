@@ -174,6 +174,12 @@ public:
 
     void dumpFrames(int fd);
     void dumpDisplayList(int fd);
+
+    // Layer-3 stability detection (C3): compute a cheap 64-bit fingerprint of the
+    // agent-consumable semantic content (text glyphs + device-space layout bounds)
+    // of the current frame. Stable under cosmetic churn (color/spinner/jitter);
+    // changes when text or layout changes. Runs on the RenderThread.
+    uint64_t computeSemanticHash();
     void resetFrameStats();
 
     void setName(const std::string&& name);
