@@ -343,6 +343,10 @@ public final class ViewRootImpl implements ViewParent,
     private static final boolean DEBUG_IMF = false || LOCAL_LOGV;
     private static final boolean DEBUG_CONFIGURATION = false || LOCAL_LOGV;
     private static final boolean DEBUG_FPS = false;
+    // Agent on-demand observe diagnostics (settle steps, yields). Off by default;
+    // perfetto trace sections (agentObserve/agentSettlePass/agentRecordPhase2/
+    // agentYieldToForeground) carry the profiling signal regardless of this flag.
+    private static final boolean DEBUG_AGENT = false;
     private static final boolean DEBUG_INPUT_STAGES = false || LOCAL_LOGV;
     private static final boolean DEBUG_KEEP_SCREEN_ON = false || LOCAL_LOGV;
     private static final boolean DEBUG_CONTENT_CAPTURE = false || LOCAL_LOGV;
@@ -764,7 +768,7 @@ public final class ViewRootImpl implements ViewParent,
     long mAgentObserveLastTick;         // mAgentDirtyTick snapshot from previous pass
     long mAgentObserveStartNanos;       // wall-clock start, for profiling
     Runnable mAgentObserveOnDone;       // optional callback fired (on UI thread) at Phase 2 end
-    MessageQueue.IdleHandler mAgentSettleIdler; // the single registered idle handler
+    Runnable mAgentSettleRunnable;      // the self-re-posting settle step
     // Profiling: number of times a settle pass was deferred because the foreground
     // had pending frame/traversal work (i.e. agent yielded to the foreground).
     int mAgentYieldCount;
@@ -3277,13 +3281,19 @@ public final class ViewRootImpl implements ViewParent,
      */
     public void beginAgentObserve(boolean noDraw, int vsyncFrames, Runnable onDone) {
         if (mView == null || !mAdded) {
+            if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: skip (view=" + (mView != null)
+                    + " added=" + mAdded + ")");
             if (onDone != null) onDone.run();
             return;
         }
         if (mAgentObserveActive) {
-            // Already running; ignore re-entrant request (single handler invariant).
+            // Already running; ignore re-entrant request but still release the caller.
+            if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: already active, releasing caller");
+            if (onDone != null) onDone.run();
             return;
         }
+        if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: begin noDraw=" + noDraw
+                + " budget=" + vsyncFrames);
         mAgentObserveActive = true;
         mAgentObserveNoDraw = noDraw;
         mAgentObserveBudget = Math.max(1, vsyncFrames);
@@ -3294,43 +3304,44 @@ public final class ViewRootImpl implements ViewParent,
         mAgentSettled = true;
         Trace.asyncTraceBegin(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
 
-        if (mAgentSettleIdler == null) {
-            mAgentSettleIdler = new MessageQueue.IdleHandler() {
-                @Override
-                public boolean queueIdle() {
-                    return agentOnIdleSettle();
-                }
-            };
+        if (mAgentSettleRunnable == null) {
+            mAgentSettleRunnable = this::agentOnSettleStep;
         }
-        mHandler.getLooper().getQueue().addIdleHandler(mAgentSettleIdler);
+        // Post the first pass. Each pass self-continues by re-posting, returning to the
+        // looper between passes so the foreground's doFrame (also a queued message) is
+        // serviced first when due.
+        mHandler.post(mAgentSettleRunnable);
     }
 
     /**
-     * One iteration of the idle-driven settle, invoked by the MessageQueue when it has
-     * no due messages. Returns true to keep the handler registered (more passes needed),
-     * false to remove it (session complete). Runs at most one settle pass per call so the
-     * looper re-checks for foreground work between passes.
+     * One step of the posted-continuation settle. Runs at most one Phase-1 pass, then
+     * either re-posts itself (more passes needed) or records Phase 2 and finishes. Yields
+     * to the foreground by deferring (re-post) when a foreground frame is scheduled.
      */
-    private boolean agentOnIdleSettle() {
+    private void agentOnSettleStep() {
+        if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: step pass=" + mAgentObservePass
+                + " active=" + mAgentObserveActive + " yields=" + mAgentYieldCount);
         if (!mAgentObserveActive || mView == null || !mAdded) {
             agentFinishObserve();
-            return false;
+            return;
         }
         // Yield: if the foreground has a frame scheduled, defer this pass so the
-        // foreground doFrame is serviced first. Keep the handler registered.
+        // foreground doFrame is serviced first. Re-post with a small delay to avoid a
+        // busy loop while the foreground frame is pending.
         if (agentForegroundHasPendingWork()) {
             mAgentYieldCount++;
             Trace.instant(Trace.TRACE_TAG_VIEW, "agentYieldToForeground");
-            return true;
+            mHandler.postDelayed(mAgentSettleRunnable, 4);
+            return;
         }
         if (mIsInTraversal) {
-            // Defensive: never re-enter traversal.
-            return true;
+            mHandler.postDelayed(mAgentSettleRunnable, 4);
+            return;
         }
 
         final boolean prevNoDraw = mAgentNoDraw;
         final boolean prevSkipRecord = mAgentSkipRecord;
-        boolean keep;
+        boolean done = false;
         try {
             // Phase 1 pass.
             mAgentNoDraw = true;
@@ -3348,19 +3359,18 @@ public final class ViewRootImpl implements ViewParent,
                 mAgentNoDraw = mAgentObserveNoDraw;
                 mAgentSkipRecord = false;
                 agentRecordPhase2();
-                keep = false;
-            } else {
-                keep = true;
+                done = true;
             }
         } finally {
             mAgentNoDraw = prevNoDraw;
             mAgentSkipRecord = prevSkipRecord;
         }
 
-        if (!keep) {
+        if (done) {
             agentFinishObserve();
+        } else {
+            mHandler.post(mAgentSettleRunnable);
         }
-        return keep;
     }
 
     private void agentFinishObserve() {
@@ -3371,8 +3381,8 @@ public final class ViewRootImpl implements ViewParent,
         Trace.asyncTraceEnd(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
         final Runnable onDone = mAgentObserveOnDone;
         mAgentObserveOnDone = null;
-        if (mAgentSettleIdler != null) {
-            mHandler.getLooper().getQueue().removeIdleHandler(mAgentSettleIdler);
+        if (mAgentSettleRunnable != null) {
+            mHandler.removeCallbacks(mAgentSettleRunnable);
         }
         if (onDone != null) {
             onDone.run();
