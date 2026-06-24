@@ -770,7 +770,7 @@ public final class ViewRootImpl implements ViewParent,
     private int mIsAgentUiCache = -1; // -1 unknown, 0 no, 1 yes
 
     // === Layer 1: agent-UI traversal decoupled from VSYNC (foreground-yielding) ===
-    // When enabled on an agent UI, a scheduled traversal is NOT bound to the shared
+    // When active on an agent UI, a scheduled traversal is NOT bound to the shared
     // VSYNC CALLBACK_TRAVERSAL queue (which would compete with the user's frame and
     // post a sync barrier on the main looper). Instead it is posted as a deferred
     // runnable that yields to the foreground: it runs the traversal only when the
@@ -779,7 +779,17 @@ public final class ViewRootImpl implements ViewParent,
     // scheduleTraversals() re-arms the deferred runnable; "stable" = no more arming.
     // This is independent of GPU bypass (Layer 2 / mAgentNoDraw): Layer 1 keeps normal
     // GPU draw so the agent VirtualDisplay's ImageReader still receives frames.
-    boolean mAgentDecoupleEnabled;      // master switch for Layer 1 on this window
+    //
+    // Decouple is a WINDOW PROPERTY that defaults ON for any agent UI (and its
+    // derived windows): an agent UI launched on an agent display via the C1
+    // agent-display API automatically decouples, without any external trigger —
+    // exactly as freeze is gated to agent UIs. A tri-state manual override
+    // (mAgentDecoupleOverride) exists for experiments (notably B-GUI, which needs
+    // the original VSYNC-bound path): 0=auto (=isAgentUi()), 1=force on, -1=force off.
+    static final int AGENT_DECOUPLE_AUTO = 0;
+    static final int AGENT_DECOUPLE_ON = 1;
+    static final int AGENT_DECOUPLE_OFF = -1;
+    int mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
     boolean mAgentTraversalScheduled;   // a deferred agent traversal is posted
     int mAgentDeferredCount;            // profiling: deferred traversals run
     Runnable mAgentDeferredTraversalRunnable; // the foreground-yielding traversal step
@@ -3132,10 +3142,11 @@ public final class ViewRootImpl implements ViewParent,
         if (mAgentFrozen) {
             return;
         }
-        // Layer 1: agent UI with decouple enabled — route the traversal off the shared
+        // Layer 1: agent UI with decouple active — route the traversal off the shared
         // VSYNC TRAVERSAL queue into a foreground-yielding deferred runnable instead of
         // posting a sync barrier + CALLBACK_TRAVERSAL (which competes with the user frame).
-        if (mAgentDecoupleEnabled && isAgentUi()) {
+        // Decouple defaults ON for agent UIs (window property); see isAgentDecoupleActive().
+        if (isAgentDecoupleActive()) {
             scheduleAgentDeferredTraversal();
             return;
         }
@@ -3583,17 +3594,38 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     /**
-     * Layer 1: enable/disable decoupling this agent window's traversal from the shared
-     * VSYNC. When enabled (agent UI only), scheduled traversals run as foreground-yielding
-     * deferred passes instead of binding to the VSYNC TRAVERSAL queue. Independent of
-     * freeze and of GPU bypass. No-op on a main (user) UI window.
+     * Layer 1: whether decoupled (foreground-yielding) traversal is currently active
+     * for this window. Defaults ON for any agent UI (window property, follows derived
+     * windows); a manual override can force it on/off for experiments (e.g. B-GUI
+     * forces it OFF to use the original VSYNC-bound path).
+     * @hide
+     */
+    public boolean isAgentDecoupleActive() {
+        switch (mAgentDecoupleOverride) {
+            case AGENT_DECOUPLE_ON:  return isAgentUi();
+            case AGENT_DECOUPLE_OFF: return false;
+            default:                 return isAgentUi(); // AUTO: on for agent UIs
+        }
+    }
+
+    /**
+     * Layer 1 manual override. {@code enabled==true} forces decouple on (agent UI only),
+     * {@code false} forces it off (used by B-GUI to keep the VSYNC-bound traversal).
+     * To return to the default window-property behavior use {@link #setAgentDecoupleAuto()}.
+     * No-op-on-effect for a main (user) UI window, which is never decoupled.
      * @hide
      */
     public void setAgentDecoupleEnabled(boolean enabled) {
-        if (enabled && !isAgentUi()) {
-            return;
-        }
-        mAgentDecoupleEnabled = enabled;
+        mAgentDecoupleOverride = enabled ? AGENT_DECOUPLE_ON : AGENT_DECOUPLE_OFF;
+    }
+
+    /**
+     * Layer 1: clear the manual override and return to the default (auto = on for
+     * agent UIs).
+     * @hide
+     */
+    public void setAgentDecoupleAuto() {
+        mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
     }
 
     /**
@@ -3637,7 +3669,8 @@ public final class ViewRootImpl implements ViewParent,
         return "{\"display\":" + getDisplayId()
                 + ",\"agent_ui\":" + isAgentUi()
                 + ",\"frozen\":" + mAgentFrozen
-                + ",\"decouple\":" + mAgentDecoupleEnabled
+                + ",\"decouple\":" + isAgentDecoupleActive()
+                + ",\"decouple_override\":" + mAgentDecoupleOverride
                 + ",\"deferred_traversals\":" + mAgentDeferredCount
                 + ",\"hash_stability\":" + mAgentHashStabilityEnabled
                 + ",\"last_hash\":\"" + Long.toHexString(mAgentLastSemanticHash) + "\""

@@ -671,6 +671,7 @@ public final class WindowManagerGlobal {
                 else if ("asyncsettle".equals(arg)) asyncSettle = true;
                 else if ("decouple".equals(arg)) decouple = 1;
                 else if ("undecouple".equals(arg)) decouple = -1;
+                else if ("autodecouple".equals(arg)) decouple = 2;
                 else if ("hashstable".equals(arg)) hashStable = 1;
                 else if ("nohashstable".equals(arg)) hashStable = -1;
                 else if (arg.startsWith("vsync")) {
@@ -705,6 +706,7 @@ public final class WindowManagerGlobal {
                                     if (doReset) root.resetAgentStats();
                                     if (dec == 1) root.setAgentDecoupleEnabled(true);
                                     if (dec == -1) root.setAgentDecoupleEnabled(false);
+                                    if (dec == 2) root.setAgentDecoupleAuto();
                                     if (hs == 1) root.setAgentHashStabilityEnabled(true);
                                     if (hs == -1) root.setAgentHashStabilityEnabled(false);
                                     if (fz == 1) root.setAgentFrozen(true);
@@ -728,6 +730,7 @@ public final class WindowManagerGlobal {
                                 if (doReset) root.resetAgentStats();
                                 if (dec == 1) root.setAgentDecoupleEnabled(true);
                                 if (dec == -1) root.setAgentDecoupleEnabled(false);
+                                if (dec == 2) root.setAgentDecoupleAuto();
                                 if (hs == 1) root.setAgentHashStabilityEnabled(true);
                                 if (hs == -1) root.setAgentHashStabilityEnabled(false);
                                 if (fz == 1) root.setAgentFrozen(true);
