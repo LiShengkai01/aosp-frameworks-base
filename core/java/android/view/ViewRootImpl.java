@@ -3433,7 +3433,9 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public String getAgentStatsJson() {
-        return "{\"settled\":" + mAgentSettled
+        return "{\"display\":" + getDisplayId()
+                + ",\"frozen\":" + mAgentFrozen
+                + ",\"settled\":" + mAgentSettled
                 + ",\"phase1_traversals\":" + mAgentPhase1Count
                 + ",\"phase2_traversals\":" + mAgentPhase2Count
                 + ",\"yield_count\":" + mAgentYieldCount
