@@ -173,7 +173,8 @@ public:
     std::mutex& profilerLock() { return mFrameInfoMutex; }
 
     void dumpFrames(int fd);
-    void dumpDisplayList(int fd);
+    void dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                         int surfaceInsetX, int surfaceInsetY);
 
     // Layer-3 stability detection (C3): compute a cheap 64-bit fingerprint of the
     // agent-consumable semantic content (text glyphs + device-space layout bounds)

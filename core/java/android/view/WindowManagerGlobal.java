@@ -32,6 +32,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.res.Configuration;
 import android.content.res.TypedArray;
 import android.graphics.HardwareRenderer;
+import android.graphics.Rect;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
@@ -759,7 +760,14 @@ public final class WindowManagerGlobal {
                     ThreadedRenderer renderer =
                             root.getView().mAttachInfo.mThreadedRenderer;
                     if (renderer != null) {
-                        renderer.dumpGfxInfo(pw, fd, args);
+                        // HWUI coordinates are relative to the Window Surface.
+                        // Include its screen origin for dialogs and popup windows.
+                        final Rect surfaceInsets = root.mWindowAttributes.surfaceInsets;
+                        final int surfaceOriginX = root.mWinFrame.left - surfaceInsets.left;
+                        final int surfaceOriginY = root.mWinFrame.top - surfaceInsets.top;
+                        renderer.dumpGfxInfo(
+                                pw, fd, args, surfaceOriginX, surfaceOriginY,
+                                surfaceInsets.left, surfaceInsets.top);
                     }
                 }
 

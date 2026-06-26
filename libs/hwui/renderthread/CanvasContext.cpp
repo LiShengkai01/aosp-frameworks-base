@@ -1081,7 +1081,8 @@ void CanvasContext::dumpFrames(int fd) {
     mJankTracker.dumpFrames(fd);
 }
 
-void CanvasContext::dumpDisplayList(int fd) {
+void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                                    int surfaceInsetX, int surfaceInsetY) {
     // Use the same render path as GPU rendering (SkiaPipeline::renderFrameImpl)
     // to ensure we capture every RenderNode in the tree, including nested
     // HardwareLayers and child RenderNodes that don't appear in mRootNode's
@@ -1095,6 +1096,12 @@ void CanvasContext::dumpDisplayList(int fd) {
     std::ostringstream oss;
     oss << "{\"frame\":\"flat_render\",\"width\":" << mLastFrameWidth
         << ",\"height\":" << mLastFrameHeight
+        << ",\"coordinateSpace\":\"screen\""
+        << ",\"surfaceOrigin\":[" << surfaceOriginX << "," << surfaceOriginY << "]"
+        << ",\"surfaceInsets\":[" << surfaceInsetX << "," << surfaceInsetY << "]"
+        << ",\"surfaceBoundsOnScreen\":[" << surfaceOriginX << "," << surfaceOriginY
+        << "," << surfaceOriginX + mLastFrameWidth
+        << "," << surfaceOriginY + mLastFrameHeight << "]"
         << ",\"nodes\":[";
 
     int width = std::max(mLastFrameWidth, 1);
@@ -1110,7 +1117,10 @@ void CanvasContext::dumpDisplayList(int fd) {
             // explicit dimensions creates a "no-draw" canvas where draw ops
             // route through onDraw* virtuals (our overrides) without any GPU
             // rasterization.
-            skiapipeline::FlatExportOpsCanvas canvas(oss, width, height);
+            skiapipeline::FlatExportOpsCanvas canvas(
+                    oss, width, height,
+                    surfaceOriginX - surfaceInsetX,
+                    surfaceOriginY - surfaceInsetY);
             // Wrap the RenderNode in a RenderNodeDrawable and force-draw onto
             // our canvas. forceDraw() is what SkiaPipeline uses internally;
             // it handles RenderLayer composition and recursively renders

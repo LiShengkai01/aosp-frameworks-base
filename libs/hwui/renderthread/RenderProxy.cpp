@@ -316,9 +316,11 @@ void RenderProxy::dumpProfileInfo(int fd, int dumpFlags) {
     });
 }
 
-void RenderProxy::dumpDisplayList(int fd) {
+void RenderProxy::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                                  int surfaceInsetX, int surfaceInsetY) {
     mRenderThread.queue().runSync([&]() {
-        mContext->dumpDisplayList(fd);
+        mContext->dumpDisplayList(
+                fd, surfaceOriginX, surfaceOriginY, surfaceInsetX, surfaceInsetY);
     });
 }
 

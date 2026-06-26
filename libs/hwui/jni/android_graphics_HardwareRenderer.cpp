@@ -414,10 +414,12 @@ static void android_view_ThreadedRenderer_dumpProfileInfo(JNIEnv* env, jobject c
 }
 
 static void android_view_ThreadedRenderer_dumpDisplayList(JNIEnv* env, jobject clazz,
-        jlong proxyPtr, jobject javaFileDescriptor) {
+        jlong proxyPtr, jobject javaFileDescriptor, jint surfaceOriginX, jint surfaceOriginY,
+        jint surfaceInsetX, jint surfaceInsetY) {
     RenderProxy* proxy = reinterpret_cast<RenderProxy*>(proxyPtr);
     int fd = jniGetFDFromFileDescriptor(env, javaFileDescriptor);
-    proxy->dumpDisplayList(fd);
+    proxy->dumpDisplayList(
+            fd, surfaceOriginX, surfaceOriginY, surfaceInsetX, surfaceInsetY);
 }
 
 static jlong android_view_ThreadedRenderer_computeSemanticHash(JNIEnv* env, jobject clazz,
@@ -1042,7 +1044,7 @@ static const JNINativeMethod gMethods[] = {
         {"nNotifyFramePending", "(J)V", (void*)android_view_ThreadedRenderer_notifyFramePending},
         {"nDumpProfileInfo", "(JLjava/io/FileDescriptor;I)V",
          (void*)android_view_ThreadedRenderer_dumpProfileInfo},
-        {"nDumpDisplayList", "(JLjava/io/FileDescriptor;)V",
+        {"nDumpDisplayList", "(JLjava/io/FileDescriptor;IIII)V",
          (void*)android_view_ThreadedRenderer_dumpDisplayList},
         {"nComputeSemanticHash", "(J)J",
          (void*)android_view_ThreadedRenderer_computeSemanticHash},

@@ -120,7 +120,8 @@ public:
     void notifyGpuLoadUp();
 
     void dumpProfileInfo(int fd, int dumpFlags);
-    void dumpDisplayList(int fd);
+    void dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                         int surfaceInsetX, int surfaceInsetY);
     uint64_t computeSemanticHash();
     // Not exported, only used for testing
     void resetProfileInfo();
