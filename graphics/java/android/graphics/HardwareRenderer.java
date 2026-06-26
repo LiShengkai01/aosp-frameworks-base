@@ -956,7 +956,33 @@ public class HardwareRenderer {
      * @hide
      */
     public void dumpDisplayList(FileDescriptor fd) {
-        nDumpDisplayList(mNativeProxy, fd);
+        dumpDisplayList(fd, 0, 0);
+    }
+
+    /**
+     * Dumps the current DisplayList in global logical-screen coordinates.
+     *
+     * @param surfaceOriginX x coordinate of the rendering surface on screen
+     * @param surfaceOriginY y coordinate of the rendering surface on screen
+     * @hide
+     */
+    public void dumpDisplayList(FileDescriptor fd, int surfaceOriginX, int surfaceOriginY) {
+        dumpDisplayList(fd, surfaceOriginX, surfaceOriginY, 0, 0);
+    }
+
+    /**
+     * Dumps the current DisplayList in global logical-screen coordinates.
+     *
+     * @param surfaceOriginX x coordinate of the rendering surface on screen
+     * @param surfaceOriginY y coordinate of the rendering surface on screen
+     * @param surfaceInsetX left inset applied while recording the root DisplayList
+     * @param surfaceInsetY top inset applied while recording the root DisplayList
+     * @hide
+     */
+    public void dumpDisplayList(FileDescriptor fd, int surfaceOriginX, int surfaceOriginY,
+            int surfaceInsetX, int surfaceInsetY) {
+        nDumpDisplayList(mNativeProxy, fd, surfaceOriginX, surfaceOriginY,
+                surfaceInsetX, surfaceInsetY);
     }
 
     /**
@@ -1691,7 +1717,8 @@ public class HardwareRenderer {
     private static native void nDumpProfileInfo(long nativeProxy, FileDescriptor fd,
             @DumpFlags int dumpFlags);
 
-    private static native void nDumpDisplayList(long nativeProxy, FileDescriptor fd);
+    private static native void nDumpDisplayList(long nativeProxy, FileDescriptor fd,
+            int surfaceOriginX, int surfaceOriginY, int surfaceInsetX, int surfaceInsetY);
     private static native void nSetSyncOnlyNextFrame(long nativeProxy);
 
     private static native void nDumpGlobalProfileInfo(FileDescriptor fd, @DumpFlags int dumpFlags);

@@ -173,7 +173,8 @@ public:
     std::mutex& profilerLock() { return mFrameInfoMutex; }
 
     void dumpFrames(int fd);
-    void dumpDisplayList(int fd);
+    void dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                         int surfaceInsetX, int surfaceInsetY);
     void resetFrameStats();
 
     void setName(const std::string&& name);

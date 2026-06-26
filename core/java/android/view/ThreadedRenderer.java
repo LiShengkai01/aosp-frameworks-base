@@ -668,12 +668,14 @@ public final class ThreadedRenderer extends HardwareRenderer {
     /**
      * Outputs extra debugging information in the specified file descriptor.
      */
-    void dumpGfxInfo(PrintWriter pw, FileDescriptor fd, String[] args) {
+    void dumpGfxInfo(PrintWriter pw, FileDescriptor fd, String[] args,
+            int surfaceOriginX, int surfaceOriginY, int surfaceInsetX, int surfaceInsetY) {
         pw.flush();
         // Check if displaylist dump is requested: 'dumpsys gfxinfo <pkg> displaylist'
         for (String arg : args) {
             if ("displaylist".equals(arg)) {
-                dumpDisplayList(fd);
+                dumpDisplayList(fd, surfaceOriginX, surfaceOriginY,
+                        surfaceInsetX, surfaceInsetY);
                 return;
             }
         }

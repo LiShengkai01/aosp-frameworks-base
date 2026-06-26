@@ -313,3 +313,67 @@ c9fe912  Agent Display: approach A - exempt singleTask reuse in resolveReusableT
 ## License
 
 Same as AOSP — Apache 2.0.
+
+## C2 DisplayList Export 修改说明
+
+本分支在 Android `frameworks/base` 中加入了 C2 使用的 DisplayList 导出能力。该修改的目标是从 Android RenderThread / HWUI 渲染流程中导出当前窗口的绘制指令，并将其转换为结构化 JSON，供上层 agent 使用。
+
+### 修改目标
+
+原始 Android framework 只能通过截图或 ViewTree 获取界面信息。为了让 agent 能够直接访问 UI 的底层绘制结构，本修改在 HWUI 中加入了 DisplayList 导出逻辑，使系统可以输出如下信息：
+
+- 当前窗口的绘制操作，例如 `drawText`、`drawPath`、`drawImage`、`drawRect` 等；
+- 文本内容、绘制 bounds、颜色、图片采样信息；
+- 图标和 path 的几何形状；
+- 元素在全局屏幕坐标系中的位置；
+- 当前窗口的 surface origin 和 surface insets 信息。
+
+这些信息会被后续 Python 侧脚本进一步过滤、简化，并转换为 agent observation。
+
+### 核心修改
+
+本次修改涉及 Java framework、JNI、RenderProxy、CanvasContext 和 HWUI Skia pipeline。主要修改文件如下：
+
+```text
+core/java/android/view/ThreadedRenderer.java
+core/java/android/view/WindowManagerGlobal.java
+graphics/java/android/graphics/HardwareRenderer.java
+libs/hwui/jni/android_graphics_HardwareRenderer.cpp
+libs/hwui/pipeline/skia/FlatExportOpsCanvas.h
+libs/hwui/renderthread/CanvasContext.cpp
+libs/hwui/renderthread/CanvasContext.h
+libs/hwui/renderthread/RenderProxy.cpp
+libs/hwui/renderthread/RenderProxy.h
+```
+
+### FlatExportOpsCanvas
+
+`FlatExportOpsCanvas` 是本修改的核心组件。它继承自 `SkCanvas`，在 DisplayList replay 过程中拦截绘制操作，并导出 JSON 格式的绘制记录。
+
+目前支持导出的主要绘制操作包括：
+
+- `drawTextBlob`
+- `drawPath`
+- `drawImage`
+- `drawRect`
+- `drawOval`
+- `drawRRect`
+- `drawCircle`
+- `clipRect`
+
+对于不同操作，会导出对应的结构化信息，例如：
+
+- `op`
+- `bounds`
+- `color`
+- `text`
+- `path`
+- `src`
+- `dst`
+- `imageId`
+- `visualStatus`
+- `sampleWidth`
+- `sampleHeight`
+- `argbRle`
+
+其中 `drawImage` 会尝试导出小尺寸 ARGB 采样，并使用 run-length encoding 表示图片像素信息，供后续脚本生成图标语义描述。
