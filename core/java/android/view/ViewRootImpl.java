@@ -792,8 +792,21 @@ public final class ViewRootImpl implements ViewParent,
     int mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
     boolean mAgentTraversalScheduled;   // a deferred agent traversal is posted
     int mAgentDeferredCount;            // profiling: deferred traversals run
-    Runnable mAgentDeferredTraversalRunnable; // the foreground-yielding traversal step
-    static final long AGENT_YIELD_DELAY_MS = 2; // re-post delay when yielding to foreground
+    // Layer 1 (IdleHandler-driven decouple): the agent traversal runs in the
+    // main-thread idle slot — i.e. the gap after the foreground's VSYNC doFrame has
+    // dispatched all its callbacks and the looper is about to sleep. This is event-
+    // driven (no polling, no mFrameScheduled boolean check, no 2ms self-repost) and
+    // never schedules a VSYNC of its own, so the vanilla foreground frame pipeline is
+    // untouched. Anti-starvation: on perpetually-invalidating pages the looper may
+    // stay busy and the idle slot never arrive; if the agent traversal has been
+    // pending longer than AGENT_DECOUPLE_MAX_DEFER_MS, the next idle/timeout forces
+    // one synthetic frame so the agent window cannot be starved into an input-
+    // dispatch-timeout ANR. A short bounded delay is acceptable; indefinite is not.
+    MessageQueue.IdleHandler mAgentTraversalIdler; // runs the deferred traversal at idle
+    boolean mAgentIdlerRegistered;      // idler currently added to the queue
+    long mAgentTraversalArmedAt;        // SystemClock.uptimeMillis() when armed
+    Runnable mAgentTraversalDeadlineRunnable; // safety-bound forced traversal
+    static final long AGENT_DECOUPLE_MAX_DEFER_MS = 48; // ~3 frames @60Hz: bound before forcing
     // Layer 3: DL semantic-hash stability detection.
     // When enabled, settle stability is judged by comparing the agent-consumable
     // semantic fingerprint (text glyphs + device-space layout bounds, computed on
@@ -3161,49 +3174,86 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     /**
-     * Layer 1: arm a deferred, foreground-yielding traversal for this agent window.
-     * Posted as an ordinary main-thread message (no sync barrier), so the foreground's
-     * VSYNC doFrame — delivered as an async message — is serviced ahead of it. The
-     * runnable yields (re-posts) while the shared Choreographer has a frame pending.
+     * Layer 1: arm a deferred agent traversal that runs in the main-thread idle slot
+     * (the gap between foreground VSYNC frames) via a {@link MessageQueue.IdleHandler}.
+     * This path posts NO sync barrier, NO Choreographer TRAVERSAL callback and does NOT
+     * subscribe to VSYNC, so the foreground frame pipeline is untouched (vanilla VSYNC
+     * semantics preserved). The traversal is serviced only when the looper has no due
+     * messages — i.e. after the foreground doFrame has run and the thread is about to
+     * sleep — with no polling and no mFrameScheduled check. A safety deadline
+     * (AGENT_DECOUPLE_MAX_DEFER_MS) forces one traversal if a continuously-busy looper
+     * never yields an idle slot, bounding deferral and preventing input-timeout ANRs.
      */
     private void scheduleAgentDeferredTraversal() {
         if (mAgentTraversalScheduled) {
             return;
         }
         mAgentTraversalScheduled = true;
-        if (mAgentDeferredTraversalRunnable == null) {
-            mAgentDeferredTraversalRunnable = this::doAgentDeferredTraversal;
+        mAgentTraversalArmedAt = SystemClock.uptimeMillis();
+
+        if (mAgentTraversalIdler == null) {
+            mAgentTraversalIdler = () -> {
+                // Runs when the main thread is about to idle: the foreground frame (if
+                // any) has already been dispatched. Run exactly one agent traversal,
+                // then remove the idler (return false). If a traversal is in progress,
+                // keep the idler registered (return true) to retry at the next idle.
+                if (!mAgentTraversalScheduled) {
+                    mAgentIdlerRegistered = false;
+                    return false;
+                }
+                if (mIsInTraversal) {
+                    return true; // retry next idle; do not consume the idler
+                }
+                mAgentIdlerRegistered = false;
+                runAgentDeferredTraversalNow();
+                return false;
+            };
         }
-        mHandler.post(mAgentDeferredTraversalRunnable);
+        if (mAgentTraversalDeadlineRunnable == null) {
+            mAgentTraversalDeadlineRunnable = () -> {
+                // Safety bound: idle slot never arrived in time (busy looper). Force one
+                // traversal so the agent window cannot be starved into an ANR.
+                if (mAgentTraversalScheduled && !mIsInTraversal) {
+                    Trace.instant(Trace.TRACE_TAG_VIEW, "agentDeferDeadlineForce");
+                    runAgentDeferredTraversalNow();
+                }
+            };
+        }
+        if (!mAgentIdlerRegistered) {
+            mHandler.getLooper().getQueue().addIdleHandler(mAgentTraversalIdler);
+            mAgentIdlerRegistered = true;
+        }
+        mHandler.removeCallbacks(mAgentTraversalDeadlineRunnable);
+        mHandler.postDelayed(mAgentTraversalDeadlineRunnable, AGENT_DECOUPLE_MAX_DEFER_MS);
     }
 
-    private void doAgentDeferredTraversal() {
-        if (!mAgentTraversalScheduled) {
-            return;
+    /**
+     * Run one agent traversal inside a synthetic frame. Shared by the idle path and the
+     * safety-deadline path. Clears the armed state and cancels the deadline.
+     */
+    private void runAgentDeferredTraversalNow() {
+        mAgentTraversalScheduled = false;
+        if (mAgentTraversalDeadlineRunnable != null) {
+            mHandler.removeCallbacks(mAgentTraversalDeadlineRunnable);
         }
         if (mAgentFrozen || mView == null || !mAdded) {
-            mAgentTraversalScheduled = false;
             return;
         }
-        // Yield to the foreground: if the shared Choreographer has a frame scheduled,
-        // the user UI is about to render — defer this agent traversal.
-        if (agentForegroundHasPendingWork() || mIsInTraversal) {
+        // Profiling: count how many times the traversal had to wait past one frame for
+        // its idle slot (replaces the old 2ms busy-spin yield counter).
+        final long waited = SystemClock.uptimeMillis() - mAgentTraversalArmedAt;
+        if (waited > AGENT_DECOUPLE_MAX_DEFER_MS) {
             mAgentYieldCount++;
-            Trace.instant(Trace.TRACE_TAG_VIEW, "agentDeferTraversalYield");
-            mHandler.postDelayed(mAgentDeferredTraversalRunnable, AGENT_YIELD_DELAY_MS);
-            return;
         }
-        mAgentTraversalScheduled = false;
         Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentDeferredTraversal");
         try {
             // The traversal's draw() calls Choreographer.getFrameTimeNanos(), which
-            // requires mCallbacksRunning==true (i.e. running INSIDE doFrame's callback
-            // dispatch). Calling performTraversals() bare from a plain Handler message
-            // throws. So we register this window's real traversal callback and pump a
-            // synthetic frame: doFrameForAgent() runs doFrame, which invokes the
-            // TRAVERSAL callback (mTraversalRunnable -> doTraversal -> performTraversals)
-            // while a frame is in progress. GPU draw stays ON (Layer 1 independent of
-            // Layer-2 noDraw) so the agent VD's ImageReader receives the frame.
+            // requires running INSIDE doFrame's callback dispatch. Register this window's
+            // real traversal callback and pump a synthetic frame: doFrameForAgent() runs
+            // doFrame, which invokes the TRAVERSAL callback (mTraversalRunnable ->
+            // doTraversal -> performTraversals) while a frame is in progress. GPU draw
+            // stays ON (Layer 1 independent of Layer-2 noDraw) so the agent VD's
+            // ImageReader still receives the frame.
             if (!mTraversalScheduled) {
                 mTraversalScheduled = true;
                 mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
@@ -3221,8 +3271,12 @@ public final class ViewRootImpl implements ViewParent,
     void unscheduleTraversals() {
         if (mAgentTraversalScheduled) {
             mAgentTraversalScheduled = false;
-            if (mAgentDeferredTraversalRunnable != null) {
-                mHandler.removeCallbacks(mAgentDeferredTraversalRunnable);
+            if (mAgentIdlerRegistered && mAgentTraversalIdler != null) {
+                mHandler.getLooper().getQueue().removeIdleHandler(mAgentTraversalIdler);
+                mAgentIdlerRegistered = false;
+            }
+            if (mAgentTraversalDeadlineRunnable != null) {
+                mHandler.removeCallbacks(mAgentTraversalDeadlineRunnable);
             }
         }
         if (mTraversalScheduled) {
