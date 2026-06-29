@@ -77,34 +77,52 @@ def load_fonts_dir(fonts_dir):
     region-specific glyphs (SC/TC/JP/KR/HK variants of Noto Sans CJK) are
     all available under the same family name.
 
-    Returns a dict {family_name (lowercased): merged_cmap_dict}. Family name
-    is taken from the font's `name` table to match what
+    Returns a dict {family_name (lowercased): [cmap_dict, ...]}. Each physical
+    font registers its OWN cmap as a separate candidate, because multiple
+    files can legitimately share a family name yet carry DIFFERENT glyph
+    orderings (e.g. several subsetted "FZYouHeiS" instances downloaded by one
+    app). decode_run() tries every candidate and keeps the best fit. Family
+    name is taken from the font's `name` table to match what
     SkTypeface::getFamilyName() reports.
     """
-    families = {}  # lowercased name -> {gid: unicode}
+    families = {}  # lowercased name -> list of {gid: unicode}
 
     def register(font, src):
+        # Collect ALL candidate family names this font may be referenced by.
+        # Skia's SkTypeface::getFamilyName() (what the DL "font" field carries)
+        # may report the typographic family (name id 16) WITHOUT the subfamily
+        # suffix, while the legacy family (id 1) often includes it
+        # (e.g. "FZYouHeiS 508R" vs typographic "FZYouHeiS"). Index under every
+        # distinct name so the DL family matches regardless.
+        names = set()
         try:
-            name_table = font['name']
-            family = None
-            # Prefer English (langID 0x409) family name (id=1) or
-            # preferred family (id=16) on Windows platform (3).
-            for rec in name_table.names:
-                if rec.nameID in (1, 16) and rec.platformID == 3:
-                    family = rec.toUnicode().strip()
-                    break
-            if not family:
-                family = font['name'].getDebugName(1) or src.stem
+            for rec in font['name'].names:
+                if rec.nameID in (1, 4, 6, 16):
+                    try:
+                        val = rec.toUnicode().strip()
+                    except Exception:
+                        continue
+                    if val:
+                        names.add(val)
+                        # Postscript names (id 6) often replace spaces with
+                        # hyphens; also add a space-normalized variant.
+                        names.add(val.replace('-', ' '))
         except Exception:
-            family = src.stem
-        key = family.lower()
+            pass
+        if not names:
+            names.add(src.stem)
         m = cmap_of(font)
-        if key in families:
-            for gid, u in m.items():
-                families[key].setdefault(gid, u)
-        else:
-            families[key] = m
-        return family, len(m)
+        primary = None
+        for val in sorted(names):
+            key = val.lower()
+            if primary is None:
+                primary = val
+            # Append this font's cmap as a candidate for the family name.
+            # Avoid duplicate identical cmaps under the same key.
+            bucket = families.setdefault(key, [])
+            if m not in bucket:
+                bucket.append(m)
+        return primary, len(m)
 
     loaded = []
     for path in sorted(Path(fonts_dir).rglob('*')):
@@ -129,30 +147,85 @@ def load_fonts_dir(fonts_dir):
 
 # ── Decoding ───────────────────────────────────────────────────────────────
 
+# Optional CJK plausibility scorer. When several fonts share a family name but
+# carry different glyph orderings (subsetted instances), the DL "font" field
+# (a bare family name) cannot disambiguate them, and several candidates may
+# decode every glyph WITHOUT a miss — yet only one yields real words. We break
+# such ties by word-level frequency (most plausible text wins). Degrades
+# gracefully to the fewest-misses heuristic if wordfreq is unavailable.
+try:
+    from wordfreq import zipf_frequency as _zipf
+    try:
+        import jieba as _jieba
+        _jieba.setLogLevel(60)
+        _HAS_JIEBA = True
+    except Exception:
+        _HAS_JIEBA = False
+    _HAS_WORDFREQ = True
+except Exception:
+    _HAS_WORDFREQ = False
+    _HAS_JIEBA = False
+
+
+def _has_cjk(s):
+    return any('\u4e00' <= c <= '\u9fff' for c in s)
+
+
+def _plausibility(text):
+    """Higher = more plausible real text. CJK: max word-level zipf frequency
+    over the string and its jieba tokens. Non-CJK or no wordfreq: 0."""
+    if not _HAS_WORDFREQ or not text or not _has_cjk(text):
+        return 0.0
+    cands = [text]
+    if _HAS_JIEBA:
+        cands += list(_jieba.cut(text))
+    best = 0.0
+    for t in cands:
+        if _has_cjk(t):
+            try:
+                best = max(best, _zipf(t, 'zh'))
+            except Exception:
+                pass
+    return best
+
+
 def decode_run(family, glyphs, font_table):
     """Translate a run's glyph IDs into a Python str.
 
-    Unmapped glyphs are emitted as U+FFFD (replacement char) so that the
-    output remains a valid string and downstream consumers can detect
-    failure rate. Returns (decoded_str, num_unmapped).
+    A family name may map to several candidate fonts with different glyph
+    orderings (subsetted instances that share a name). Try each candidate;
+    keep the decoding with the fewest unmapped glyphs, breaking ties by CJK
+    word-frequency plausibility (so "推荐" wins over an equally-mapped but
+    nonsensical "掐茹"). Unmapped glyphs are emitted as U+FFFD so the output
+    stays a valid string and callers can measure failure rate.
+    Returns (decoded_str, num_unmapped).
     """
-    cmap = font_table.get(family.lower())
-    if cmap is None:
+    candidates = font_table.get(family.lower())
+    if not candidates:
         # Try family aliases (e.g. "sans-serif" → "roboto")
         if family.lower() in ('sans-serif', 'default', 'normal'):
-            cmap = font_table.get('roboto')
-    if cmap is None:
-        return '�' * len(glyphs), len(glyphs)
-    chars = []
-    miss = 0
-    for g in glyphs:
-        u = cmap.get(g)
-        if u is None:
-            chars.append('�')
-            miss += 1
-        else:
-            chars.append(chr(u))
-    return ''.join(chars), miss
+            candidates = font_table.get('roboto')
+    if not candidates:
+        return '\ufffd' * len(glyphs), len(glyphs)
+
+    best = None  # (neg_miss, plausibility, chars)
+    for cmap in candidates:
+        chars = []
+        miss = 0
+        for g in glyphs:
+            u = cmap.get(g)
+            if u is None:
+                chars.append('\ufffd')
+                miss += 1
+            else:
+                chars.append(chr(u))
+        text = ''.join(chars)
+        score = (-miss, _plausibility(text))
+        if best is None or score > best[0]:
+            best = (score, miss, chars)
+            if miss == 0 and best[0][1] == 0.0 and len(candidates) == 1:
+                break
+    return ''.join(best[2]), best[1]
 
 
 def extract_dl_blocks(content):
