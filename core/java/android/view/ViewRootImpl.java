@@ -3642,7 +3642,25 @@ public final class ViewRootImpl implements ViewParent,
             return;
         }
         mAgentFrozen = frozen;
-        if (!frozen) {
+        if (frozen) {
+            // Agent-UI-only GPU memory release. When an agent window freezes it
+            // will not render until unfrozen, so its GPU-resident resources
+            // (this window's HardwareLayers, prefetched layers, pinned images)
+            // are dead weight. clearContent() -> nDestroyHardwareResources is
+            // PER-CONTEXT (this window's RenderProxy only); it must NOT be
+            // confused with the static HardwareRenderer.trimMemory()/trimCaches()
+            // which are process-global and would harm a co-process user UI
+            // (C1 foreground+VD shared process). Re-assert the agent-UI guard
+            // so this can never run for the user's display-0 window.
+            if (isAgentUi() && mAttachInfo != null
+                    && mAttachInfo.mThreadedRenderer != null) {
+                try {
+                    mAttachInfo.mThreadedRenderer.clearContent();
+                } catch (Throwable t) {
+                    // best-effort; freezing must still succeed
+                }
+            }
+        } else {
             scheduleTraversals();
         }
     }
