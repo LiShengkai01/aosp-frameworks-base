@@ -736,6 +736,47 @@ public final class ViewRootImpl implements ViewParent,
     // but skip GPU draw (zero GPU/SF). Set only on the UI thread for the duration of
     // a forceTraversalForAgent() call.
     boolean mAgentNoDraw;
+    // Agent PERSISTENT no-draw (GPU bypass): when true, EVERY performDraw() on this
+    // window skips the GPU draw -- not only the on-demand observe frame (mAgentNoDraw),
+    // but also the app's own real-VSYNC-driven traversals while the window is unfrozen
+    // and active. This is the "unfreeze period has traversal but all GPU is bypassed"
+    // mode: the view tree still measures/layouts/records its DisplayList (so on-demand
+    // DL perception stays correct and the app's state machine advances on input), but
+    // the RenderThread never rasterizes a frame for this window (zero GPU / zero SF
+    // buffer queued). Independent of freeze. Gated to agent UIs only.
+    //
+    // Tri-state per-window override, mirroring mAgentDecoupleOverride:
+    //   AUTO(0)  -> follow the PROCESS-WIDE default sAgentPersistentNoDrawDefault
+    //               (see below): a newly-created agent window inherits whatever mode
+    //               the agent last set process-wide, so sub-activities/dialogs the
+    //               agent navigates to AFTER task start are covered automatically
+    //               (fixes multi-window nav apps e.g. Zhihu question->answer, whose
+    //               new ViewRootImpls previously rendered at full GPU).
+    //   ON(1)    -> force on for this window (agent UI only).
+    //   OFF(-1)  -> force off for this window.
+    // Actual state decided by isAgentPersistentNoDrawActive(); see performDraw().
+    // NOTE: unlike decouple, the AUTO default is OFF (process default starts false),
+    // because nodraw BLANKS the window's output -- B-GUI / screenshot configs that
+    // render the agent VD for ImageReader capture must NOT be blanked. The agent
+    // opts in by calling gpubypass, which flips the process default ON.
+    static final int AGENT_NODRAW_AUTO = 0;
+    static final int AGENT_NODRAW_ON = 1;
+    static final int AGENT_NODRAW_OFF = -1;
+    int mAgentPersistentNoDrawOverride = AGENT_NODRAW_AUTO;
+    // Process-wide default for agent-UI persistent no-draw, inherited by every new
+    // agent ViewRootImpl at construction (so newly navigated agent windows bypass
+    // GPU without per-window re-engagement). Flipped by the gpubypass/nogpubypass
+    // dumpsys backdoor. Starts false so non-bypass configs (B-GUI screenshot) are
+    // unaffected until the agent explicitly opts in.
+    static volatile boolean sAgentPersistentNoDrawDefault = false;
+    // A window must complete at least one REAL draw() to build its RenderNode
+    // DisplayList before persistent no-draw may safely skip draws -- otherwise
+    // syncForAgent() records an empty/uninitialized DL and the agent perceives a
+    // blank screen. Set true after the first real draw in performDraw(); until then
+    // isAgentPersistentNoDrawActive() returns false so the first frame renders
+    // normally (builds the DL), then subsequent frames bypass GPU. This lets newly
+    // navigated agent windows self-bootstrap: 1 real frame, then nodraw.
+    boolean mAgentHasDrawnOnce;
     // Agent freeze: when true this window stops scheduling its own traversal/draw on
     // real VSYNC (app self-rendering for this window halts, zero GPU). The agent still
     // updates the DisplayList on demand via forceTraversalForAgent(), which calls
@@ -3712,6 +3753,86 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     /**
+     * Whether persistent GPU bypass (no-draw) is currently active for this window.
+     * AUTO (default) == isAgentUi(): on for ANY agent-UI window, including
+     * sub-activities/dialogs the agent navigates to after task start (they are agent
+     * UIs by display), so no per-window re-engagement is needed. A manual override
+     * can force on/off for experiments. Mirrors isAgentDecoupleActive().
+     * @hide
+     */
+    public boolean isAgentPersistentNoDrawActive() {
+        // Never skip draws until the window has rendered one real frame to build its
+        // DisplayList; otherwise syncForAgent records an empty DL (blank perception).
+        // This lets a newly navigated agent window self-bootstrap: 1 real frame to
+        // build the DL, then all subsequent frames bypass GPU.
+        if (!mAgentHasDrawnOnce) {
+            return false;
+        }
+        switch (mAgentPersistentNoDrawOverride) {
+            case AGENT_NODRAW_ON:  return isAgentUi();
+            case AGENT_NODRAW_OFF: return false;
+            default:               // AUTO: follow process-wide default, agent UI only
+                return sAgentPersistentNoDrawDefault && isAgentUi();
+        }
+    }
+
+    /**
+     * Persistent GPU bypass (no-draw). When active, every performDraw() on this
+     * window -- including the app's own real-VSYNC-driven traversals while unfrozen
+     * and active -- records the DisplayList and syncs to the RenderThread but skips
+     * the GPU draw (zero GPU / zero SF buffer for this window). Realizes "unfreeze
+     * period has traversal but all GPU bypassed".
+     *
+     * This is a tri-state manual OVERRIDE on top of the AUTO default (= isAgentUi()):
+     * {@code enabled==true} forces on (agent UI only), {@code false} forces off. To
+     * return to AUTO use {@link #setAgentPersistentNoDrawAuto()}. Because AUTO already
+     * covers every agent-UI window, the common case needs NO call at all -- newly
+     * navigated agent windows bypass automatically.
+     *
+     * Gated to agent UIs only; no-op-on-effect for a main/user UI window (display-0
+     * never blanks). Independent of freeze.
+     * @hide
+     */
+    public void setAgentPersistentNoDraw(boolean enabled) {
+        // Flip the PROCESS-WIDE default so every agent window -- current and future
+        // (sub-activities the agent navigates to later) -- inherits this mode without
+        // per-window re-engagement. This is the fix for multi-window nav apps.
+        sAgentPersistentNoDrawDefault = enabled;
+        // Clear any per-window manual override so this window follows the new default.
+        final boolean wasActive = isAgentPersistentNoDrawActive();
+        mAgentPersistentNoDrawOverride = AGENT_NODRAW_AUTO;
+        final boolean nowActive = isAgentPersistentNoDrawActive();
+        if (nowActive == wasActive) {
+            return;
+        }
+        if (nowActive) {
+            // Release this window's GPU-resident resources now; dead weight while we
+            // never rasterize. PER-CONTEXT (this window's RenderProxy only), agent-UI
+            // guarded -- never the static process-global trim.
+            if (isAgentUi() && mAttachInfo != null
+                    && mAttachInfo.mThreadedRenderer != null) {
+                try {
+                    mAttachInfo.mThreadedRenderer.clearContent();
+                } catch (Throwable t) {
+                    // best-effort
+                }
+            }
+        } else {
+            // Re-enable real drawing: force a full redraw so the window repaints.
+            mFullRedrawNeeded = true;
+            invalidate();
+        }
+    }
+
+    /**
+     * Return persistent no-draw to the default AUTO (= follow process default).
+     * @hide
+     */
+    public void setAgentPersistentNoDrawAuto() {
+        mAgentPersistentNoDrawOverride = AGENT_NODRAW_AUTO;
+    }
+
+    /**
      * Whether this window belongs to an agent UI (launched by an agent via the
      * agent-display API), as opposed to a main UI (user-launched). Layer-1 callback
      * rerouting, freeze, and on-demand observe all key off this. The classification
@@ -3741,6 +3862,8 @@ public final class ViewRootImpl implements ViewParent,
         return "{\"display\":" + getDisplayId()
                 + ",\"agent_ui\":" + isAgentUi()
                 + ",\"frozen\":" + mAgentFrozen
+                + ",\"persistent_nodraw\":" + isAgentPersistentNoDrawActive()
+                + ",\"persistent_nodraw_override\":" + mAgentPersistentNoDrawOverride
                 + ",\"decouple\":" + isAgentDecoupleActive()
                 + ",\"decouple_override\":" + mAgentDecoupleOverride
                 + ",\"deferred_traversals\":" + mAgentDeferredCount
@@ -6152,10 +6275,21 @@ public final class ViewRootImpl implements ViewParent,
             // Phase 1 of dual-phase agent traversal: measure+layout done, skip record entirely.
             return true;
         }
-        if (mAgentNoDraw) {
+        if (mAgentNoDraw || isAgentPersistentNoDrawActive()) {
             // Agent no-draw path: record the DisplayList and sync staging->active on the
             // RenderThread, but skip the GPU draw. Works even when the display is STATE_OFF
             // or the surface is unbound, so we deliberately bypass the screen_off guard below.
+            //
+            // Two ways to enter here:
+            //   mAgentNoDraw                    -- transient, set for the duration of one
+            //                                      on-demand forceTraversalForAgent() frame.
+            //   isAgentPersistentNoDrawActive() -- persistent GPU bypass: ANY traversal
+            //                                      (incl. the app's own real-VSYNC frames
+            //                                      while unfrozen) skips the GPU draw. AUTO
+            //                                      = isAgentUi(), so it applies to every
+            //                                      agent-UI window automatically, including
+            //                                      sub-activities navigated to after task
+            //                                      start. Never the user's display-0 window.
             if (mView != null && mAttachInfo.mThreadedRenderer != null) {
                 mAttachInfo.mThreadedRenderer.syncForAgent(mView, mAttachInfo, this);
             }
@@ -6192,6 +6326,12 @@ public final class ViewRootImpl implements ViewParent,
             usingAsyncReport = draw(fullRedrawNeeded, surfaceSyncGroup, mSyncBuffer);
             if (mAttachInfo.mThreadedRenderer != null && !usingAsyncReport) {
                 mAttachInfo.mThreadedRenderer.setFrameCallback(null);
+            }
+            // This window has now completed at least one real draw, so its DisplayList
+            // is built. Persistent no-draw may safely skip subsequent draws for an
+            // agent UI (see isAgentPersistentNoDrawActive()).
+            if (!mAgentHasDrawnOnce && isAgentUi()) {
+                mAgentHasDrawnOnce = true;
             }
         } finally {
             mIsDrawing = false;

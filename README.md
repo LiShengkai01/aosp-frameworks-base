@@ -30,10 +30,10 @@ Three components spanning the windowing system and rendering pipeline:
 
 | File | Purpose |
 |------|---------|
-| `core/java/android/view/ViewRootImpl.java` | Freeze, dual-phase forceTraversalForAgent, stability detection (mAgentDirtyTick), profiling counters |
+| `core/java/android/view/ViewRootImpl.java` | Freeze, dual-phase forceTraversalForAgent, stability detection (mAgentDirtyTick), profiling counters; **persistent GPU bypass (`mAgentPersistentNoDrawOverride` tri-state + process-wide `sAgentPersistentNoDrawDefault`, first-frame `mAgentHasDrawnOnce` bootstrap)** |
 | `core/java/android/view/Choreographer.java` | `doFrameForAgent()` synthetic VSYNC pump |
 | `core/java/android/view/ThreadedRenderer.java` | `syncForAgent()` record+sync without GPU draw |
-| `core/java/android/view/WindowManagerGlobal.java` | Parse fresh/nodraw/vsyncN/freeze/unfreeze/reset subparams; inject agent stats to DL output |
+| `core/java/android/view/WindowManagerGlobal.java` | Parse fresh/nodraw/vsyncN/freeze/unfreeze/reset **/gpubypass/nogpubypass** subparams; inject agent stats to DL output |
 | `graphics/java/android/graphics/HardwareRenderer.java` | `setSyncOnlyNextFrame()` public hidden API |
 | `libs/hwui/jni/android_graphics_HardwareRenderer.cpp` | JNI bridge for setSyncOnlyNextFrame |
 | `libs/hwui/renderthread/DrawFrameTask.{h,cpp}` | `mSyncOnlyFrame` skips GPU draw after syncFrameState |
@@ -42,6 +42,7 @@ Three components spanning the windowing system and rendering pipeline:
 | `services/core/.../wm/ActivityStarter.java` | C1: detect agent display, override to LAUNCH_MULTIPLE |
 | `services/core/.../wm/ActivityTaskManagerService.java` | `isAgentDisplay()` / mAgentDisplayIds registry |
 | `tools/dlglyph/dl_glyph_decode.py` | Host-side post-processor: reverses glyph IDs back to UTF-8 via fontTools |
+| *(frameworks/native)* `services/surfaceflinger/SurfaceFlinger.{cpp,h}` | **L3 SF compose-bypass: backdoor code 1050 skips compositing an agent VD by layerStack — cuts SF composition GPU + back-pressures video producers without touching window/display/input state (separate repo)** |
 
 ## Quick Start: Build & Deploy
 
@@ -81,6 +82,8 @@ All interaction through `dumpsys gfxinfo <pkg> displaylist [subparams]`:
 | `vsyncN` | Pump up to N synthetic VSYNC frames in Phase 1 (default 3 if no number) |
 | `freeze` | Freeze agent window (stop real-VSYNC self-rendering) |
 | `unfreeze` | Resume normal rendering |
+| `gpubypass` | Persistent no-draw: EVERY traversal (incl. the app's own real-VSYNC frames while unfrozen) skips the GPU draw. Process-wide default, inherited by newly-navigated agent windows automatically. Agent-UI only. Independent of freeze. |
+| `nogpubypass` | Disable persistent no-draw (resume real drawing) |
 | `reset` | Reset per-window profiling counters |
 
 ### Output Format
@@ -302,13 +305,41 @@ unpacked and supplied via `--fonts`, that gap closes too.
 
 ## Commit History
 
+Current branch `exp_agent_ondemand_sched` (newest first):
 ```
-ecc7907  DisplayList Export: device-space op bounds + per-run glyph IDs + reverse-cmap script
-cc6eead  Agent Rendering: on-demand DL, GPU bypass, stability detection, profiling
-bbb8b05  DisplayList Export: dump RenderNode tree as JSON for agent UI perception
-fc63e2b  Agent Display: approach B - override launchMode in setInitialState
-c9fe912  Agent Display: approach A - exempt singleTask reuse in resolveReusableTask
+<pending> Agent C3 L2: persistent GPU bypass — per-frame no-draw as an auto agent-UI
+          window property (process-wide default + per-window override + first-frame
+          bootstrap so newly-navigated windows inherit no-draw without re-engagement)
+6ed448b  dlglyph: multi-candidate font matching + CJK word-freq disambiguation
+1bb67aae Agent C3: release agent window GPU resources on freeze (agent-UI-only)
+1005f63e Agent C3 Layer-1: idle-driven decouple traversal + anti-starvation bound
+e4b6f442 add bounds and drawimage/drawpath functions (DL visual completion)
+a90aa32d Agent C3 Layer-1: make decouple an automatic window property of agent UIs
+cb00a319 Agent C3: three-layer decoupled architecture (callback reroute / GPU bypass / DL semantic-hash stability)
+42f0934d Agent on-demand: add display id + frozen flag to stats JSON
+d58973d5 Agent on-demand: switch settle to posted self-continuation
+c8fcd683 Agent on-demand: idle-driven foreground-yielding settle + animation attribution
+831e8169 DisplayList Export: device-space op bounds + per-run glyph IDs + reverse-cmap script
 ```
+
+### Three-layer GPU-bypass design (current)
+
+The agent UI's GPU cost is cut by three orthogonal, independently-switchable,
+agent-UI-only layers. None touches window visibility / display power / input /
+activity lifecycle, so the agent stays perceivable (DisplayList) and operable (tap):
+
+| Layer | Cuts | Mechanism | Switch |
+|-------|------|-----------|--------|
+| **L1 freeze** | window renders nothing while frozen + releases this window's GPU resources | `setAgentFrozen`: `scheduleTraversals` early-return + `clearContent()` | `displaylist freeze` / `unfreeze` |
+| **L2 persistent no-draw** | EVERY traversal skips `context->draw()` (rasterization + SF submit), incl. the app's own VSYNC frames — not just the observe frame | `mAgentPersistentNoDraw*`: `performDraw` routes to `syncForAgent` (record DL + RT sync, skip draw). Process-wide default so navigated sub-windows inherit; first real frame builds the DisplayList, then bypass | `displaylist gpubypass` / `nogpubypass` |
+| **L3 SF compose-bypass** | SF's composition pass for the agent VD + video/SurfaceView producer back-pressure | *(frameworks/native)* SurfaceFlinger backdoor code 1050 skips the agent VD's Output by layerStack | `service call SurfaceFlinger 1050 i32 <displayId> i32 <1/0>` |
+
+Measured (2-round avg, c3_dl_nofg_compose vs bgui_nofg baseline): target-app GPU
+compute **−94.6%**, SF composition GPU **−95.1%**, rendered frames ≈ **−99%**
+(agent VD renders single-digit frames vs thousands). CPU is roughly flat per unit
+time (DL export + agent scheduling replace the rasterization CPU). WebView pages
+(Firefox: GPU in a separate `:gpu` process) are an intrinsic boundary the render-
+pipeline bypass cannot reach.
 
 ## License
 

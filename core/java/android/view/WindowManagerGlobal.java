@@ -656,6 +656,9 @@ public final class WindowManagerGlobal {
             // vsyncN    -> pump up to N synthetic VSYNC frames during Phase 1 settle
             // freeze    -> freeze agent window (stop real-VSYNC-driven self-rendering)
             // unfreeze  -> unfreeze agent window
+            // gpubypass -> persistent no-draw: EVERY traversal (incl. app's own VSYNC
+            //              frames while unfrozen) skips GPU draw. Independent of freeze.
+            // nogpubypass-> disable persistent no-draw (resume real drawing)
             // reset     -> reset per-window agent profiling counters before fresh
             boolean fresh = false, noDraw = false, reset = false;
             int vsyncFrames = 0;
@@ -663,6 +666,7 @@ public final class WindowManagerGlobal {
             boolean asyncSettle = false; // use idle-driven foreground-yielding settle
             int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
             int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
+            int gpuBypass = 0; // 0=none, 1=enable persistent no-draw, -1=disable
             for (String arg : args) {
                 if ("fresh".equals(arg)) fresh = true;
                 else if ("nodraw".equals(arg)) noDraw = true;
@@ -675,13 +679,16 @@ public final class WindowManagerGlobal {
                 else if ("autodecouple".equals(arg)) decouple = 2;
                 else if ("hashstable".equals(arg)) hashStable = 1;
                 else if ("nohashstable".equals(arg)) hashStable = -1;
+                else if ("gpubypass".equals(arg)) gpuBypass = 1;
+                else if ("nogpubypass".equals(arg)) gpuBypass = -1;
                 else if (arg.startsWith("vsync")) {
                     String n = arg.substring(5);
                     try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
                     catch (NumberFormatException e) { vsyncFrames = 3; }
                 }
             }
-            if (fresh || freeze != 0 || reset || decouple != 0 || hashStable != 0) {
+            if (fresh || freeze != 0 || reset || decouple != 0 || hashStable != 0
+                    || gpuBypass != 0) {
                 final ViewRootImpl[] roots;
                 synchronized (mLock) {
                     roots = mRoots.toArray(new ViewRootImpl[0]);
@@ -694,6 +701,7 @@ public final class WindowManagerGlobal {
                 final boolean doAsync = asyncSettle;
                 final int dec = decouple;
                 final int hs = hashStable;
+                final int gb = gpuBypass;
                 for (final ViewRootImpl root : roots) {
                     try {
                         if (doFresh && doAsync) {
@@ -702,7 +710,7 @@ public final class WindowManagerGlobal {
                             // prevent the MessageQueue from ever going idle (where the
                             // settle passes run). Post the start and wait bounded on a
                             // latch fired from the observe's onDone callback.
-                            if (doReset || fz == 1 || dec != 0 || hs != 0) {
+                            if (doReset || fz == 1 || dec != 0 || hs != 0 || gb != 0) {
                                 root.mHandler.runWithScissors(() -> {
                                     if (doReset) root.resetAgentStats();
                                     if (dec == 1) root.setAgentDecoupleEnabled(true);
@@ -710,6 +718,8 @@ public final class WindowManagerGlobal {
                                     if (dec == 2) root.setAgentDecoupleAuto();
                                     if (hs == 1) root.setAgentHashStabilityEnabled(true);
                                     if (hs == -1) root.setAgentHashStabilityEnabled(false);
+                                    if (gb == 1) root.setAgentPersistentNoDraw(true);
+                                    if (gb == -1) root.setAgentPersistentNoDraw(false);
                                     if (fz == 1) root.setAgentFrozen(true);
                                 }, 1000);
                             }
@@ -734,6 +744,8 @@ public final class WindowManagerGlobal {
                                 if (dec == 2) root.setAgentDecoupleAuto();
                                 if (hs == 1) root.setAgentHashStabilityEnabled(true);
                                 if (hs == -1) root.setAgentHashStabilityEnabled(false);
+                                if (gb == 1) root.setAgentPersistentNoDraw(true);
+                                if (gb == -1) root.setAgentPersistentNoDraw(false);
                                 if (fz == 1) root.setAgentFrozen(true);
                                 if (doFresh) root.forceTraversalForAgent(nd, vf);
                                 if (fz == -1) root.setAgentFrozen(false);
