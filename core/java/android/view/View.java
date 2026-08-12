@@ -24153,6 +24153,10 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
         }
         mPrivateFlags4 &= ~PFLAG4_HAS_MOVED;
         mFrameContentVelocity = -1;
+        // The current RenderNode is closed here. An ancestor RecordingCanvas may remain on the
+        // stack; allowing a foreground frame at this boundary is the aggressive checkpoint whose
+        // reentrancy and latency are evaluated by the node-checkpoint experiment.
+        ViewRootImpl.agentNodeCheckpoint(this);
         return renderNode;
     }
 
@@ -25879,6 +25883,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
         }
 
         notifyAppearedOrDisappearedForContentCaptureIfNeeded(true);
+        ViewRootImpl.agentNodeCheckpoint(this);
     }
 
     private boolean hasParentWantsFocus() {
@@ -28615,6 +28620,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
 
         mMeasureCache.put(key, ((long) mMeasuredWidth) << 32 |
                 (long) mMeasuredHeight & 0xffffffffL); // suppress sign extension
+        ViewRootImpl.agentNodeCheckpoint(this);
     }
 
     /**

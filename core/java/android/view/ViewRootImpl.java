@@ -858,6 +858,13 @@ public final class ViewRootImpl implements ViewParent,
     long mAgentLastSemanticHash;
     boolean mAgentHasLastHash;
 
+    // Only set while this thread is traversing an agent ViewRoot outside Choreographer#doFrame.
+    // View measure/layout/DisplayList recording use it to insert agent-only frame checkpoints;
+    // foreground ViewRoots never install this context and retain the vanilla traversal path.
+    private static final ThreadLocal<ViewRootImpl> sAgentNodeCheckpointRoot = new ThreadLocal<>();
+    long mAgentNodeCheckpointCount;
+    long mAgentNodeCheckpointFrameCount;
+
     // === Agent on-demand idle-driven settle (foreground-yielding) ===
     // Async counterpart of forceTraversalForAgent(): instead of running the whole
     // settle loop synchronously (blocking the foreground), one settle pass is run
@@ -3287,25 +3294,56 @@ public final class ViewRootImpl implements ViewParent,
             mAgentYieldCount++;
         }
         Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentDeferredTraversal");
+        final boolean previousNoDraw = mAgentNoDraw;
         try {
-            // The traversal's draw() calls Choreographer.getFrameTimeNanos(), which
-            // requires running INSIDE doFrame's callback dispatch. Register this window's
-            // real traversal callback and pump a synthetic frame: doFrameForAgent() runs
-            // doFrame, which invokes the TRAVERSAL callback (mTraversalRunnable ->
-            // doTraversal -> performTraversals) while a frame is in progress. GPU draw
-            // stays ON (Layer 1 independent of Layer-2 noDraw) so the agent VD's
-            // ImageReader still receives the frame.
-            if (!mTraversalScheduled) {
-                mTraversalScheduled = true;
-                mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
-                mChoreographer.postCallback(
+            // Run outside Choreographer#doFrame so an arrived physical-display frame can be
+            // dispatched inline at a node checkpoint without recursively entering an outer
+            // agent doFrame. This prototype uses the existing DisplayList sync-only path.
+            if (mTraversalScheduled) {
+                mTraversalScheduled = false;
+                mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+                mChoreographer.removeCallbacks(
                         Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
             }
             mFullRedrawNeeded = true;
-            mChoreographer.doFrameForAgent();
+            mAgentNoDraw = true;
+            performAgentNodeCheckpointTraversal();
             mAgentDeferredCount++;
         } finally {
+            mAgentNoDraw = previousNoDraw;
             Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    private void performAgentNodeCheckpointTraversal() {
+        if (!isAgentUi()) {
+            performTraversals();
+            return;
+        }
+        final ViewRootImpl previousRoot = sAgentNodeCheckpointRoot.get();
+        sAgentNodeCheckpointRoot.set(this);
+        mChoreographer.beginAgentNodeCheckpointTraversal();
+        try {
+            performTraversals();
+        } finally {
+            mChoreographer.endAgentNodeCheckpointTraversal();
+            if (previousRoot == null) {
+                sAgentNodeCheckpointRoot.remove();
+            } else {
+                sAgentNodeCheckpointRoot.set(previousRoot);
+            }
+        }
+    }
+
+    static void agentNodeCheckpoint(View view) {
+        final ViewRootImpl root = sAgentNodeCheckpointRoot.get();
+        if (root == null || view == null || view.mAttachInfo == null
+                || view.mAttachInfo.mViewRootImpl != root || !root.mIsInTraversal) {
+            return;
+        }
+        root.mAgentNodeCheckpointCount++;
+        if (root.mChoreographer.doFrameAtAgentNodeCheckpoint()) {
+            root.mAgentNodeCheckpointFrameCount++;
         }
     }
 
@@ -3873,6 +3911,8 @@ public final class ViewRootImpl implements ViewParent,
                 + ",\"phase1_traversals\":" + mAgentPhase1Count
                 + ",\"phase2_traversals\":" + mAgentPhase2Count
                 + ",\"yield_count\":" + mAgentYieldCount
+                + ",\"node_checkpoints\":" + mAgentNodeCheckpointCount
+                + ",\"checkpoint_frames\":" + mAgentNodeCheckpointFrameCount
                 + ",\"observe_active\":" + mAgentObserveActive + "}";
     }
 
@@ -3887,6 +3927,8 @@ public final class ViewRootImpl implements ViewParent,
         mAgentSettled = false;
         mAgentYieldCount = 0;
         mAgentDeferredCount = 0;
+        mAgentNodeCheckpointCount = 0;
+        mAgentNodeCheckpointFrameCount = 0;
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {

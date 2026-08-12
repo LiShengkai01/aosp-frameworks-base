@@ -32,6 +32,7 @@ import android.graphics.Insets;
 import android.hardware.display.DisplayManagerGlobal;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 import android.os.SystemClock;
@@ -40,6 +41,8 @@ import android.os.Trace;
 import android.util.Log;
 import android.util.TimeUtils;
 import android.view.animation.AnimationUtils;
+
+import com.android.internal.annotations.GuardedBy;
 
 import java.io.PrintWriter;
 import java.util.Locale;
@@ -353,6 +356,31 @@ public final class Choreographer {
         setFPSDivisor(SystemProperties.getInt(ThreadedRenderer.DEBUG_FPS_DIVISOR, 1));
     }
 
+    // Agent node-checkpoint prototype. A receiver on the main Looper cannot publish VSYNC
+    // while an agent traversal occupies that Looper, so a side receiver mirrors requested
+    // app VSYNCs into this mailbox. Only the main thread consumes the mailbox.
+    private HandlerThread mAgentCheckpointVsyncThread;
+    private AgentCheckpointDisplayEventReceiver mAgentCheckpointDisplayEventReceiver;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointTraversalActive;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointVsyncScheduled;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointVsyncPending;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointFrameDispatching;
+    @GuardedBy("mLock")
+    private long mAgentCheckpointVsyncTimestampNanos;
+    @GuardedBy("mLock")
+    private int mAgentCheckpointVsyncFrame;
+    @GuardedBy("mLock")
+    private final DisplayEventReceiver.VsyncEventData mAgentCheckpointVsyncEventData =
+            new DisplayEventReceiver.VsyncEventData();
+    @GuardedBy("mLock")
+    private long mLastAgentCheckpointVsyncId = FrameInfo.INVALID_VSYNC_ID;
+    @GuardedBy("mLock")
+    private long mLastAgentCheckpointVsyncTimestampNanos = Long.MIN_VALUE;
+
     private static float getRefreshRate() {
         DisplayInfo di = DisplayManagerGlobal.getInstance().getDisplayInfo(
                 Display.DEFAULT_DISPLAY);
@@ -419,6 +447,22 @@ public final class Choreographer {
 
     private void dispose() {
         mDisplayEventReceiver.dispose();
+        final AgentCheckpointDisplayEventReceiver checkpointReceiver;
+        final HandlerThread checkpointThread;
+        synchronized (mLock) {
+            checkpointReceiver = mAgentCheckpointDisplayEventReceiver;
+            checkpointThread = mAgentCheckpointVsyncThread;
+            mAgentCheckpointDisplayEventReceiver = null;
+            mAgentCheckpointVsyncThread = null;
+            mAgentCheckpointTraversalActive = false;
+            mAgentCheckpointVsyncPending = false;
+        }
+        if (checkpointReceiver != null) {
+            checkpointReceiver.dispose();
+        }
+        if (checkpointThread != null) {
+            checkpointThread.quitSafely();
+        }
     }
 
     /**
@@ -1224,6 +1268,96 @@ public final class Choreographer {
         }
     }
 
+    /** Begin an agent traversal that may service an arrived foreground VSYNC inline. @hide */
+    public void beginAgentNodeCheckpointTraversal() {
+        ensureAgentCheckpointDisplayEventReceiver();
+        synchronized (mLock) {
+            mAgentCheckpointTraversalActive = true;
+            mAgentCheckpointVsyncPending = false;
+            // Keep the side receiver subscribed while the agent owns the main Looper. A frame
+            // request posted from another thread cannot run MSG_DO_SCHEDULE_VSYNC until the
+            // traversal returns, but it does set mFrameScheduled under mLock immediately.
+            scheduleAgentCheckpointVsyncLocked();
+        }
+    }
+
+    /** End an agent node-checkpoint traversal and restore the vanilla VSYNC path. @hide */
+    public void endAgentNodeCheckpointTraversal() {
+        synchronized (mLock) {
+            mAgentCheckpointTraversalActive = false;
+            mAgentCheckpointVsyncPending = false;
+            if (mFrameScheduled && mDisplayEventReceiver != null) {
+                mDisplayEventReceiver.scheduleVsync();
+            }
+        }
+    }
+
+    /**
+     * Runs one already-arrived foreground frame while preserving the caller's agent traversal
+     * stack. This is deliberately a frame-only pump; it does not dispatch arbitrary Looper work.
+     * @hide
+     */
+    public boolean doFrameAtAgentNodeCheckpoint() {
+        final long timestampNanos;
+        final int frame;
+        final DisplayEventReceiver.VsyncEventData data =
+                new DisplayEventReceiver.VsyncEventData();
+        synchronized (mLock) {
+            if (!mAgentCheckpointTraversalActive || mAgentCheckpointFrameDispatching
+                    || !mAgentCheckpointVsyncPending || !mFrameScheduled) {
+                return false;
+            }
+            mAgentCheckpointVsyncPending = false;
+            mAgentCheckpointFrameDispatching = true;
+            timestampNanos = mAgentCheckpointVsyncTimestampNanos;
+            frame = mAgentCheckpointVsyncFrame;
+            data.copyFrom(mAgentCheckpointVsyncEventData);
+            mLastAgentCheckpointVsyncId = data.preferredFrameTimeline().vsyncId;
+            mLastAgentCheckpointVsyncTimestampNanos = timestampNanos;
+        }
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentNodeCheckpoint#doFrame");
+        try {
+            doFrame(timestampNanos, frame, data);
+            return true;
+        } finally {
+            synchronized (mLock) {
+                mAgentCheckpointFrameDispatching = false;
+            }
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    private void ensureAgentCheckpointDisplayEventReceiver() {
+        synchronized (mLock) {
+            if (mAgentCheckpointDisplayEventReceiver != null || !USE_VSYNC) {
+                return;
+            }
+        }
+        final HandlerThread thread = new HandlerThread("AgentCheckpointVsync");
+        thread.start();
+        final AgentCheckpointDisplayEventReceiver receiver =
+                new AgentCheckpointDisplayEventReceiver(thread.getLooper());
+        synchronized (mLock) {
+            if (mAgentCheckpointDisplayEventReceiver == null) {
+                mAgentCheckpointVsyncThread = thread;
+                mAgentCheckpointDisplayEventReceiver = receiver;
+                return;
+            }
+        }
+        receiver.dispose();
+        thread.quitSafely();
+    }
+
+    @GuardedBy("mLock")
+    private void scheduleAgentCheckpointVsyncLocked() {
+        if (!mAgentCheckpointTraversalActive || mAgentCheckpointVsyncScheduled
+                || mAgentCheckpointDisplayEventReceiver == null) {
+            return;
+        }
+        mAgentCheckpointVsyncScheduled = true;
+        mAgentCheckpointDisplayEventReceiver.scheduleVsync();
+    }
+
     void doScheduleVsync() {
         synchronized (mLock) {
             if (mFrameScheduled) {
@@ -1247,7 +1381,12 @@ public final class Choreographer {
     private void scheduleVsyncLocked() {
         try {
             Trace.traceBegin(Trace.TRACE_TAG_VIEW, "Choreographer#scheduleVsyncLocked");
-            mDisplayEventReceiver.scheduleVsync();
+            if (mAgentCheckpointTraversalActive
+                    && mAgentCheckpointDisplayEventReceiver != null) {
+                scheduleAgentCheckpointVsyncLocked();
+            } else {
+                mDisplayEventReceiver.scheduleVsync();
+            }
         } finally {
             Trace.traceEnd(Trace.TRACE_TAG_VIEW);
         }
@@ -1583,7 +1722,45 @@ public final class Choreographer {
         @Override
         public void run() {
             mHavePendingVsync = false;
+            synchronized (mLock) {
+                final long vsyncId = mLastVsyncEventData.preferredFrameTimeline().vsyncId;
+                final boolean consumedAtAgentCheckpoint =
+                        (vsyncId != FrameInfo.INVALID_VSYNC_ID
+                                && vsyncId <= mLastAgentCheckpointVsyncId)
+                        || mTimestampNanos <= mLastAgentCheckpointVsyncTimestampNanos;
+                if (consumedAtAgentCheckpoint) {
+                    if (mFrameScheduled && !mAgentCheckpointTraversalActive) {
+                        mDisplayEventReceiver.scheduleVsync();
+                    }
+                    return;
+                }
+            }
             doFrame(mTimestampNanos, mFrame, mLastVsyncEventData);
+        }
+    }
+
+    private final class AgentCheckpointDisplayEventReceiver extends DisplayEventReceiver {
+        AgentCheckpointDisplayEventReceiver(Looper looper) {
+            super(looper, VSYNC_SOURCE_APP, /* eventRegistration */ 0, /* layerHandle */ 0L);
+        }
+
+        @Override
+        public void onVsync(long timestampNanos, long physicalDisplayId, int frame,
+                VsyncEventData vsyncEventData) {
+            synchronized (mLock) {
+                mAgentCheckpointVsyncScheduled = false;
+                if (!mAgentCheckpointTraversalActive) {
+                    return;
+                }
+                if (mFrameScheduled) {
+                    mAgentCheckpointVsyncTimestampNanos =
+                            Math.min(timestampNanos, System.nanoTime());
+                    mAgentCheckpointVsyncFrame = frame;
+                    mAgentCheckpointVsyncEventData.copyFrom(vsyncEventData);
+                    mAgentCheckpointVsyncPending = true;
+                }
+                scheduleAgentCheckpointVsyncLocked();
+            }
         }
     }
 
