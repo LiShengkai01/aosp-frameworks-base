@@ -779,8 +779,8 @@ public final class ViewRootImpl implements ViewParent,
     boolean mAgentHasDrawnOnce;
     // Agent freeze: when true this window stops scheduling its own traversal/draw on
     // real VSYNC (app self-rendering for this window halts, zero GPU). The agent still
-    // updates the DisplayList on demand via forceTraversalForAgent(), which calls
-    // performTraversals() directly. Gated to agent displays only (never the main display).
+    // updates the DisplayList on demand via forceTraversalForAgent(), whose traversals run
+    // through the agent checkpoint wrapper. Gated to agent displays only (never display 0).
     boolean mAgentFrozen;
     // Agent dual-phase: skip draw-command recording in Phase 1 (measure+layout only).
     boolean mAgentSkipRecord;
@@ -3523,7 +3523,7 @@ public final class ViewRootImpl implements ViewParent,
                 mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
             }
             mFullRedrawNeeded = true;
-            performTraversals();
+            performAgentNodeCheckpointTraversal();
             mAgentPhase1Count++;
         } finally {
             Trace.traceEnd(Trace.TRACE_TAG_VIEW);
@@ -3543,7 +3543,7 @@ public final class ViewRootImpl implements ViewParent,
                 mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
             }
             mFullRedrawNeeded = true;
-            performTraversals();
+            performAgentNodeCheckpointTraversal();
             mAgentPhase2Count++;
         } finally {
             Trace.traceEnd(Trace.TRACE_TAG_VIEW);
