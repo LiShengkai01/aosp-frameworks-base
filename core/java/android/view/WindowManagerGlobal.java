@@ -660,6 +660,7 @@ public final class WindowManagerGlobal {
             //              frames while unfrozen) skips GPU draw. Independent of freeze.
             // nogpubypass-> disable persistent no-draw (resume real drawing)
             // reset     -> reset per-window agent profiling counters before fresh
+            // checkpointprofile / nocheckpointprofile -> enable/disable no-hit timing
             boolean fresh = false, noDraw = false, reset = false;
             int vsyncFrames = 0;
             int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
@@ -667,6 +668,7 @@ public final class WindowManagerGlobal {
             int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
             int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
             int gpuBypass = 0; // 0=none, 1=enable persistent no-draw, -1=disable
+            int checkpointProfile = 0; // 0=none, 1=enable, -1=disable
             for (String arg : args) {
                 if ("fresh".equals(arg)) fresh = true;
                 else if ("nodraw".equals(arg)) noDraw = true;
@@ -681,6 +683,8 @@ public final class WindowManagerGlobal {
                 else if ("nohashstable".equals(arg)) hashStable = -1;
                 else if ("gpubypass".equals(arg)) gpuBypass = 1;
                 else if ("nogpubypass".equals(arg)) gpuBypass = -1;
+                else if ("checkpointprofile".equals(arg)) checkpointProfile = 1;
+                else if ("nocheckpointprofile".equals(arg)) checkpointProfile = -1;
                 else if (arg.startsWith("vsync")) {
                     String n = arg.substring(5);
                     try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
@@ -688,7 +692,8 @@ public final class WindowManagerGlobal {
                 }
             }
             if (fresh || freeze != 0 || reset || decouple != 0 || hashStable != 0
-                    || gpuBypass != 0) {
+                    || gpuBypass != 0
+                    || checkpointProfile != 0) {
                 final ViewRootImpl[] roots;
                 synchronized (mLock) {
                     roots = mRoots.toArray(new ViewRootImpl[0]);
@@ -702,6 +707,7 @@ public final class WindowManagerGlobal {
                 final int dec = decouple;
                 final int hs = hashStable;
                 final int gb = gpuBypass;
+                final int cp = checkpointProfile;
                 for (final ViewRootImpl root : roots) {
                     try {
                         if (doFresh && doAsync) {
@@ -710,9 +716,13 @@ public final class WindowManagerGlobal {
                             // prevent the MessageQueue from ever going idle (where the
                             // settle passes run). Post the start and wait bounded on a
                             // latch fired from the observe's onDone callback.
-                            if (doReset || fz == 1 || dec != 0 || hs != 0 || gb != 0) {
+                            if (doReset || fz == 1 || dec != 0 || hs != 0 || gb != 0
+                                    || cp != 0) {
                                 root.mHandler.runWithScissors(() -> {
                                     if (doReset) root.resetAgentStats();
+                                    if (cp != 0) {
+                                        root.setAgentCheckpointProfilingEnabled(cp == 1);
+                                    }
                                     if (dec == 1) root.setAgentDecoupleEnabled(true);
                                     if (dec == -1) root.setAgentDecoupleEnabled(false);
                                     if (dec == 2) root.setAgentDecoupleAuto();
@@ -739,6 +749,9 @@ public final class WindowManagerGlobal {
                         } else {
                             root.mHandler.runWithScissors(() -> {
                                 if (doReset) root.resetAgentStats();
+                                if (cp != 0) {
+                                    root.setAgentCheckpointProfilingEnabled(cp == 1);
+                                }
                                 if (dec == 1) root.setAgentDecoupleEnabled(true);
                                 if (dec == -1) root.setAgentDecoupleEnabled(false);
                                 if (dec == 2) root.setAgentDecoupleAuto();

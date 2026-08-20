@@ -864,6 +864,27 @@ public final class ViewRootImpl implements ViewParent,
     private static final ThreadLocal<ViewRootImpl> sAgentNodeCheckpointRoot = new ThreadLocal<>();
     long mAgentNodeCheckpointCount;
     long mAgentNodeCheckpointFrameCount;
+    private static final int AGENT_CHECKPOINT_TIMER_CALIBRATION_SAMPLES = 4096;
+    private static final int AGENT_CHECKPOINT_HISTOGRAM_BUCKETS = 48;
+    private static final long AGENT_CHECKPOINT_OUTLIER_NS = 10_000;
+    boolean mAgentCheckpointProfilingEnabled;
+    long mAgentCheckpointTimerCalibrationCount;
+    long mAgentCheckpointTimerCalibrationTotalNs;
+    long mAgentCheckpointTimerCalibrationMinNs;
+    long mAgentCheckpointTimerCalibrationMaxNs;
+    long mAgentNodeCheckpointNoHitCount;
+    long mAgentNodeCheckpointNoHitRawTotalNs;
+    long mAgentNodeCheckpointNoHitCalibratedTotalNs;
+    long mAgentNodeCheckpointNoHitRawMinNs;
+    long mAgentNodeCheckpointNoHitCalibratedMinNs;
+    long mAgentNodeCheckpointNoHitRawMaxNs;
+    long mAgentNodeCheckpointNoHitCalibratedMaxNs;
+    long mAgentNodeCheckpointNoHitRawOutlierCount;
+    long mAgentNodeCheckpointNoHitCalibratedOutlierCount;
+    final long[] mAgentNodeCheckpointNoHitRawHistogram =
+            new long[AGENT_CHECKPOINT_HISTOGRAM_BUCKETS];
+    final long[] mAgentNodeCheckpointNoHitCalibratedHistogram =
+            new long[AGENT_CHECKPOINT_HISTOGRAM_BUCKETS];
 
     // === Agent on-demand idle-driven settle (foreground-yielding) ===
     // Async counterpart of forceTraversalForAgent(): instead of running the whole
@@ -3342,8 +3363,133 @@ public final class ViewRootImpl implements ViewParent,
             return;
         }
         root.mAgentNodeCheckpointCount++;
-        if (root.mChoreographer.doFrameAtAgentNodeCheckpoint()) {
+        if (!root.mAgentCheckpointProfilingEnabled) {
+            if (root.mChoreographer.doFrameAtAgentNodeCheckpoint()) {
+                root.mAgentNodeCheckpointFrameCount++;
+            }
+            return;
+        }
+
+        final long startNs = System.nanoTime();
+        final boolean hit = root.mChoreographer.doFrameAtAgentNodeCheckpoint();
+        final long elapsedNs = System.nanoTime() - startNs;
+        if (hit) {
             root.mAgentNodeCheckpointFrameCount++;
+        } else {
+            root.recordAgentNodeCheckpointNoHit(elapsedNs);
+        }
+    }
+
+    private void recordAgentNodeCheckpointNoHit(long rawNs) {
+        final long calibrationNs = getAgentCheckpointTimerCalibrationMeanNs();
+        final long calibratedNs = Math.max(0, rawNs - calibrationNs);
+        if (mAgentNodeCheckpointNoHitCount == 0) {
+            mAgentNodeCheckpointNoHitRawMinNs = rawNs;
+            mAgentNodeCheckpointNoHitCalibratedMinNs = calibratedNs;
+        } else {
+            mAgentNodeCheckpointNoHitRawMinNs = Math.min(
+                    mAgentNodeCheckpointNoHitRawMinNs, rawNs);
+            mAgentNodeCheckpointNoHitCalibratedMinNs = Math.min(
+                    mAgentNodeCheckpointNoHitCalibratedMinNs, calibratedNs);
+        }
+        mAgentNodeCheckpointNoHitCount++;
+        mAgentNodeCheckpointNoHitRawTotalNs += rawNs;
+        mAgentNodeCheckpointNoHitCalibratedTotalNs += calibratedNs;
+        mAgentNodeCheckpointNoHitRawMaxNs = Math.max(
+                mAgentNodeCheckpointNoHitRawMaxNs, rawNs);
+        mAgentNodeCheckpointNoHitCalibratedMaxNs =
+                Math.max(mAgentNodeCheckpointNoHitCalibratedMaxNs, calibratedNs);
+        if (rawNs > AGENT_CHECKPOINT_OUTLIER_NS) {
+            mAgentNodeCheckpointNoHitRawOutlierCount++;
+        }
+        if (calibratedNs > AGENT_CHECKPOINT_OUTLIER_NS) {
+            mAgentNodeCheckpointNoHitCalibratedOutlierCount++;
+        }
+        mAgentNodeCheckpointNoHitRawHistogram[agentCheckpointHistogramBucket(rawNs)]++;
+        mAgentNodeCheckpointNoHitCalibratedHistogram[
+                agentCheckpointHistogramBucket(calibratedNs)]++;
+    }
+
+    private static int agentCheckpointHistogramBucket(long elapsedNs) {
+        if (elapsedNs <= 1) {
+            return 0;
+        }
+        final int bucket = 64 - Long.numberOfLeadingZeros(elapsedNs - 1);
+        return Math.min(bucket, AGENT_CHECKPOINT_HISTOGRAM_BUCKETS - 1);
+    }
+
+    private static long agentCheckpointHistogramUpperBoundNs(int bucket) {
+        return 1L << bucket;
+    }
+
+    private static long agentCheckpointHistogramPercentileUpperBoundNs(
+            long[] histogram, long count, int percentile) {
+        if (count == 0) {
+            return 0;
+        }
+        final long rank = Math.max(1, (count * percentile + 99) / 100);
+        long cumulative = 0;
+        for (int i = 0; i < histogram.length; i++) {
+            cumulative += histogram[i];
+            if (cumulative >= rank) {
+                return agentCheckpointHistogramUpperBoundNs(i);
+            }
+        }
+        return agentCheckpointHistogramUpperBoundNs(histogram.length - 1);
+    }
+
+    private long getAgentCheckpointTimerCalibrationMeanNs() {
+        return mAgentCheckpointTimerCalibrationCount == 0
+                ? 0
+                : mAgentCheckpointTimerCalibrationTotalNs / mAgentCheckpointTimerCalibrationCount;
+    }
+
+    private void calibrateAgentCheckpointTimer() {
+        long totalNs = 0;
+        long minNs = Long.MAX_VALUE;
+        long maxNs = 0;
+        for (int i = 0; i < AGENT_CHECKPOINT_TIMER_CALIBRATION_SAMPLES; i++) {
+            final long startNs = System.nanoTime();
+            final long elapsedNs = System.nanoTime() - startNs;
+            totalNs += elapsedNs;
+            minNs = Math.min(minNs, elapsedNs);
+            maxNs = Math.max(maxNs, elapsedNs);
+        }
+        mAgentCheckpointTimerCalibrationCount = AGENT_CHECKPOINT_TIMER_CALIBRATION_SAMPLES;
+        mAgentCheckpointTimerCalibrationTotalNs = totalNs;
+        mAgentCheckpointTimerCalibrationMinNs = minNs;
+        mAgentCheckpointTimerCalibrationMaxNs = maxNs;
+    }
+
+    /** @hide */
+    public void setAgentCheckpointProfilingEnabled(boolean enabled) {
+        if (!isAgentUi() || mAgentCheckpointProfilingEnabled == enabled) {
+            return;
+        }
+        mAgentCheckpointProfilingEnabled = enabled;
+        resetAgentCheckpointProfile();
+    }
+
+    private void resetAgentCheckpointProfile() {
+        mAgentCheckpointTimerCalibrationCount = 0;
+        mAgentCheckpointTimerCalibrationTotalNs = 0;
+        mAgentCheckpointTimerCalibrationMinNs = 0;
+        mAgentCheckpointTimerCalibrationMaxNs = 0;
+        mAgentNodeCheckpointNoHitCount = 0;
+        mAgentNodeCheckpointNoHitRawTotalNs = 0;
+        mAgentNodeCheckpointNoHitCalibratedTotalNs = 0;
+        mAgentNodeCheckpointNoHitRawMinNs = 0;
+        mAgentNodeCheckpointNoHitCalibratedMinNs = 0;
+        mAgentNodeCheckpointNoHitRawMaxNs = 0;
+        mAgentNodeCheckpointNoHitCalibratedMaxNs = 0;
+        mAgentNodeCheckpointNoHitRawOutlierCount = 0;
+        mAgentNodeCheckpointNoHitCalibratedOutlierCount = 0;
+        for (int i = 0; i < AGENT_CHECKPOINT_HISTOGRAM_BUCKETS; i++) {
+            mAgentNodeCheckpointNoHitRawHistogram[i] = 0;
+            mAgentNodeCheckpointNoHitCalibratedHistogram[i] = 0;
+        }
+        if (mAgentCheckpointProfilingEnabled) {
+            calibrateAgentCheckpointTimer();
         }
     }
 
@@ -3913,12 +4059,93 @@ public final class ViewRootImpl implements ViewParent,
                 + ",\"yield_count\":" + mAgentYieldCount
                 + ",\"node_checkpoints\":" + mAgentNodeCheckpointCount
                 + ",\"checkpoint_frames\":" + mAgentNodeCheckpointFrameCount
+                + getAgentCheckpointProfileStatsJson()
                 + ",\"observe_active\":" + mAgentObserveActive + "}";
+    }
+
+    private String getAgentCheckpointProfileStatsJson() {
+        final long count = mAgentNodeCheckpointNoHitCount;
+        final long rawMeanNs = count == 0 ? 0 : mAgentNodeCheckpointNoHitRawTotalNs / count;
+        final long calibratedMeanNs =
+                count == 0 ? 0 : mAgentNodeCheckpointNoHitCalibratedTotalNs / count;
+        final StringBuilder stats = new StringBuilder(768);
+        stats.append(",\"checkpoint_profile_enabled\":")
+                .append(mAgentCheckpointProfilingEnabled)
+                .append(",\"checkpoint_timer_calibration_count\":")
+                .append(mAgentCheckpointTimerCalibrationCount)
+                .append(",\"checkpoint_timer_calibration_total_ns\":")
+                .append(mAgentCheckpointTimerCalibrationTotalNs)
+                .append(",\"checkpoint_timer_calibration_mean_ns\":")
+                .append(getAgentCheckpointTimerCalibrationMeanNs())
+                .append(",\"checkpoint_timer_calibration_min_ns\":")
+                .append(mAgentCheckpointTimerCalibrationMinNs)
+                .append(",\"checkpoint_timer_calibration_max_ns\":")
+                .append(mAgentCheckpointTimerCalibrationMaxNs)
+                .append(",\"checkpoint_no_hit_count\":")
+                .append(count)
+                .append(",\"checkpoint_no_hit_raw_total_ns\":")
+                .append(mAgentNodeCheckpointNoHitRawTotalNs)
+                .append(",\"checkpoint_no_hit_raw_mean_ns\":")
+                .append(rawMeanNs)
+                .append(",\"checkpoint_no_hit_raw_min_ns\":")
+                .append(mAgentNodeCheckpointNoHitRawMinNs)
+                .append(",\"checkpoint_no_hit_raw_p50_upper_ns\":")
+                .append(
+                        agentCheckpointHistogramPercentileUpperBoundNs(
+                                mAgentNodeCheckpointNoHitRawHistogram, count, 50))
+                .append(",\"checkpoint_no_hit_raw_p95_upper_ns\":")
+                .append(
+                        agentCheckpointHistogramPercentileUpperBoundNs(
+                                mAgentNodeCheckpointNoHitRawHistogram, count, 95))
+                .append(",\"checkpoint_no_hit_raw_max_ns\":")
+                .append(mAgentNodeCheckpointNoHitRawMaxNs)
+                .append(",\"checkpoint_no_hit_raw_over_10us\":")
+                .append(mAgentNodeCheckpointNoHitRawOutlierCount)
+                .append(",\"checkpoint_no_hit_calibrated_total_ns\":")
+                .append(mAgentNodeCheckpointNoHitCalibratedTotalNs)
+                .append(",\"checkpoint_no_hit_calibrated_mean_ns\":")
+                .append(calibratedMeanNs)
+                .append(",\"checkpoint_no_hit_calibrated_min_ns\":")
+                .append(mAgentNodeCheckpointNoHitCalibratedMinNs)
+                .append(",\"checkpoint_no_hit_calibrated_p50_upper_ns\":")
+                .append(
+                        agentCheckpointHistogramPercentileUpperBoundNs(
+                                mAgentNodeCheckpointNoHitCalibratedHistogram, count, 50))
+                .append(",\"checkpoint_no_hit_calibrated_p95_upper_ns\":")
+                .append(
+                        agentCheckpointHistogramPercentileUpperBoundNs(
+                                mAgentNodeCheckpointNoHitCalibratedHistogram, count, 95))
+                .append(",\"checkpoint_no_hit_calibrated_max_ns\":")
+                .append(mAgentNodeCheckpointNoHitCalibratedMaxNs)
+                .append(",\"checkpoint_no_hit_calibrated_over_10us\":")
+                .append(mAgentNodeCheckpointNoHitCalibratedOutlierCount)
+                .append(",\"checkpoint_no_hit_histogram_log2_ns_upper\":[");
+        for (int i = 0; i < AGENT_CHECKPOINT_HISTOGRAM_BUCKETS; i++) {
+            if (i != 0) {
+                stats.append(',');
+            }
+            stats.append(agentCheckpointHistogramUpperBoundNs(i));
+        }
+        stats.append("],\"checkpoint_no_hit_raw_histogram\":[");
+        appendAgentCheckpointHistogram(stats, mAgentNodeCheckpointNoHitRawHistogram);
+        stats.append("],\"checkpoint_no_hit_calibrated_histogram\":[");
+        appendAgentCheckpointHistogram(stats, mAgentNodeCheckpointNoHitCalibratedHistogram);
+        return stats.append(']').toString();
+    }
+
+    private static void appendAgentCheckpointHistogram(StringBuilder output, long[] histogram) {
+        for (int i = 0; i < histogram.length; i++) {
+            if (i != 0) {
+                output.append(',');
+            }
+            output.append(histogram[i]);
+        }
     }
 
     /**
      * Reset per-window agent profiling counters. Called when agent passes 'reset'
      * subparam to 'dumpsys gfxinfo ... displaylist fresh reset'.
+     *
      * @hide
      */
     public void resetAgentStats() {
@@ -3929,6 +4156,7 @@ public final class ViewRootImpl implements ViewParent,
         mAgentDeferredCount = 0;
         mAgentNodeCheckpointCount = 0;
         mAgentNodeCheckpointFrameCount = 0;
+        resetAgentCheckpointProfile();
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {
