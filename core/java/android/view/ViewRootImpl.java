@@ -821,12 +821,10 @@ public final class ViewRootImpl implements ViewParent,
     // This is independent of GPU bypass (Layer 2 / mAgentNoDraw): Layer 1 keeps normal
     // GPU draw so the agent VirtualDisplay's ImageReader still receives frames.
     //
-    // Decouple is a WINDOW PROPERTY that defaults ON for any agent UI (and its
-    // derived windows): an agent UI launched on an agent display via the C1
-    // agent-display API automatically decouples, without any external trigger —
-    // exactly as freeze is gated to agent UIs. A tri-state manual override
-    // (mAgentDecoupleOverride) exists for experiments (notably B-GUI, which needs
-    // the original VSYNC-bound path): 0=auto (=isAgentUi()), 1=force on, -1=force off.
+    // Decouple is a WINDOW PROPERTY with a tri-state manual override. This A1
+    // experiment branch keeps AUTO attached to VSYNC; explicit ON enables the
+    // foreground-yielding path and explicit OFF also remains attached. This preserves
+    // both control paths while making an unconfigured agent UI the naive baseline.
     static final int AGENT_DECOUPLE_AUTO = 0;
     static final int AGENT_DECOUPLE_ON = 1;
     static final int AGENT_DECOUPLE_OFF = -1;
@@ -3199,7 +3197,7 @@ public final class ViewRootImpl implements ViewParent,
         // Layer 1: agent UI with decouple active — route the traversal off the shared
         // VSYNC TRAVERSAL queue into a foreground-yielding deferred runnable instead of
         // posting a sync barrier + CALLBACK_TRAVERSAL (which competes with the user frame).
-        // Decouple defaults ON for agent UIs (window property); see isAgentDecoupleActive().
+        // This A1 branch keeps AUTO attached to VSYNC; see isAgentDecoupleActive().
         if (isAgentDecoupleActive()) {
             scheduleAgentDeferredTraversal();
             return;
@@ -3708,23 +3706,22 @@ public final class ViewRootImpl implements ViewParent,
 
     /**
      * Layer 1: whether decoupled (foreground-yielding) traversal is currently active
-     * for this window. Defaults ON for any agent UI (window property, follows derived
-     * windows); a manual override can force it on/off for experiments (e.g. B-GUI
-     * forces it OFF to use the original VSYNC-bound path).
+     * for this window. AUTO remains attached to VSYNC on this A1 experiment branch;
+     * a manual override can enable or disable decoupling explicitly.
      * @hide
      */
     public boolean isAgentDecoupleActive() {
         switch (mAgentDecoupleOverride) {
             case AGENT_DECOUPLE_ON:  return isAgentUi();
             case AGENT_DECOUPLE_OFF: return false;
-            default:                 return isAgentUi(); // AUTO: on for agent UIs
+            default:                 return false; // AUTO: naive VSYNC-attached baseline
         }
     }
 
     /**
      * Layer 1 manual override. {@code enabled==true} forces decouple on (agent UI only),
      * {@code false} forces it off (used by B-GUI to keep the VSYNC-bound traversal).
-     * To return to the default window-property behavior use {@link #setAgentDecoupleAuto()}.
+     * To return to the default VSYNC-attached behavior use {@link #setAgentDecoupleAuto()}.
      * No-op-on-effect for a main (user) UI window, which is never decoupled.
      * @hide
      */
@@ -3733,8 +3730,8 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     /**
-     * Layer 1: clear the manual override and return to the default (auto = on for
-     * agent UIs).
+     * Layer 1: clear the manual override and return to the default (AUTO = attached
+     * to VSYNC on this A1 experiment branch).
      * @hide
      */
     public void setAgentDecoupleAuto() {
