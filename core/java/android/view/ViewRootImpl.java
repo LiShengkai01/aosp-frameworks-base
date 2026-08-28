@@ -858,6 +858,62 @@ public final class ViewRootImpl implements ViewParent,
     long mAgentLastSemanticHash;
     boolean mAgentHasLastHash;
 
+    // Profiling-only readiness detector. Disabled by default and never controls when an
+    // observation stops. It correlates terminal input, a complete Java DisplayList pass,
+    // and the subsequent synchronous RenderThread staging-to-active handoff.
+    boolean mAgentDlProfileEnabled;
+    boolean mAgentDlProfileArmed;
+    boolean mAgentDlProfileActionActive;
+    boolean mAgentDlProfileTerminalDelivered;
+    boolean mAgentDlProfileRecordPassActive;
+    boolean mAgentDlProfilePendingSync;
+    long mAgentDlProfileActionGeneration;
+    long mAgentDlProfileActionStartNanos;
+    long mAgentDlProfileTerminalRecordGeneration;
+    long mAgentDlProfileRecordGeneration;
+    long mAgentDlProfileActiveGeneration;
+    long mAgentDlProfileActiveRecordGeneration;
+    long mAgentDlProfileLastRecordDurationNanos;
+    long mAgentDlProfileLastSyncDurationNanos;
+    long mAgentDlProfileRecordDurationTotalNanos;
+    long mAgentDlProfileSyncDurationTotalNanos;
+    long mAgentDlProfileSemanticDurationTotalNanos;
+    long mAgentDlProfileBookkeepingDurationTotalNanos;
+    long mAgentDlProfileRecordCount;
+    long mAgentDlProfileSyncCount;
+    long mAgentDlProfileSemanticCount;
+    long mAgentDlProfilePassRecordedNodes;
+    long mAgentDlProfilePassNodeSketch;
+    long mAgentDlProfileActiveRecordedNodes;
+    long mAgentDlProfileActiveNodeSketch;
+    long mAgentDlProfileActiveDirtyTick;
+    long mAgentDlProfileActiveRootId;
+    boolean mAgentDlProfileActiveRootValid;
+    int mAgentDlProfileLastSyncResult;
+    long mAgentDlProfileLastSemanticHash;
+    boolean mAgentDlProfileHasSemanticHash;
+    long mAgentDlProfileLastSampleDirtyTick;
+    long mAgentDlProfileLastSampleRootId;
+    int mAgentDlProfileQuietSlots;
+    long mAgentDlProfileReadyAtUs = -1;
+    long mAgentDlProfileQuiet1AtUs = -1;
+    long mAgentDlProfileQuiet2AtUs = -1;
+
+    private static final int AGENT_DL_PROFILE_SAMPLE_CAPACITY = 64;
+    private static final int AGENT_DL_PROFILE_SAMPLE_STRIDE = 15;
+    private static final int AGENT_DL_READY_TERMINAL = 1 << 0;
+    private static final int AGENT_DL_READY_POST_ACTION_RECORD = 1 << 1;
+    private static final int AGENT_DL_READY_ACTIVE_VALID = 1 << 2;
+    private static final int AGENT_DL_READY_INPUT_QUIET = 1 << 3;
+    private static final int AGENT_DL_READY_FRAMEWORK_QUIET = 1 << 4;
+    private static final int AGENT_DL_READY = 1 << 5;
+    private static final int AGENT_DL_HASH_REPEAT = 1 << 6;
+    private static final int AGENT_DL_HASH_SAMPLED = 1 << 7;
+    private static final int AGENT_DL_ROOT_CHANGED = 1 << 8;
+    long[] mAgentDlProfileSamples;
+    int mAgentDlProfileSampleCount;
+    int mAgentDlProfileSampleWrite;
+
     // Only set while this thread is traversing an agent ViewRoot outside Choreographer#doFrame.
     // View measure/layout/DisplayList recording use it to insert agent-only frame checkpoints;
     // foreground ViewRoots never install this context and retain the vanilla traversal path.
@@ -3332,14 +3388,23 @@ public final class ViewRootImpl implements ViewParent,
             } else {
                 sAgentNodeCheckpointRoot.set(previousRoot);
             }
+            agentDlProfileOnTraversalComplete();
         }
     }
 
     static void agentNodeCheckpoint(View view) {
+        agentNodeCheckpoint(view, false);
+    }
+
+    static void agentNodeCheckpoint(View view, boolean displayListRecorded) {
         final ViewRootImpl root = sAgentNodeCheckpointRoot.get();
         if (root == null || view == null || view.mAttachInfo == null
                 || view.mAttachInfo.mViewRootImpl != root || !root.mIsInTraversal) {
             return;
+        }
+        if (displayListRecorded && root.mAgentDlProfileEnabled
+                && root.mAgentDlProfileRecordPassActive) {
+            root.agentDlProfileOnNodeRecorded(view);
         }
         root.mAgentNodeCheckpointCount++;
         if (root.mChoreographer.doFrameAtAgentNodeCheckpoint()) {
@@ -3502,6 +3567,253 @@ public final class ViewRootImpl implements ViewParent,
         mAgentLastSemanticHash = h;
         mAgentHasLastHash = true;
         return stable;
+    }
+
+    boolean isAgentDlProfileRecordingActive() {
+        return mAgentDlProfileEnabled && mAgentDlProfileActionActive;
+    }
+
+    /** Enables the profiling-only DL readiness observer. It never changes settle behavior. */
+    public void setAgentDlProfileEnabled(boolean enabled) {
+        mAgentDlProfileEnabled = enabled && isAgentUi();
+        if (mAgentDlProfileEnabled && mAgentDlProfileSamples == null) {
+            mAgentDlProfileSamples = new long[AGENT_DL_PROFILE_SAMPLE_CAPACITY
+                    * AGENT_DL_PROFILE_SAMPLE_STRIDE];
+        }
+        if (!mAgentDlProfileEnabled) {
+            mAgentDlProfileArmed = false;
+            mAgentDlProfileActionActive = false;
+            mAgentDlProfileRecordPassActive = false;
+            mAgentDlProfilePendingSync = false;
+        }
+    }
+
+    /** Arms the next touch/key action as a profiling epoch. */
+    public void armAgentDlProfile() {
+        if (!mAgentDlProfileEnabled || !isAgentUi()) {
+            return;
+        }
+        mAgentDlProfileArmed = true;
+        mAgentDlProfileActionActive = false;
+        mAgentDlProfileTerminalDelivered = false;
+        mAgentDlProfileSampleCount = 0;
+        mAgentDlProfileSampleWrite = 0;
+        mAgentDlProfileHasSemanticHash = false;
+        mAgentDlProfileQuietSlots = 0;
+        mAgentDlProfileReadyAtUs = -1;
+        mAgentDlProfileQuiet1AtUs = -1;
+        mAgentDlProfileQuiet2AtUs = -1;
+        mAgentDlProfileLastSampleDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileLastSampleRootId = 0;
+    }
+
+    private void agentDlProfileOnInputDispatched(InputEvent event) {
+        if (!mAgentDlProfileEnabled || !mAgentDlProfileArmed) {
+            return;
+        }
+        final boolean startsAction = event instanceof MotionEvent
+                ? ((MotionEvent) event).getActionMasked() == MotionEvent.ACTION_DOWN
+                : event instanceof KeyEvent
+                        && ((KeyEvent) event).getAction() == KeyEvent.ACTION_DOWN
+                        && ((KeyEvent) event).getRepeatCount() == 0;
+        if (!startsAction) {
+            return;
+        }
+        mAgentDlProfileActionGeneration++;
+        mAgentDlProfileActionActive = true;
+        mAgentDlProfileTerminalDelivered = false;
+        mAgentDlProfileActionStartNanos = System.nanoTime();
+        mAgentDlProfileTerminalRecordGeneration = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileSampleCount = 0;
+        mAgentDlProfileSampleWrite = 0;
+        mAgentDlProfileHasSemanticHash = false;
+        mAgentDlProfileQuietSlots = 0;
+        mAgentDlProfileReadyAtUs = -1;
+        mAgentDlProfileQuiet1AtUs = -1;
+        mAgentDlProfileQuiet2AtUs = -1;
+        mAgentDlProfileLastSampleDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileLastSampleRootId = 0;
+    }
+
+    private void agentDlProfileOnInputFinished(InputEvent event) {
+        if (!mAgentDlProfileEnabled || !mAgentDlProfileActionActive) {
+            return;
+        }
+        final boolean finishesAction = event instanceof MotionEvent
+                ? ((MotionEvent) event).getActionMasked() == MotionEvent.ACTION_UP
+                        || ((MotionEvent) event).getActionMasked() == MotionEvent.ACTION_CANCEL
+                : event instanceof KeyEvent && ((KeyEvent) event).getAction() == KeyEvent.ACTION_UP;
+        if (!finishesAction) {
+            return;
+        }
+        mAgentDlProfileTerminalDelivered = true;
+        mAgentDlProfileTerminalRecordGeneration = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileArmed = false;
+        Trace.instant(Trace.TRACE_TAG_VIEW, "agentDlProfileTerminalInput");
+    }
+
+    void agentDlProfileOnRecordPassBegin() {
+        if (!mAgentDlProfileEnabled) {
+            return;
+        }
+        mAgentDlProfileRecordPassActive = true;
+        mAgentDlProfilePassRecordedNodes = 0;
+        mAgentDlProfilePassNodeSketch = 0;
+    }
+
+    private void agentDlProfileOnNodeRecorded(View view) {
+        final long id = view.getUniqueDrawingId();
+        long mixed = id + 0x9e3779b97f4a7c15L;
+        mixed = (mixed ^ (mixed >>> 30)) * 0xbf58476d1ce4e5b9L;
+        mixed = (mixed ^ (mixed >>> 27)) * 0x94d049bb133111ebL;
+        mixed ^= mixed >>> 31;
+        mAgentDlProfilePassRecordedNodes++;
+        mAgentDlProfilePassNodeSketch ^= Long.rotateLeft(mixed,
+                (int) (mAgentDlProfilePassRecordedNodes & 63));
+    }
+
+    void agentDlProfileOnRecordPassComplete(boolean stagingRootValid, long rootId,
+            long durationNanos) {
+        if (!mAgentDlProfileEnabled) {
+            return;
+        }
+        mAgentDlProfileRecordGeneration++;
+        mAgentDlProfileRecordCount++;
+        mAgentDlProfileLastRecordDurationNanos = durationNanos;
+        mAgentDlProfileRecordDurationTotalNanos += durationNanos;
+        mAgentDlProfileActiveRecordGeneration = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileActiveRecordedNodes = mAgentDlProfilePassRecordedNodes;
+        mAgentDlProfileActiveNodeSketch = mAgentDlProfilePassNodeSketch;
+        mAgentDlProfileActiveDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileActiveRootId = rootId;
+        mAgentDlProfileActiveRootValid = stagingRootValid;
+    }
+
+    void agentDlProfileOnActiveSyncComplete(int syncResult, long durationNanos) {
+        if (!mAgentDlProfileEnabled) {
+            return;
+        }
+        // syncAndDrawFrame() is synchronous: this is the record generation that has
+        // crossed the RenderThread staging-to-active boundary, not a separate counter.
+        mAgentDlProfileActiveGeneration = mAgentDlProfileActiveRecordGeneration;
+        mAgentDlProfileSyncCount++;
+        mAgentDlProfileLastSyncDurationNanos = durationNanos;
+        mAgentDlProfileSyncDurationTotalNanos += durationNanos;
+        mAgentDlProfileLastSyncResult = syncResult;
+        mAgentDlProfilePendingSync = true;
+    }
+
+    private void agentDlProfileOnTraversalComplete() {
+        if (!mAgentDlProfileEnabled || !mAgentDlProfilePendingSync) {
+            return;
+        }
+        mAgentDlProfilePendingSync = false;
+        mAgentDlProfileRecordPassActive = false;
+        if (!mAgentDlProfileActionActive) {
+            return;
+        }
+
+        final long bookkeepingStart = System.nanoTime();
+        int readiness = 0;
+        if (mAgentDlProfileTerminalDelivered) {
+            readiness |= AGENT_DL_READY_TERMINAL;
+        }
+        if (mAgentDlProfileTerminalDelivered
+                && mAgentDlProfileActiveRecordGeneration
+                        > mAgentDlProfileTerminalRecordGeneration) {
+            readiness |= AGENT_DL_READY_POST_ACTION_RECORD;
+        }
+        if (mAgentDlProfileActiveRootValid) {
+            readiness |= AGENT_DL_READY_ACTIVE_VALID;
+        }
+        if (mPendingInputEventCount == 0 && !mProcessInputEventsScheduled) {
+            readiness |= AGENT_DL_READY_INPUT_QUIET;
+        }
+        if (!mTraversalScheduled && !mAgentTraversalScheduled && !mLayoutRequested) {
+            readiness |= AGENT_DL_READY_FRAMEWORK_QUIET;
+        }
+        final boolean rootChanged = mAgentDlProfileLastSampleRootId != 0
+                && mAgentDlProfileLastSampleRootId != mAgentDlProfileActiveRootId;
+        if (rootChanged) {
+            readiness |= AGENT_DL_ROOT_CHANGED;
+        }
+        final int required = AGENT_DL_READY_TERMINAL | AGENT_DL_READY_POST_ACTION_RECORD
+                | AGENT_DL_READY_ACTIVE_VALID | AGENT_DL_READY_INPUT_QUIET
+                | AGENT_DL_READY_FRAMEWORK_QUIET;
+        final boolean ready = (readiness & required) == required;
+        if (ready) {
+            readiness |= AGENT_DL_READY;
+        }
+
+        final boolean generationChanged = mAgentDlProfileActiveRecordedNodes != 0
+                || mAgentDlProfileActiveDirtyTick != mAgentDlProfileLastSampleDirtyTick
+                || rootChanged;
+        long semanticDurationNanos = 0;
+        if (ready && (!mAgentDlProfileHasSemanticHash || generationChanged)) {
+            final long hashStart = System.nanoTime();
+            final long hash = agentSemanticHash();
+            semanticDurationNanos = System.nanoTime() - hashStart;
+            if (mAgentDlProfileHasSemanticHash && hash == mAgentDlProfileLastSemanticHash) {
+                readiness |= AGENT_DL_HASH_REPEAT;
+            }
+            mAgentDlProfileLastSemanticHash = hash;
+            mAgentDlProfileHasSemanticHash = true;
+            mAgentDlProfileSemanticCount++;
+            mAgentDlProfileSemanticDurationTotalNanos += semanticDurationNanos;
+            readiness |= AGENT_DL_HASH_SAMPLED;
+        } else if (ready && mAgentDlProfileHasSemanticHash && !generationChanged) {
+            readiness |= AGENT_DL_HASH_REPEAT;
+        }
+
+        if (ready && !generationChanged) {
+            mAgentDlProfileQuietSlots++;
+        } else {
+            mAgentDlProfileQuietSlots = 0;
+        }
+        final long sinceActionUs = mAgentDlProfileActionStartNanos == 0 ? -1
+                : (System.nanoTime() - mAgentDlProfileActionStartNanos) / 1000;
+        if (ready && mAgentDlProfileReadyAtUs < 0) {
+            mAgentDlProfileReadyAtUs = sinceActionUs;
+        }
+        if (mAgentDlProfileQuietSlots >= 1 && mAgentDlProfileQuiet1AtUs < 0) {
+            mAgentDlProfileQuiet1AtUs = sinceActionUs;
+        }
+        if (mAgentDlProfileQuietSlots >= 2 && mAgentDlProfileQuiet2AtUs < 0) {
+            mAgentDlProfileQuiet2AtUs = sinceActionUs;
+        }
+        agentDlProfileAppendSample(sinceActionUs, readiness, semanticDurationNanos);
+        mAgentDlProfileLastSampleDirtyTick = mAgentDlProfileActiveDirtyTick;
+        mAgentDlProfileLastSampleRootId = mAgentDlProfileActiveRootId;
+        mAgentDlProfileBookkeepingDurationTotalNanos +=
+                System.nanoTime() - bookkeepingStart - semanticDurationNanos;
+    }
+
+    private void agentDlProfileAppendSample(long sinceActionUs, int readiness,
+            long semanticDurationNanos) {
+        if (mAgentDlProfileSamples == null) {
+            return;
+        }
+        final int slot = mAgentDlProfileSampleWrite;
+        final int base = slot * AGENT_DL_PROFILE_SAMPLE_STRIDE;
+        mAgentDlProfileSamples[base] = sinceActionUs;
+        mAgentDlProfileSamples[base + 1] = mAgentDlProfileActionGeneration;
+        mAgentDlProfileSamples[base + 2] = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileSamples[base + 3] = mAgentDlProfileActiveGeneration;
+        mAgentDlProfileSamples[base + 4] = mAgentDlProfileActiveRecordedNodes;
+        mAgentDlProfileSamples[base + 5] = mAgentDlProfileActiveNodeSketch;
+        mAgentDlProfileSamples[base + 6] = mAgentDlProfileActiveDirtyTick;
+        mAgentDlProfileSamples[base + 7] = mAgentDlProfileActiveRootId;
+        mAgentDlProfileSamples[base + 8] = readiness;
+        mAgentDlProfileSamples[base + 9] = mAgentDlProfileQuietSlots;
+        mAgentDlProfileSamples[base + 10] = mAgentDlProfileLastSemanticHash;
+        mAgentDlProfileSamples[base + 11] = mAgentDlProfileLastRecordDurationNanos;
+        mAgentDlProfileSamples[base + 12] = mAgentDlProfileLastSyncDurationNanos;
+        mAgentDlProfileSamples[base + 13] = semanticDurationNanos;
+        mAgentDlProfileSamples[base + 14] = mAgentDlProfileLastSyncResult;
+        mAgentDlProfileSampleWrite = (slot + 1) % AGENT_DL_PROFILE_SAMPLE_CAPACITY;
+        if (mAgentDlProfileSampleCount < AGENT_DL_PROFILE_SAMPLE_CAPACITY) {
+            mAgentDlProfileSampleCount++;
+        }
     }
 
     /**
@@ -3933,7 +4245,59 @@ public final class ViewRootImpl implements ViewParent,
                 + ",\"yield_count\":" + mAgentYieldCount
                 + ",\"node_checkpoints\":" + mAgentNodeCheckpointCount
                 + ",\"checkpoint_frames\":" + mAgentNodeCheckpointFrameCount
-                + ",\"observe_active\":" + mAgentObserveActive + "}";
+                + ",\"observe_active\":" + mAgentObserveActive
+                + ",\"dl_profile\":" + getAgentDlProfileJson() + "}";
+    }
+
+    private String getAgentDlProfileJson() {
+        final StringBuilder out = new StringBuilder(512 + mAgentDlProfileSampleCount * 96);
+        out.append("{\"enabled\":").append(mAgentDlProfileEnabled)
+                .append(",\"armed\":").append(mAgentDlProfileArmed)
+                .append(",\"action_active\":").append(mAgentDlProfileActionActive)
+                .append(",\"terminal_delivered\":")
+                .append(mAgentDlProfileTerminalDelivered)
+                .append(",\"action_generation\":")
+                .append(mAgentDlProfileActionGeneration)
+                .append(",\"record_generation\":")
+                .append(mAgentDlProfileRecordGeneration)
+                .append(",\"active_generation\":")
+                .append(mAgentDlProfileActiveGeneration)
+                .append(",\"last_sync_result\":")
+                .append(mAgentDlProfileLastSyncResult)
+                .append(",\"ready_at_us\":").append(mAgentDlProfileReadyAtUs)
+                .append(",\"quiet1_at_us\":").append(mAgentDlProfileQuiet1AtUs)
+                .append(",\"quiet2_at_us\":").append(mAgentDlProfileQuiet2AtUs)
+                .append(",\"record_count\":").append(mAgentDlProfileRecordCount)
+                .append(",\"record_total_ns\":")
+                .append(mAgentDlProfileRecordDurationTotalNanos)
+                .append(",\"sync_count\":").append(mAgentDlProfileSyncCount)
+                .append(",\"sync_total_ns\":").append(mAgentDlProfileSyncDurationTotalNanos)
+                .append(",\"semantic_count\":").append(mAgentDlProfileSemanticCount)
+                .append(",\"semantic_total_ns\":")
+                .append(mAgentDlProfileSemanticDurationTotalNanos)
+                .append(",\"bookkeeping_total_ns\":")
+                .append(mAgentDlProfileBookkeepingDurationTotalNanos)
+                .append(",\"sample_columns\":[\"time_us\",\"action_gen\",\"record_gen\","
+                        + "\"active_gen\",\"recorded_nodes\",\"node_sketch\",\"dirty_tick\","
+                        + "\"root_id\",\"readiness_mask\",\"quiet_slots\",\"semantic_hash\","
+                        + "\"record_ns\",\"sync_ns\",\"semantic_ns\",\"sync_result\"],"
+                        + "\"samples\":[");
+        if (mAgentDlProfileSamples != null) {
+            final int start = (mAgentDlProfileSampleWrite - mAgentDlProfileSampleCount
+                    + AGENT_DL_PROFILE_SAMPLE_CAPACITY) % AGENT_DL_PROFILE_SAMPLE_CAPACITY;
+            for (int i = 0; i < mAgentDlProfileSampleCount; i++) {
+                if (i != 0) out.append(',');
+                final int slot = (start + i) % AGENT_DL_PROFILE_SAMPLE_CAPACITY;
+                final int base = slot * AGENT_DL_PROFILE_SAMPLE_STRIDE;
+                out.append('[');
+                for (int j = 0; j < AGENT_DL_PROFILE_SAMPLE_STRIDE; j++) {
+                    if (j != 0) out.append(',');
+                    out.append(mAgentDlProfileSamples[base + j]);
+                }
+                out.append(']');
+            }
+        }
+        return out.append("]}").toString();
     }
 
     /**
@@ -3949,6 +4313,48 @@ public final class ViewRootImpl implements ViewParent,
         mAgentDeferredCount = 0;
         mAgentNodeCheckpointCount = 0;
         mAgentNodeCheckpointFrameCount = 0;
+        resetAgentDlProfileStats();
+    }
+
+    private void resetAgentDlProfileStats() {
+        mAgentDlProfileArmed = false;
+        mAgentDlProfileActionActive = false;
+        mAgentDlProfileTerminalDelivered = false;
+        mAgentDlProfileRecordPassActive = false;
+        mAgentDlProfilePendingSync = false;
+        mAgentDlProfileActionGeneration = 0;
+        mAgentDlProfileActionStartNanos = 0;
+        mAgentDlProfileTerminalRecordGeneration = 0;
+        mAgentDlProfileRecordGeneration = 0;
+        mAgentDlProfileActiveGeneration = 0;
+        mAgentDlProfileActiveRecordGeneration = 0;
+        mAgentDlProfileLastRecordDurationNanos = 0;
+        mAgentDlProfileLastSyncDurationNanos = 0;
+        mAgentDlProfileRecordDurationTotalNanos = 0;
+        mAgentDlProfileSyncDurationTotalNanos = 0;
+        mAgentDlProfileSemanticDurationTotalNanos = 0;
+        mAgentDlProfileBookkeepingDurationTotalNanos = 0;
+        mAgentDlProfileRecordCount = 0;
+        mAgentDlProfileSyncCount = 0;
+        mAgentDlProfileSemanticCount = 0;
+        mAgentDlProfilePassRecordedNodes = 0;
+        mAgentDlProfilePassNodeSketch = 0;
+        mAgentDlProfileActiveRecordedNodes = 0;
+        mAgentDlProfileActiveNodeSketch = 0;
+        mAgentDlProfileActiveDirtyTick = 0;
+        mAgentDlProfileActiveRootId = 0;
+        mAgentDlProfileActiveRootValid = false;
+        mAgentDlProfileLastSyncResult = 0;
+        mAgentDlProfileLastSemanticHash = 0;
+        mAgentDlProfileHasSemanticHash = false;
+        mAgentDlProfileLastSampleDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileLastSampleRootId = 0;
+        mAgentDlProfileQuietSlots = 0;
+        mAgentDlProfileReadyAtUs = -1;
+        mAgentDlProfileQuiet1AtUs = -1;
+        mAgentDlProfileQuiet2AtUs = -1;
+        mAgentDlProfileSampleCount = 0;
+        mAgentDlProfileSampleWrite = 0;
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {
@@ -11415,6 +11821,7 @@ public final class ViewRootImpl implements ViewParent,
     private void deliverInputEvent(QueuedInputEvent q) {
         Trace.asyncTraceBegin(Trace.TRACE_TAG_VIEW, "deliverInputEvent",
                 q.mEvent.getId());
+        agentDlProfileOnInputDispatched(q.mEvent);
 
         if (Trace.isTagEnabled(Trace.TRACE_TAG_VIEW)) {
             Trace.traceBegin(Trace.TRACE_TAG_VIEW, "deliverInputEvent src=0x"
@@ -11462,6 +11869,7 @@ public final class ViewRootImpl implements ViewParent,
     private void finishInputEvent(QueuedInputEvent q) {
         Trace.asyncTraceEnd(Trace.TRACE_TAG_VIEW, "deliverInputEvent",
                 q.mEvent.getId());
+        agentDlProfileOnInputFinished(q.mEvent);
 
         if (q.mReceiver != null) {
             boolean handled = (q.mFlags & QueuedInputEvent.FLAG_FINISHED_HANDLED) != 0;

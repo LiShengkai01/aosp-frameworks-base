@@ -817,8 +817,19 @@ public final class ThreadedRenderer extends HardwareRenderer {
      * GPU/SurfaceFlinger work.
      */
     void syncForAgent(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
-        attachInfo.mViewRootImpl.mViewFrameInfo.markDrawStart();
+        final ViewRootImpl root = attachInfo.mViewRootImpl;
+        final boolean profileDlReadiness = root.isAgentDlProfileRecordingActive();
+        root.mViewFrameInfo.markDrawStart();
+        if (profileDlReadiness) {
+            root.agentDlProfileOnRecordPassBegin();
+        }
+        final long recordStartNanos = profileDlReadiness ? System.nanoTime() : 0;
         updateRootDisplayList(view, callbacks);
+        if (profileDlReadiness) {
+            root.agentDlProfileOnRecordPassComplete(
+                    mRootNode.hasDisplayList(), view.getUniqueDrawingId(),
+                    System.nanoTime() - recordStartNanos);
+        }
         if (attachInfo.mPendingAnimatingRenderNodes != null) {
             final int count = attachInfo.mPendingAnimatingRenderNodes.size();
             for (int i = 0; i < count; i++) {
@@ -828,11 +839,16 @@ public final class ThreadedRenderer extends HardwareRenderer {
             attachInfo.mPendingAnimatingRenderNodes.clear();
             attachInfo.mPendingAnimatingRenderNodes = null;
         }
-        final FrameInfo frameInfo = attachInfo.mViewRootImpl.getUpdatedFrameInfo();
+        final FrameInfo frameInfo = root.getUpdatedFrameInfo();
         // Skip GPU draw; the DrawFrameTask still runs syncFrameState which pushes the
         // staging DisplayList to active.
         setSyncOnlyNextFrame();
-        syncAndDrawFrame(frameInfo);
+        final long syncStartNanos = profileDlReadiness ? System.nanoTime() : 0;
+        final int syncResult = syncAndDrawFrame(frameInfo);
+        if (profileDlReadiness) {
+            root.agentDlProfileOnActiveSyncComplete(
+                    syncResult, System.nanoTime() - syncStartNanos);
+        }
     }
 
     void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {

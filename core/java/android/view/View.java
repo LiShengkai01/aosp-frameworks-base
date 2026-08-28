@@ -24067,6 +24067,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
     @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.R, trackingBug = 170729553)
     public RenderNode updateDisplayListIfDirty() {
         final RenderNode renderNode = mRenderNode;
+        boolean agentDisplayListRecorded = false;
         if (!canHaveDisplayList()) {
             // can't populate RenderNode, don't try
             return renderNode;
@@ -24138,6 +24139,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
             } finally {
                 renderNode.endRecording();
                 setDisplayListProperties(renderNode);
+                agentDisplayListRecorded = true;
             }
         } else {
             if ((mPrivateFlags4 & PFLAG4_HAS_VIEW_PROPERTY_INVALIDATION)
@@ -24156,7 +24158,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
         // The current RenderNode is closed here. An ancestor RecordingCanvas may remain on the
         // stack; allowing a foreground frame at this boundary is the aggressive checkpoint whose
         // reentrancy and latency are evaluated by the node-checkpoint experiment.
-        ViewRootImpl.agentNodeCheckpoint(this);
+        ViewRootImpl.agentNodeCheckpoint(this, agentDisplayListRecorded);
         return renderNode;
     }
 

@@ -664,6 +664,8 @@ public final class WindowManagerGlobal {
             // agentstate-> return compact control state without renderer data
             // traversalfreeze / traversalunfreeze -> toggle only traversal scheduling;
             //              unlike freeze, never release/reconstruct GPU resources
+            // dlprofile / nodlprofile -> enable/disable profiling-only DL readiness observer
+            // dlprofilearm -> bind the next touch/key action to a profiling epoch
             boolean fresh = false, noDraw = false, reset = false;
             int vsyncFrames = 0;
             int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
@@ -674,6 +676,8 @@ public final class WindowManagerGlobal {
             int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
             int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
             int gpuBypass = 0; // 0=none, 1=enable persistent no-draw, -1=disable
+            int dlProfile = 0; // 0=none, 1=enable, -1=disable readiness profiling
+            boolean dlProfileArm = false;
             for (String arg : args) {
                 if ("agentctl".equals(arg)) agentControl = true;
                 else if ("agentstate".equals(arg)) agentState = true;
@@ -692,6 +696,9 @@ public final class WindowManagerGlobal {
                 else if ("nohashstable".equals(arg)) hashStable = -1;
                 else if ("gpubypass".equals(arg)) gpuBypass = 1;
                 else if ("nogpubypass".equals(arg)) gpuBypass = -1;
+                else if ("dlprofile".equals(arg)) dlProfile = 1;
+                else if ("nodlprofile".equals(arg)) dlProfile = -1;
+                else if ("dlprofilearm".equals(arg)) dlProfileArm = true;
                 else if (arg.startsWith("vsync")) {
                     String n = arg.substring(5);
                     try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
@@ -700,7 +707,7 @@ public final class WindowManagerGlobal {
             }
             if (fresh || freeze != 0 || traversalFreeze != 0 || reset || decouple != 0
                     || hashStable != 0
-                    || gpuBypass != 0) {
+                    || gpuBypass != 0 || dlProfile != 0 || dlProfileArm) {
                 final ViewRootImpl[] roots;
                 synchronized (mLock) {
                     roots = mRoots.toArray(new ViewRootImpl[0]);
@@ -715,6 +722,8 @@ public final class WindowManagerGlobal {
                 final int dec = decouple;
                 final int hs = hashStable;
                 final int gb = gpuBypass;
+                final int dlp = dlProfile;
+                final boolean dlpArm = dlProfileArm;
                 for (final ViewRootImpl root : roots) {
                     try {
                         if (doFresh && doAsync) {
@@ -724,7 +733,7 @@ public final class WindowManagerGlobal {
                             // settle passes run). Post the start and wait bounded on a
                             // latch fired from the observe's onDone callback.
                             if (doReset || fz == 1 || tfz != 0 || dec != 0 || hs != 0
-                                    || gb != 0) {
+                                    || gb != 0 || dlp != 0 || dlpArm) {
                                 root.mHandler.runWithScissors(() -> {
                                     if (doReset) root.resetAgentStats();
                                     if (dec == 1) root.setAgentDecoupleEnabled(true);
@@ -734,6 +743,9 @@ public final class WindowManagerGlobal {
                                     if (hs == -1) root.setAgentHashStabilityEnabled(false);
                                     if (gb == 1) root.setAgentPersistentNoDraw(true);
                                     if (gb == -1) root.setAgentPersistentNoDraw(false);
+                                    if (dlp == 1) root.setAgentDlProfileEnabled(true);
+                                    if (dlp == -1) root.setAgentDlProfileEnabled(false);
+                                    if (dlpArm) root.armAgentDlProfile();
                                     if (fz == 1) root.setAgentFrozen(true);
                                     if (tfz == 1) root.setAgentTraversalFrozen(true);
                                     if (tfz == -1) root.setAgentTraversalFrozen(false);
@@ -762,6 +774,9 @@ public final class WindowManagerGlobal {
                                 if (hs == -1) root.setAgentHashStabilityEnabled(false);
                                 if (gb == 1) root.setAgentPersistentNoDraw(true);
                                 if (gb == -1) root.setAgentPersistentNoDraw(false);
+                                if (dlp == 1) root.setAgentDlProfileEnabled(true);
+                                if (dlp == -1) root.setAgentDlProfileEnabled(false);
+                                if (dlpArm) root.armAgentDlProfile();
                                 if (fz == 1) root.setAgentFrozen(true);
                                 if (tfz == 1) root.setAgentTraversalFrozen(true);
                                 if (doFresh) root.forceTraversalForAgent(nd, vf);
