@@ -660,19 +660,30 @@ public final class WindowManagerGlobal {
             //              frames while unfrozen) skips GPU draw. Independent of freeze.
             // nogpubypass-> disable persistent no-draw (resume real drawing)
             // reset     -> reset per-window agent profiling counters before fresh
+            // agentctl  -> apply controls and return without dumping any state
+            // agentstate-> return compact control state without renderer data
+            // traversalfreeze / traversalunfreeze -> toggle only traversal scheduling;
+            //              unlike freeze, never release/reconstruct GPU resources
             boolean fresh = false, noDraw = false, reset = false;
             int vsyncFrames = 0;
             int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
+            int traversalFreeze = 0; // pure scheduling gate for CPU experiments
+            boolean agentControl = false;
+            boolean agentState = false;
             boolean asyncSettle = false; // use idle-driven foreground-yielding settle
             int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
             int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
             int gpuBypass = 0; // 0=none, 1=enable persistent no-draw, -1=disable
             for (String arg : args) {
-                if ("fresh".equals(arg)) fresh = true;
+                if ("agentctl".equals(arg)) agentControl = true;
+                else if ("agentstate".equals(arg)) agentState = true;
+                else if ("fresh".equals(arg)) fresh = true;
                 else if ("nodraw".equals(arg)) noDraw = true;
                 else if ("reset".equals(arg)) reset = true;
                 else if ("freeze".equals(arg)) freeze = 1;
                 else if ("unfreeze".equals(arg)) freeze = -1;
+                else if ("traversalfreeze".equals(arg)) traversalFreeze = 1;
+                else if ("traversalunfreeze".equals(arg)) traversalFreeze = -1;
                 else if ("asyncsettle".equals(arg)) asyncSettle = true;
                 else if ("decouple".equals(arg)) decouple = 1;
                 else if ("undecouple".equals(arg)) decouple = -1;
@@ -687,7 +698,8 @@ public final class WindowManagerGlobal {
                     catch (NumberFormatException e) { vsyncFrames = 3; }
                 }
             }
-            if (fresh || freeze != 0 || reset || decouple != 0 || hashStable != 0
+            if (fresh || freeze != 0 || traversalFreeze != 0 || reset || decouple != 0
+                    || hashStable != 0
                     || gpuBypass != 0) {
                 final ViewRootImpl[] roots;
                 synchronized (mLock) {
@@ -696,6 +708,7 @@ public final class WindowManagerGlobal {
                 final boolean nd = noDraw;
                 final int vf = vsyncFrames;
                 final int fz = freeze;
+                final int tfz = traversalFreeze;
                 final boolean doFresh = fresh;
                 final boolean doReset = reset;
                 final boolean doAsync = asyncSettle;
@@ -710,7 +723,8 @@ public final class WindowManagerGlobal {
                             // prevent the MessageQueue from ever going idle (where the
                             // settle passes run). Post the start and wait bounded on a
                             // latch fired from the observe's onDone callback.
-                            if (doReset || fz == 1 || dec != 0 || hs != 0 || gb != 0) {
+                            if (doReset || fz == 1 || tfz != 0 || dec != 0 || hs != 0
+                                    || gb != 0) {
                                 root.mHandler.runWithScissors(() -> {
                                     if (doReset) root.resetAgentStats();
                                     if (dec == 1) root.setAgentDecoupleEnabled(true);
@@ -721,6 +735,8 @@ public final class WindowManagerGlobal {
                                     if (gb == 1) root.setAgentPersistentNoDraw(true);
                                     if (gb == -1) root.setAgentPersistentNoDraw(false);
                                     if (fz == 1) root.setAgentFrozen(true);
+                                    if (tfz == 1) root.setAgentTraversalFrozen(true);
+                                    if (tfz == -1) root.setAgentTraversalFrozen(false);
                                 }, 1000);
                             }
                             final java.util.concurrent.CountDownLatch done =
@@ -747,14 +763,28 @@ public final class WindowManagerGlobal {
                                 if (gb == 1) root.setAgentPersistentNoDraw(true);
                                 if (gb == -1) root.setAgentPersistentNoDraw(false);
                                 if (fz == 1) root.setAgentFrozen(true);
+                                if (tfz == 1) root.setAgentTraversalFrozen(true);
                                 if (doFresh) root.forceTraversalForAgent(nd, vf);
                                 if (fz == -1) root.setAgentFrozen(false);
+                                if (tfz == -1) root.setAgentTraversalFrozen(false);
                             }, 2000);
                         }
                     } catch (Exception e) {
                         // Best-effort; fall through to dumping whatever is current.
                     }
                 }
+            }
+            if (agentControl) {
+                return;
+            }
+            if (agentState) {
+                synchronized (mLock) {
+                    pw.println("Agent control state:");
+                    for (int i = 0; i < mRoots.size(); i++) {
+                        pw.println(mRoots.get(i).getAgentStatsJson());
+                    }
+                }
+                return;
             }
             synchronized (mLock) {
                 final int count = mViews.size();

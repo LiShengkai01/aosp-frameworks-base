@@ -661,7 +661,16 @@ public final class ThreadedRenderer extends HardwareRenderer {
 
     /** @hide */
     public static void handleDumpGfxInfo(FileDescriptor fd, String[] args) {
-        dumpGlobalProfileInfo(fd, dumpArgsToFlags(args));
+        boolean agentCommand = false;
+        for (String arg : args) {
+            if ("agentctl".equals(arg) || "agentstate".equals(arg)) {
+                agentCommand = true;
+                break;
+            }
+        }
+        if (!agentCommand) {
+            dumpGlobalProfileInfo(fd, dumpArgsToFlags(args));
+        }
         WindowManagerGlobal.getInstance().dumpGfxInfo(fd, args);
     }
 

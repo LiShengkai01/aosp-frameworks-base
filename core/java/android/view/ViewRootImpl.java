@@ -3705,6 +3705,26 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     /**
+     * Freeze/unfreeze only this agent window's real-VSYNC-driven traversal scheduling.
+     * Unlike {@link #setAgentFrozen}, this method does not destroy HardwareRenderer
+     * content. It exists for the CPU scheduling experiment where GPU-resource release
+     * and reconstruction would be a confounding variable.
+     * @hide
+     */
+    public void setAgentTraversalFrozen(boolean frozen) {
+        if (frozen && !isAgentUi()) {
+            return;
+        }
+        if (mAgentFrozen == frozen) {
+            return;
+        }
+        mAgentFrozen = frozen;
+        if (!frozen) {
+            scheduleTraversals();
+        }
+    }
+
+    /**
      * Freeze/unfreeze this window's real-VSYNC-driven self-rendering. Only honored on
      * agent displays (never the main display 0) so the user's UI is never frozen. While
      * frozen, scheduleTraversals() is a no-op (the app stops rendering this window on
