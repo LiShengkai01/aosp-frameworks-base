@@ -934,11 +934,17 @@ public final class ViewRootImpl implements ViewParent,
     int mAgentObservePass;              // Phase 1 passes already run this session
     long mAgentObserveLastTick;         // mAgentDirtyTick snapshot from previous pass
     long mAgentObserveStartNanos;       // wall-clock start, for profiling
+    long mAgentObserveTimeoutMs;        // wall-clock fallback; 0 for legacy pass-bound mode
+    boolean mAgentObserveFreezeOnDone;  // traversal-only freeze after a consumable Phase 2
+    String mAgentObserveResult = "idle"; // active/readiness/timeout/budget/sync_failed
+    long mAgentObserveDurationMs;
     Runnable mAgentObserveOnDone;       // optional callback fired (on UI thread) at Phase 2 end
     Runnable mAgentSettleRunnable;      // the self-re-posting settle step
     // Profiling: number of times a settle pass was deferred because the foreground
     // had pending frame/traversal work (i.e. agent yielded to the foreground).
     int mAgentYieldCount;
+    boolean mAgentLastSyncForAgentValid;
+    int mAgentLastSyncForAgentResult = -1;
 
     boolean mApplyInsetsRequested;
     boolean mLayoutRequested;
@@ -3864,6 +3870,8 @@ public final class ViewRootImpl implements ViewParent,
                 mTraversalScheduled = false;
                 mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
             }
+            mAgentLastSyncForAgentValid = false;
+            mAgentLastSyncForAgentResult = -1;
             mFullRedrawNeeded = true;
             performAgentNodeCheckpointTraversal();
             mAgentPhase2Count++;
@@ -3898,6 +3906,31 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public void beginAgentObserve(boolean noDraw, int vsyncFrames, Runnable onDone) {
+        beginAgentObserveInternal(noDraw, Math.max(1, vsyncFrames), 0, false, onDone);
+    }
+
+    /**
+     * Begin a cheap action-to-observation settle. Framework dirty/readiness may end the
+     * window early; {@code timeoutMs} retains the old fixed wait as a hard fallback.
+     * A successful final DisplayList record/sync is followed by traversal-only freeze.
+     *
+     * <p>The caller starts this after action injection has completed. This deliberately
+     * defines readiness as "the action has been consumed and a current UI snapshot is
+     * available", not equality with UI content that may arrive asynchronously later.
+     * @hide
+     */
+    public void beginAgentReadyObserve(boolean noDraw, long timeoutMs, Runnable onDone) {
+        if (!isAgentUi() || mView == null || !mAdded || !mAppVisible
+                || mView.getVisibility() != View.VISIBLE) {
+            if (onDone != null) onDone.run();
+            return;
+        }
+        setAgentTraversalFrozen(false);
+        beginAgentObserveInternal(noDraw, 0, Math.max(1, timeoutMs), true, onDone);
+    }
+
+    private void beginAgentObserveInternal(boolean noDraw, int passBudget, long timeoutMs,
+            boolean freezeOnDone, Runnable onDone) {
         if (mView == null || !mAdded) {
             if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: skip (view=" + (mView != null)
                     + " added=" + mAdded + ")");
@@ -3911,13 +3944,18 @@ public final class ViewRootImpl implements ViewParent,
             return;
         }
         if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: begin noDraw=" + noDraw
-                + " budget=" + vsyncFrames);
+                + " budget=" + passBudget + " timeoutMs=" + timeoutMs
+                + " freezeOnDone=" + freezeOnDone);
         mAgentObserveActive = true;
         mAgentObserveNoDraw = noDraw;
-        mAgentObserveBudget = Math.max(1, vsyncFrames);
+        mAgentObserveBudget = passBudget;
         mAgentObservePass = 0;
         mAgentObserveLastTick = mAgentDirtyTick;
         mAgentObserveStartNanos = System.nanoTime();
+        mAgentObserveTimeoutMs = timeoutMs;
+        mAgentObserveFreezeOnDone = freezeOnDone;
+        mAgentObserveResult = "active";
+        mAgentObserveDurationMs = 0;
         mAgentObserveOnDone = onDone;
         mAgentSettled = true;
         mAgentHasLastHash = false; // reset hash baseline for this observe
@@ -3941,26 +3979,27 @@ public final class ViewRootImpl implements ViewParent,
         if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: step pass=" + mAgentObservePass
                 + " active=" + mAgentObserveActive + " yields=" + mAgentYieldCount);
         if (!mAgentObserveActive || mView == null || !mAdded) {
+            if (mAgentObserveActive) mAgentObserveResult = "detached";
             agentFinishObserve();
             return;
         }
         // Yield: if the foreground has a frame scheduled, defer this pass so the
         // foreground doFrame is serviced first. Re-post with a small delay to avoid a
         // busy loop while the foreground frame is pending.
-        if (agentForegroundHasPendingWork()) {
+        final boolean deadlineReached = mAgentObserveTimeoutMs > 0
+                && (System.nanoTime() - mAgentObserveStartNanos) / 1_000_000
+                        >= mAgentObserveTimeoutMs;
+        if (agentForegroundHasPendingWork() && !deadlineReached) {
             mAgentYieldCount++;
             Trace.instant(Trace.TRACE_TAG_VIEW, "agentYieldToForeground");
             mHandler.postDelayed(mAgentSettleRunnable, 4);
             return;
         }
-        if (mIsInTraversal) {
-            mHandler.postDelayed(mAgentSettleRunnable, 4);
-            return;
-        }
-
         final boolean prevNoDraw = mAgentNoDraw;
         final boolean prevSkipRecord = mAgentSkipRecord;
-        final boolean hashMode = mAgentHashStabilityEnabled;
+        // The production ready-settle path is intentionally O(1): never enable the
+        // profiling semantic hash even if a previous experiment left hash mode on.
+        final boolean hashMode = mAgentHashStabilityEnabled && mAgentObserveTimeoutMs == 0;
         boolean done = false;
         try {
             // Phase 1 pass. In hash mode, record during settle so the content
@@ -3974,17 +4013,50 @@ public final class ViewRootImpl implements ViewParent,
             if (hashMode) {
                 stable = agentIsContentStable();
             } else {
-                stable = (mAgentDirtyTick == mAgentObserveLastTick) && agentIsFrameworkStable();
+                stable = (mAgentDirtyTick == mAgentObserveLastTick)
+                        && agentIsFrameworkStable()
+                        && (mAgentObserveTimeoutMs == 0
+                                || (!mTraversalScheduled && !mAgentTraversalScheduled));
             }
             mAgentObserveLastTick = mAgentDirtyTick;
 
-            if (stable || mAgentObservePass >= mAgentObserveBudget) {
-                // Settled or budget exhausted → Phase 2 record, then finish.
-                mAgentSettled = stable;
+            final long elapsedMs = (System.nanoTime() - mAgentObserveStartNanos) / 1_000_000;
+            final boolean timedOut = mAgentObserveTimeoutMs > 0
+                    && elapsedMs >= mAgentObserveTimeoutMs;
+            final boolean budgetExhausted = mAgentObserveBudget > 0
+                    && mAgentObservePass >= mAgentObserveBudget;
+            if (stable || timedOut || budgetExhausted) {
+                // A candidate and both fallback paths publish one final complete DL.
+                // In readiness mode, re-check O(1) framework state after recording:
+                // record callbacks can themselves schedule more UI work.
                 mAgentNoDraw = mAgentObserveNoDraw;
                 mAgentSkipRecord = false;
+                final long beforeRecordTick = mAgentDirtyTick;
                 agentRecordPhase2();
-                done = true;
+                final boolean syncReady = mAgentLastSyncForAgentValid
+                        && mAgentLastSyncForAgentResult == 0;
+                final boolean quietAfterRecord = mAgentDirtyTick == beforeRecordTick
+                        && agentIsFrameworkStable() && !mTraversalScheduled
+                        && !mAgentTraversalScheduled;
+                final boolean readinessReady = stable && syncReady
+                        && (!mAgentObserveFreezeOnDone || quietAfterRecord);
+
+                if (readinessReady || timedOut || budgetExhausted) {
+                    mAgentSettled = readinessReady;
+                    if (!syncReady) {
+                        mAgentObserveResult = "sync_failed";
+                    } else if (readinessReady) {
+                        mAgentObserveResult = "readiness";
+                    } else if (timedOut) {
+                        mAgentObserveResult = "timeout";
+                    } else {
+                        mAgentObserveResult = "budget";
+                    }
+                    if (syncReady && mAgentObserveFreezeOnDone) {
+                        setAgentTraversalFrozen(true);
+                    }
+                    done = true;
+                }
             }
         } finally {
             mAgentNoDraw = prevNoDraw;
@@ -3994,7 +4066,10 @@ public final class ViewRootImpl implements ViewParent,
         if (done) {
             agentFinishObserve();
         } else {
-            mHandler.post(mAgentSettleRunnable);
+            // Readiness is sampled at approximately one 60-Hz UI period. This avoids
+            // turning an idle queue into a tight synthetic-frame loop.
+            mHandler.postDelayed(mAgentSettleRunnable,
+                    mAgentObserveTimeoutMs > 0 ? 16 : 0);
         }
     }
 
@@ -4003,6 +4078,7 @@ public final class ViewRootImpl implements ViewParent,
             return;
         }
         mAgentObserveActive = false;
+        mAgentObserveDurationMs = (System.nanoTime() - mAgentObserveStartNanos) / 1_000_000;
         Trace.asyncTraceEnd(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
         final Runnable onDone = mAgentObserveOnDone;
         mAgentObserveOnDone = null;
@@ -4012,6 +4088,12 @@ public final class ViewRootImpl implements ViewParent,
         if (onDone != null) {
             onDone.run();
         }
+    }
+
+    /** O(1) completion marker for the sync-only RenderThread handoff. */
+    void agentOnSyncForAgentComplete(boolean rootDisplayListValid, int syncResult) {
+        mAgentLastSyncForAgentValid = rootDisplayListValid;
+        mAgentLastSyncForAgentResult = syncResult;
     }
 
     /**
@@ -4269,6 +4351,12 @@ public final class ViewRootImpl implements ViewParent,
                 + ",\"node_checkpoints\":" + mAgentNodeCheckpointCount
                 + ",\"checkpoint_frames\":" + mAgentNodeCheckpointFrameCount
                 + ",\"observe_active\":" + mAgentObserveActive
+                + ",\"observe_result\":\"" + mAgentObserveResult + "\""
+                + ",\"observe_duration_ms\":" + mAgentObserveDurationMs
+                + ",\"observe_timeout_ms\":" + mAgentObserveTimeoutMs
+                + ",\"observe_passes\":" + mAgentObservePass
+                + ",\"last_sync_valid\":" + mAgentLastSyncForAgentValid
+                + ",\"last_sync_result\":" + mAgentLastSyncForAgentResult
                 + ",\"dl_profile\":" + getAgentDlProfileJson() + "}";
     }
 
@@ -4336,6 +4424,12 @@ public final class ViewRootImpl implements ViewParent,
         mAgentDeferredCount = 0;
         mAgentNodeCheckpointCount = 0;
         mAgentNodeCheckpointFrameCount = 0;
+        mAgentObserveResult = "idle";
+        mAgentObserveDurationMs = 0;
+        mAgentObserveTimeoutMs = 0;
+        mAgentObservePass = 0;
+        mAgentLastSyncForAgentValid = false;
+        mAgentLastSyncForAgentResult = -1;
         resetAgentDlProfileStats();
     }
 

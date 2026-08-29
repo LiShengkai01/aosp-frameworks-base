@@ -666,6 +666,8 @@ public final class WindowManagerGlobal {
             //              unlike freeze, never release/reconstruct GPU resources
             // dlprofile / nodlprofile -> enable/disable profiling-only DL readiness observer
             // dlprofilearm -> bind the next touch/key action to a profiling epoch
+            // readysettle -> dirty/readiness early return with readywaitN-ms fallback;
+            //                final record/sync is followed by traversal-only freeze
             boolean fresh = false, noDraw = false, reset = false;
             int vsyncFrames = 0;
             int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
@@ -673,6 +675,8 @@ public final class WindowManagerGlobal {
             boolean agentControl = false;
             boolean agentState = false;
             boolean asyncSettle = false; // use idle-driven foreground-yielding settle
+            boolean readySettle = false;
+            long readyWaitMs = 2000;
             int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
             int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
             int gpuBypass = 0; // 0=none, 1=enable persistent no-draw, -1=disable
@@ -689,6 +693,16 @@ public final class WindowManagerGlobal {
                 else if ("traversalfreeze".equals(arg)) traversalFreeze = 1;
                 else if ("traversalunfreeze".equals(arg)) traversalFreeze = -1;
                 else if ("asyncsettle".equals(arg)) asyncSettle = true;
+                else if ("readysettle".equals(arg)) {
+                    readySettle = true;
+                    asyncSettle = true;
+                    fresh = true;
+                }
+                else if (arg.startsWith("readywait")) {
+                    String n = arg.substring(9);
+                    try { readyWaitMs = Long.parseLong(n); }
+                    catch (NumberFormatException e) { readyWaitMs = 2000; }
+                }
                 else if ("decouple".equals(arg)) decouple = 1;
                 else if ("undecouple".equals(arg)) decouple = -1;
                 else if ("autodecouple".equals(arg)) decouple = 2;
@@ -719,6 +733,8 @@ public final class WindowManagerGlobal {
                 final boolean doFresh = fresh;
                 final boolean doReset = reset;
                 final boolean doAsync = asyncSettle;
+                final boolean doReadySettle = readySettle;
+                final long readyTimeoutMs = Math.max(1, readyWaitMs);
                 final int dec = decouple;
                 final int hs = hashStable;
                 final int gb = gpuBypass;
@@ -753,10 +769,17 @@ public final class WindowManagerGlobal {
                             }
                             final java.util.concurrent.CountDownLatch done =
                                     new java.util.concurrent.CountDownLatch(1);
-                            root.mHandler.post(() ->
-                                    root.beginAgentObserve(nd, vf, done::countDown));
+                            root.mHandler.post(() -> {
+                                if (doReadySettle) {
+                                    root.beginAgentReadyObserve(
+                                            nd, readyTimeoutMs, done::countDown);
+                                } else {
+                                    root.beginAgentObserve(nd, vf, done::countDown);
+                                }
+                            });
                             try {
-                                done.await(3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                done.await(doReadySettle ? readyTimeoutMs + 1000 : 3000,
+                                        java.util.concurrent.TimeUnit.MILLISECONDS);
                             } catch (InterruptedException ie) {
                                 Thread.currentThread().interrupt();
                             }

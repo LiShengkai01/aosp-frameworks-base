@@ -845,6 +845,7 @@ public final class ThreadedRenderer extends HardwareRenderer {
         setSyncOnlyNextFrame();
         final long syncStartNanos = profileDlReadiness ? System.nanoTime() : 0;
         final int syncResult = syncAndDrawFrame(frameInfo);
+        root.agentOnSyncForAgentComplete(mRootNode.hasDisplayList(), syncResult);
         if (profileDlReadiness) {
             root.agentDlProfileOnActiveSyncComplete(
                     syncResult, System.nanoTime() - syncStartNanos);
