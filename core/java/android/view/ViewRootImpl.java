@@ -2888,6 +2888,12 @@ public final class ViewRootImpl implements ViewParent,
         if (!intersected) {
             localDirty.setEmpty();
         }
+        // Track partial invalidations as well as the full-root invalidate() path.
+        // This is an O(1) readiness signal; it deliberately avoids walking the
+        // View hierarchy or hashing the recorded DisplayList.
+        if (intersected || mIsAnimating) {
+            mAgentDirtyTick++;
+        }
         if (!mWillDrawSoon && (intersected || mIsAnimating)) {
             scheduleTraversals();
         }
@@ -3299,14 +3305,11 @@ public final class ViewRootImpl implements ViewParent,
             mAgentTraversalIdler = () -> {
                 // Runs when the main thread is about to idle: the foreground frame (if
                 // any) has already been dispatched. Run exactly one agent traversal,
-                // then remove the idler (return false). If a traversal is in progress,
-                // keep the idler registered (return true) to retry at the next idle.
+                // then remove the idler (return false). This callback itself runs on
+                // the UI looper, so it cannot execute concurrently with a traversal.
                 if (!mAgentTraversalScheduled) {
                     mAgentIdlerRegistered = false;
                     return false;
-                }
-                if (mIsInTraversal) {
-                    return true; // retry next idle; do not consume the idler
                 }
                 mAgentIdlerRegistered = false;
                 runAgentDeferredTraversalNow();
@@ -3317,7 +3320,7 @@ public final class ViewRootImpl implements ViewParent,
             mAgentTraversalDeadlineRunnable = () -> {
                 // Safety bound: idle slot never arrived in time (busy looper). Force one
                 // traversal so the agent window cannot be starved into an ANR.
-                if (mAgentTraversalScheduled && !mIsInTraversal) {
+                if (mAgentTraversalScheduled) {
                     Trace.instant(Trace.TRACE_TAG_VIEW, "agentDeferDeadlineForce");
                     runAgentDeferredTraversalNow();
                 }
@@ -3481,7 +3484,10 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public void forceTraversalForAgent(boolean noDraw, int vsyncFrames) {
-        if (mView == null || !mAdded || mIsInTraversal) {
+        // This API is dispatched with runWithScissors on the UI looper, so there is
+        // no concurrent traversal on this thread. Do not trust a stale
+        // mIsInTraversal bit left by an earlier aborted platform traversal.
+        if (mView == null || !mAdded) {
             return;
         }
         final boolean prevNoDraw = mAgentNoDraw;
@@ -3740,7 +3746,11 @@ public final class ViewRootImpl implements ViewParent,
         final int required = AGENT_DL_READY_TERMINAL | AGENT_DL_READY_POST_ACTION_RECORD
                 | AGENT_DL_READY_ACTIVE_VALID | AGENT_DL_READY_INPUT_QUIET
                 | AGENT_DL_READY_FRAMEWORK_QUIET;
+        final int candidateRequired = AGENT_DL_READY_TERMINAL
+                | AGENT_DL_READY_POST_ACTION_RECORD | AGENT_DL_READY_ACTIVE_VALID
+                | AGENT_DL_READY_INPUT_QUIET;
         final boolean ready = (readiness & required) == required;
+        final boolean candidateReady = (readiness & candidateRequired) == candidateRequired;
         if (ready) {
             readiness |= AGENT_DL_READY;
         }
@@ -3748,8 +3758,14 @@ public final class ViewRootImpl implements ViewParent,
         final boolean generationChanged = mAgentDlProfileActiveRecordedNodes != 0
                 || mAgentDlProfileActiveDirtyTick != mAgentDlProfileLastSampleDirtyTick
                 || rootChanged;
+        if (candidateReady && !generationChanged) {
+            mAgentDlProfileQuietSlots++;
+        } else {
+            mAgentDlProfileQuietSlots = 0;
+        }
         long semanticDurationNanos = 0;
-        if (ready && (!mAgentDlProfileHasSemanticHash || generationChanged)) {
+        if (candidateReady && (!mAgentDlProfileHasSemanticHash || generationChanged
+                || mAgentDlProfileQuietSlots == 1)) {
             final long hashStart = System.nanoTime();
             final long hash = agentSemanticHash();
             semanticDurationNanos = System.nanoTime() - hashStart;
@@ -3761,14 +3777,8 @@ public final class ViewRootImpl implements ViewParent,
             mAgentDlProfileSemanticCount++;
             mAgentDlProfileSemanticDurationTotalNanos += semanticDurationNanos;
             readiness |= AGENT_DL_HASH_SAMPLED;
-        } else if (ready && mAgentDlProfileHasSemanticHash && !generationChanged) {
+        } else if (candidateReady && mAgentDlProfileHasSemanticHash && !generationChanged) {
             readiness |= AGENT_DL_HASH_REPEAT;
-        }
-
-        if (ready && !generationChanged) {
-            mAgentDlProfileQuietSlots++;
-        } else {
-            mAgentDlProfileQuietSlots = 0;
         }
         final long sinceActionUs = mAgentDlProfileActionStartNanos == 0 ? -1
                 : (System.nanoTime() - mAgentDlProfileActionStartNanos) / 1000;
@@ -4084,6 +4094,13 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public boolean isAgentDecoupleActive() {
+        // The deferred Agent traversal is sync-only and cannot publish the first
+        // buffer. Let a newly-created Agent window complete one normal draw first,
+        // matching the bootstrap guard used by persistent GPU bypass below. Without
+        // this guard WMS never receives non-empty input geometry for a new window.
+        if (!mAgentHasDrawnOnce) {
+            return false;
+        }
         switch (mAgentDecoupleOverride) {
             case AGENT_DECOUPLE_ON:  return isAgentUi();
             case AGENT_DECOUPLE_OFF: return false;
@@ -4231,6 +4248,12 @@ public final class ViewRootImpl implements ViewParent,
     public String getAgentStatsJson() {
         return "{\"display\":" + getDisplayId()
                 + ",\"agent_ui\":" + isAgentUi()
+                + ",\"has_view\":" + (mView != null)
+                + ",\"added\":" + mAdded
+                + ",\"in_traversal\":" + mIsInTraversal
+                + ",\"has_drawn_once\":" + mAgentHasDrawnOnce
+                + ",\"traversal_scheduled\":" + mTraversalScheduled
+                + ",\"agent_traversal_scheduled\":" + mAgentTraversalScheduled
                 + ",\"frozen\":" + mAgentFrozen
                 + ",\"persistent_nodraw\":" + isAgentPersistentNoDrawActive()
                 + ",\"persistent_nodraw_override\":" + mAgentPersistentNoDrawOverride
