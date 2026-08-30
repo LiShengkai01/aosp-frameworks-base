@@ -4,7 +4,14 @@ Platform-layer mechanisms for Android that enable GUI agents to operate applicat
 efficiently and concurrently with users—without occupying the screen, competing for
 GPU resources, or relying on the screenshot-to-pixel pipeline.
 
-**Branch**: `exp_displaylist_export` (based on AOSP `25Q3-release`, Android 16)
+**Branch**: `exp_agent_dirty_readiness_stop` (based on AOSP `25Q3-release`, Android 16)
+
+This branch adds the production dirty/readiness return policy on top of the
+DisplayList export, on-demand traversal, foreground checkpoint, and traversal-only
+freeze branches. Its observation contract is deliberately narrow: after an Agent
+action has been injected, return the first complete active DisplayList for which
+the current UI pipeline is quiet. It does not wait for unrelated future network or
+timer updates to make the page permanently identical.
 
 ## Architecture
 
@@ -30,10 +37,10 @@ Three components spanning the windowing system and rendering pipeline:
 
 | File | Purpose |
 |------|---------|
-| `core/java/android/view/ViewRootImpl.java` | Freeze, dual-phase forceTraversalForAgent, stability detection (mAgentDirtyTick), profiling counters; **persistent GPU bypass (`mAgentPersistentNoDrawOverride` tri-state + process-wide `sAgentPersistentNoDrawDefault`, first-frame `mAgentHasDrawnOnce` bootstrap)** |
+| `core/java/android/view/ViewRootImpl.java` | Freeze, dual-phase traversal, dirty/readiness observation return, profiling counters; **persistent GPU bypass (`mAgentPersistentNoDrawOverride` tri-state + process-wide `sAgentPersistentNoDrawDefault`, first-frame `mAgentHasDrawnOnce` bootstrap)** |
 | `core/java/android/view/Choreographer.java` | `doFrameForAgent()` synthetic VSYNC pump |
 | `core/java/android/view/ThreadedRenderer.java` | `syncForAgent()` record+sync without GPU draw |
-| `core/java/android/view/WindowManagerGlobal.java` | Parse fresh/nodraw/vsyncN/freeze/unfreeze/reset **/gpubypass/nogpubypass** subparams; inject agent stats to DL output |
+| `core/java/android/view/WindowManagerGlobal.java` | Parse fresh/nodraw/vsyncN/freeze/traversalfreeze/readysettle/readywaitN and profiling controls; inject agent stats into DL output |
 | `graphics/java/android/graphics/HardwareRenderer.java` | `setSyncOnlyNextFrame()` public hidden API |
 | `libs/hwui/jni/android_graphics_HardwareRenderer.cpp` | JNI bridge for setSyncOnlyNextFrame |
 | `libs/hwui/renderthread/DrawFrameTask.{h,cpp}` | `mSyncOnlyFrame` skips GPU draw after syncFrameState |
@@ -82,6 +89,12 @@ All interaction through `dumpsys gfxinfo <pkg> displaylist [subparams]`:
 | `vsyncN` | Pump up to N synthetic VSYNC frames in Phase 1 (default 3 if no number) |
 | `freeze` | Freeze agent window (stop real-VSYNC self-rendering) |
 | `unfreeze` | Resume normal rendering |
+| `traversalfreeze` | Stop Agent traversal scheduling while preserving the current active DL and renderer content. Use this between Agent steps. |
+| `traversalunfreeze` | Resume Agent traversal scheduling without reconstructing renderer content. |
+| `asyncsettle` | Run settle passes as posted foreground-yielding continuations instead of one synchronous loop. |
+| `readysettle` | Start dirty/readiness settle on the visible Agent root, publish one final active DL, and traversal-freeze atomically. Implies `fresh asyncsettle`. |
+| `readywaitN` | Set the `readysettle` wall-clock fallback to N milliseconds. This is an upper bound, not a minimum sleep. Default: 2000. |
+| `agentstate` | Return compact per-root control/readiness JSON without exporting renderer data. |
 | `gpubypass` | Persistent no-draw: EVERY traversal (incl. the app's own real-VSYNC frames while unfrozen) skips the GPU draw. Process-wide default, inherited by newly-navigated agent windows automatically. Agent-UI only. Independent of freeze. |
 | `nogpubypass` | Disable persistent no-draw (resume real drawing) |
 | `reset` | Reset per-window profiling counters |
@@ -97,6 +110,16 @@ Per-window header with agent stats followed by DL JSON:
 - `settled=false`: Phase 1 exhausted vsyncN budget (perpetual animation present)
 - `phase1_traversals`: cumulative measure+layout-only passes since last reset
 - `phase2_traversals`: cumulative full-record passes since last reset
+- `observe_result=readiness`: dirty/readiness ended the observation before the fallback
+- `observe_result=timeout`: `readywaitN` fired and the fallback snapshot was published
+- `observe_result=sync_failed|detached`: no consumable snapshot; the caller must retry or use pixel fallback
+- `observe_duration_ms` / `observe_passes`: device-side return latency and settle passes
+- `last_sync_valid=true,last_sync_result=0`: the final root DL is valid and crossed the
+  RenderThread staging-to-active sync boundary
+
+When a package has both physical-display and Agent-display roots, match the root whose
+stats contain `"agent_ui":true`, the expected `"display":<VD_ID>`, and
+`visibility=0`. Do not select a window by package name or list order alone.
 
 Each op's `bounds`/`dst` is in **device (screen) coordinates** — the export
 canvas maps every local-space input through `SkCanvas::getLocalToDeviceAs3x3()`
@@ -129,7 +152,7 @@ adb shell "dumpsys gfxinfo com.example.app displaylist fresh nodraw"
 adb shell "dumpsys gfxinfo com.example.app displaylist fresh nodraw vsync120"
 ```
 
-### Full workflow: C1 dual-instance + C3 on-demand perception
+### Recommended workflow: action to readiness-aligned observation
 ```bash
 # 1. Start user instance on display 0
 adb shell am start --display 0 -n com.example.app/.MainActivity
@@ -141,18 +164,62 @@ app_process -cp /data/local/tmp/vd_agent.dex / \
 # 3. Get agent display ID from log
 DID=$(cat /data/local/tmp/vd_off.log | grep -oE "READY displayId=[0-9]+" | grep -oE "[0-9]+")
 
-# 4. Freeze agent window (zero GPU at rest)
-adb shell "dumpsys gfxinfo com.example.app displaylist freeze"
+# 4. Let the new Agent window complete its first real draw, then preserve that
+#    active DL while stopping only traversal scheduling between steps.
+adb shell "dumpsys gfxinfo com.example.app displaylist agentctl traversalfreeze"
 
-# 5. Inject action on agent display
+# 5. Inject one complete action on the Agent display. The command must return
+#    before starting observation; DOWN-only injection is not an action boundary.
 adb shell input -d $DID tap 540 800
 
-# 6. Get post-action DL (on-demand, GPU bypassed, stability detection)
-adb shell "dumpsys gfxinfo com.example.app displaylist fresh nodraw vsync120"
+# 6. Immediately request the post-action observation. Dirty/readiness may return
+#    early; 2000 ms is the former fixed wait retained only as a fallback bound.
+adb exec-out "dumpsys gfxinfo com.example.app displaylist fresh nodraw \
+  asyncsettle readysettle readywait2000" > /tmp/post_action_dl.txt
 
-# 7. Reset profiling counters for next measurement
-adb shell "dumpsys gfxinfo com.example.app displaylist reset"
+# 7. Verify the selected Agent root before giving the DL to the next Agent step.
+adb shell "dumpsys gfxinfo com.example.app displaylist agentstate"
+# Accept: observe_result is readiness or timeout, frozen=true,
+#         last_sync_valid=true, last_sync_result=0, observe_active=false.
+# Reject: sync_failed, detached, wrong display/root, empty DL, ANR/login/ad UI.
 ```
+
+`readysettle` unfreezes the visible Agent root internally. After a stable candidate,
+it performs one complete Java DL record and synchronous RenderThread handoff, checks
+that recording did not schedule more UI work, and then traversal-freezes before the
+dumpsys output is generated. If readiness never appears, the same final record/sync
+runs at `readywaitN`. The command therefore replaces both the old unconditional
+post-action sleep and the additional sleep used to wait for an unfrozen traversal.
+
+## Caller Alignment
+
+The readiness request must be aligned to an Agent action, not to inference time or a
+host polling interval:
+
+| Old caller behavior | This branch |
+|---|---|
+| `sleep(wait_after_action_seconds)` | Remove the sleep; call `readysettle` immediately after action injection returns |
+| Unfreeze, then `sleep(300 ms)` before dumping DL | Remove both; `readysettle` owns unfreeze, settle, final sync, and refreeze |
+| `wait_after_action_seconds=2.0` | `readywait2000`; preserve the value as fallback only |
+| `freeze` between every step | `traversalfreeze`; avoid per-step `clearContent()` and DL reconstruction |
+| Assume the first package window is the Agent UI | Select `agent_ui=true`, matching VD display ID, `visibility=0` |
+| Treat every dumpsys return as valid | Gate on result, sync validity, root/display, non-empty DL, and blocking UI |
+
+For this workspace, the aligned commercial caller is
+`agent_os/experiments/exp_commercial_three_configs_profiled/code/m3a_dl_agent.py`.
+It records before/after `observe_result`, `observe_duration_ms`, `observe_passes`, and
+Phase-1/2 counters in each `step.json`. The device-side smoke entry is:
+
+```bash
+cd /home/lishengkai/scripts/agent_os/experiments
+python3 exp_displaylist_ondemand/smoke_ready_settle.py \
+  --serial <serial> --adb-port <port> --package <pkg> --display-id <VD_ID> \
+  --action swipe_up --action tap:540:1200 --ready-wait-ms 2000
+```
+
+The smoke tool assumes the Agent VD and target app are already running. It does not
+create, reassign, or destroy displays, which makes it safe to hand to a tester after
+the device owner has confirmed the display and package.
 
 ### Profiling: measure traversal counts and GPU frames
 ```bash
@@ -288,7 +355,7 @@ unpacked and supplied via `--fonts`, that gap closes too.
 3. **C1 verification**: check logcat for `AgentDisplay: Overriding to LAUNCH_MULTIPLE`
    after launching on agent display.
 
-4. **GPU isolation verification**: after freeze, `Total frames rendered` should not
+4. **GPU isolation verification**: after traversal-freeze, `Total frames rendered` should not
    increase for the agent window. Small increments (1-4) may come from system UI on
    display 0, not from the agent window.
 
@@ -298,18 +365,27 @@ unpacked and supplied via `--fonts`, that gap closes too.
 6. **Display ID is dynamic** — each `vd_agent` launch gets a new ID. Always read it
    from the vd_agent log, never hardcode.
 
-7. **vsync budget selection**:
-   - Static UI (settings, forms): `vsync8` sufficient (settles in 1-3 frames)
-   - Animated content (feed, transitions): `vsync120` (2s budget)
-   - `settled=false` with perpetual animations is expected and correct
+7. **Readiness fallback selection**:
+   - Start validation with `readywait2000` to align with the previous commercial
+     runner's `wait_after_action_seconds=2.0`.
+   - Keep `readywaitN` constant across compared configurations; report readiness and
+     timeout samples separately.
+   - `readywaitN` does not certify future network completion. It bounds when the
+     current action observation is delivered.
+   - `vsyncN` remains a legacy pass-budget interface for synchronous experiments; do
+     not mix it with production readiness latency numbers.
 
 ## Commit History
 
-Current branch `exp_agent_ondemand_sched` (newest first):
+Current branch `exp_agent_dirty_readiness_stop` (newest first):
 ```
-<pending> Agent C3 L2: persistent GPU bypass — per-frame no-draw as an auto agent-UI
-          window property (process-wide default + per-window override + first-frame
-          bootstrap so newly-navigated windows inherit no-draw without re-engagement)
+6b300f7a Agent UI: stop observations on cheap readiness
+de2203f8 Agent UI: refine cheap readiness profiling
+654664c6 Agent UI: profile DisplayList readiness generations
+daa61196 Agent UI: add traversal-only freeze controls
+fa317639 Agent UI: checkpoint on-demand traversals
+2eef669a Agent UI: dispatch foreground frames at node checkpoints
+8e6fb21d Agent C3 L2: persistent GPU bypass as an auto agent-UI window property
 6ed448b  dlglyph: multi-candidate font matching + CJK word-freq disambiguation
 1bb67aae Agent C3: release agent window GPU resources on freeze (agent-UI-only)
 1005f63e Agent C3 Layer-1: idle-driven decouple traversal + anti-starvation bound
@@ -326,11 +402,14 @@ c8fcd683 Agent on-demand: idle-driven foreground-yielding settle + animation att
 
 The agent UI's GPU cost is cut by three orthogonal, independently-switchable,
 agent-UI-only layers. None touches window visibility / display power / input /
-activity lifecycle, so the agent stays perceivable (DisplayList) and operable (tap):
+activity lifecycle, so the agent stays perceivable (DisplayList) and operable (tap).
+The table separately lists the long-idle resource-release variant of L1 because it
+must not be substituted for the per-step scheduling freeze:
 
 | Layer | Cuts | Mechanism | Switch |
 |-------|------|-----------|--------|
-| **L1 freeze** | window renders nothing while frozen + releases this window's GPU resources | `setAgentFrozen`: `scheduleTraversals` early-return + `clearContent()` | `displaylist freeze` / `unfreeze` |
+| **L1 scheduling freeze** | no Agent traversal between steps while retaining the active DL | `setAgentTraversalFrozen`: `scheduleTraversals` early-return, no `clearContent()` | `displaylist traversalfreeze` / `traversalunfreeze`; `readysettle` refreezes automatically |
+| **Long-idle resource freeze** | additionally releases this window's GPU resources when reconstruction cost is acceptable | `setAgentFrozen`: scheduling gate + `clearContent()` | `displaylist freeze` / `unfreeze`; do not use per Agent step |
 | **L2 persistent no-draw** | EVERY traversal skips `context->draw()` (rasterization + SF submit), incl. the app's own VSYNC frames — not just the observe frame | `mAgentPersistentNoDraw*`: `performDraw` routes to `syncForAgent` (record DL + RT sync, skip draw). Process-wide default so navigated sub-windows inherit; first real frame builds the DisplayList, then bypass | `displaylist gpubypass` / `nogpubypass` |
 | **L3 SF compose-bypass** | SF's composition pass for the agent VD + video/SurfaceView producer back-pressure | *(frameworks/native)* SurfaceFlinger backdoor code 1050 skips the agent VD's Output by layerStack | `service call SurfaceFlinger 1050 i32 <displayId> i32 <1/0>` |
 
