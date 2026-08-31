@@ -734,6 +734,11 @@ public final class WindowManagerGlobal {
                 final boolean doReset = reset;
                 final boolean doAsync = asyncSettle;
                 final boolean doReadySettle = readySettle;
+                // agentctl is a control-plane command. For ready-settle, let it arm
+                // the asynchronous observer and return immediately; callers poll
+                // agentstate and dump the completed DisplayList separately. Waiting
+                // here can exceed ActivityManager's gfxinfo pipe timeout on busy apps.
+                final boolean nonBlockingReadyControl = agentControl && doReadySettle;
                 final long readyTimeoutMs = Math.max(1, readyWaitMs);
                 final int dec = decouple;
                 final int hs = hashStable;
@@ -777,11 +782,13 @@ public final class WindowManagerGlobal {
                                     root.beginAgentObserve(nd, vf, done::countDown);
                                 }
                             });
-                            try {
-                                done.await(doReadySettle ? readyTimeoutMs + 1000 : 3000,
-                                        java.util.concurrent.TimeUnit.MILLISECONDS);
-                            } catch (InterruptedException ie) {
-                                Thread.currentThread().interrupt();
+                            if (!nonBlockingReadyControl) {
+                                try {
+                                    done.await(doReadySettle ? readyTimeoutMs + 1000 : 3000,
+                                            java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                }
                             }
                             if (fz == -1) {
                                 root.mHandler.runWithScissors(
