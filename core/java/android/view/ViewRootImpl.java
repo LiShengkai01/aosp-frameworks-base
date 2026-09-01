@@ -821,16 +821,16 @@ public final class ViewRootImpl implements ViewParent,
     // This is independent of GPU bypass (Layer 2 / mAgentNoDraw): Layer 1 keeps normal
     // GPU draw so the agent VirtualDisplay's ImageReader still receives frames.
     //
-    // Decouple is a WINDOW PROPERTY that defaults ON for any agent UI (and its
-    // derived windows): an agent UI launched on an agent display via the C1
-    // agent-display API automatically decouples, without any external trigger —
-    // exactly as freeze is gated to agent UIs. A tri-state manual override
-    // (mAgentDecoupleOverride) exists for experiments (notably B-GUI, which needs
-    // the original VSYNC-bound path): 0=auto (=isAgentUi()), 1=force on, -1=force off.
+    // Decouple defaults ON for agent UIs. Its process-wide default is changed by
+    // the experiment controls so newly-created sub-activities inherit G1/G4 instead
+    // of silently returning to the automatic decoupled path after navigation. A
+    // tri-state per-window override remains available: 0=process default, 1=on,
+    // -1=off.
     static final int AGENT_DECOUPLE_AUTO = 0;
     static final int AGENT_DECOUPLE_ON = 1;
     static final int AGENT_DECOUPLE_OFF = -1;
     int mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
+    static volatile boolean sAgentDecoupleDefault = true;
     boolean mAgentTraversalScheduled;   // a deferred agent traversal is posted
     int mAgentDeferredCount;            // profiling: deferred traversals run
     // Layer 1 (IdleHandler-driven decouple): the agent traversal runs in the
@@ -4186,7 +4186,7 @@ public final class ViewRootImpl implements ViewParent,
         switch (mAgentDecoupleOverride) {
             case AGENT_DECOUPLE_ON:  return isAgentUi();
             case AGENT_DECOUPLE_OFF: return false;
-            default:                 return isAgentUi(); // AUTO: on for agent UIs
+            default: return sAgentDecoupleDefault && isAgentUi();
         }
     }
 
@@ -4198,6 +4198,7 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public void setAgentDecoupleEnabled(boolean enabled) {
+        sAgentDecoupleDefault = enabled;
         mAgentDecoupleOverride = enabled ? AGENT_DECOUPLE_ON : AGENT_DECOUPLE_OFF;
     }
 
@@ -4207,6 +4208,7 @@ public final class ViewRootImpl implements ViewParent,
      * @hide
      */
     public void setAgentDecoupleAuto() {
+        sAgentDecoupleDefault = true;
         mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
     }
 
