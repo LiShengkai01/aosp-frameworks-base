@@ -772,6 +772,15 @@ public final class WindowManagerGlobal {
                                     if (tfz == -1) root.setAgentTraversalFrozen(false);
                                 }, 1000);
                             }
+                            // A navigation can leave the previous Activity's root in
+                            // mRoots while its replacement becomes visible. Hidden
+                            // roots are not consumable observations and may no longer
+                            // have a valid surface to sync, so never start a fresh
+                            // readiness epoch on them. Persistent mode controls above
+                            // still apply to every root.
+                            if (root.getHostVisibility() != View.VISIBLE) {
+                                continue;
+                            }
                             final java.util.concurrent.CountDownLatch done =
                                     new java.util.concurrent.CountDownLatch(1);
                             root.mHandler.post(() -> {

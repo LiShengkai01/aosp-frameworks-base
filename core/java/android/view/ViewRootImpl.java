@@ -4332,6 +4332,7 @@ public final class ViewRootImpl implements ViewParent,
     public String getAgentStatsJson() {
         return "{\"display\":" + getDisplayId()
                 + ",\"agent_ui\":" + isAgentUi()
+                + ",\"host_visibility\":" + getHostVisibility()
                 + ",\"has_view\":" + (mView != null)
                 + ",\"added\":" + mAdded
                 + ",\"in_traversal\":" + mIsInTraversal
