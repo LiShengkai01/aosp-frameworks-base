@@ -62,6 +62,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
 
     private final int mConfigChanges;
     private final boolean mPreserveWindow;
+    private final android.os.Bundle mOverrideState;
 
     /**
      * A record that was properly configured for relaunch. Execution will be cancelled if not
@@ -73,7 +74,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
     public ActivityRelaunchItem(@NonNull IBinder activityToken,
             @Nullable List<ResultInfo> pendingResults,
             @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
-            @NonNull MergedConfiguration config, boolean preserveWindow,
+            @NonNull MergedConfiguration config, boolean preserveWindow, android.os.Bundle overrideState,
             @NonNull ActivityWindowInfo activityWindowInfo) {
         super(activityToken);
         mPendingResults = pendingResults != null ? new ArrayList<>(pendingResults) : null;
@@ -83,6 +84,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         mActivityWindowInfo = new ActivityWindowInfo(activityWindowInfo);
         mConfigChanges = configChanges;
         mPreserveWindow = preserveWindow;
+        mOverrideState = overrideState;
     }
 
     @Override
@@ -93,6 +95,9 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         }
         mActivityClientRecord = client.prepareRelaunchActivity(getActivityToken(), mPendingResults,
                 mPendingNewIntents, mConfigChanges, mConfig, mPreserveWindow, mActivityWindowInfo);
+        if (mOverrideState != null && mActivityClientRecord != null) {
+            mActivityClientRecord.checkpointOverrideState = mOverrideState;
+        }
     }
 
     @Override
@@ -126,6 +131,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         dest.writeTypedObject(mActivityWindowInfo, flags);
         dest.writeInt(mConfigChanges);
         dest.writeBoolean(mPreserveWindow);
+        dest.writeBundle(mOverrideState);
     }
 
     /** Reads from Parcel. */
@@ -137,6 +143,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         mActivityWindowInfo = requireNonNull(in.readTypedObject(ActivityWindowInfo.CREATOR));
         mConfigChanges = in.readInt();
         mPreserveWindow = in.readBoolean();
+        mOverrideState = in.readBundle(getClass().getClassLoader());
     }
 
     public static final @NonNull Creator<ActivityRelaunchItem> CREATOR =

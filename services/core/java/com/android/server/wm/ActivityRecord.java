@@ -259,6 +259,7 @@ import android.app.servertransaction.ActivityConfigurationChangeItem;
 import android.app.servertransaction.ActivityLifecycleItem;
 import android.app.servertransaction.ActivityRelaunchItem;
 import android.app.servertransaction.ActivityResultItem;
+import android.app.servertransaction.ClientTransaction;
 import android.app.servertransaction.ClientTransactionItem;
 import android.app.servertransaction.DestroyActivityItem;
 import android.app.servertransaction.MoveToDisplayItem;
@@ -507,7 +508,8 @@ final class ActivityRecord extends WindowToken {
     UriPermissionOwner uriPermissions; // current special URI access perms.
     WindowProcessController app;      // if non-null, hosting application
     private State mState;    // current state we are in
-    private Bundle mIcicle;         // last saved activity state
+    private Bundle mIcicle;
+    private Bundle mLatestCheckpointState;         // last saved activity state
     private boolean mHandoffEnabled = false; // if Handoff is enabled for this activity
     private boolean mAllowFullTaskRecreation = false; // if the entire task stack can be recreated
                                                       // during handoff of this activity.
@@ -6146,7 +6148,11 @@ final class ActivityRecord extends WindowToken {
             return;
         }
         r.setCustomizeSplashScreenExitAnimation(handleSplashScreenExit);
-        r.setSavedState(null /* savedState */);
+        if (r.getLatestCheckpointState() != null) {
+            r.setSavedState(r.getLatestCheckpointState());
+        } else {
+            r.setSavedState(null /* savedState */);
+        }
 
         r.mDisplayContent.handleActivitySizeCompatModeIfNeeded(r);
         r.mDisplayContent.mUnknownAppVisibilityController.notifyAppResumedFinished(r);
@@ -8764,7 +8770,7 @@ final class ActivityRecord extends WindowToken {
                 pendingResults, pendingNewIntents, configChangeFlags,
                 new MergedConfiguration(getProcessGlobalConfiguration(),
                         getMergedOverrideConfiguration()),
-                preserveWindow, getActivityWindowInfo());
+                preserveWindow, null, getActivityWindowInfo());
         final ActivityLifecycleItem lifecycleItem;
         if (andResume) {
             lifecycleItem = new ResumeActivityItem(token, isTransitionForward(),
@@ -9710,4 +9716,35 @@ final class ActivityRecord extends WindowToken {
                     mTaskDescription, mCreateTime);
         }
     }
+
+    // --- Agent Checkpoint ---
+    void addCheckpoint(Bundle state) {
+        mLatestCheckpointState = state;
+        setSavedState(state);
+    }
+    int getCheckpointCount() { return mLatestCheckpointState != null ? 1 : 0; }
+    void clearCheckpoints() { mLatestCheckpointState = null; }
+    Bundle getLatestCheckpointState() { return mLatestCheckpointState; }
+
+    void relaunchActivityLocked(boolean preserveWindow, int configFlags, Bundle overrideState) {
+        if (!attachedToProcess()) {
+            Slog.w(TAG, "Agent relaunch: skipping, not attached: " + this);
+            return;
+        }
+        if (mAtmService.mTaskSupervisor == null) return;
+        final MergedConfiguration mc = new MergedConfiguration(
+                getProcessGlobalConfiguration(), getMergedOverrideConfiguration());
+        final ClientTransactionItem item = new ActivityRelaunchItem(
+                token, null, null, configFlags, mc, preserveWindow, overrideState,
+                getActivityWindowInfo());
+        final ClientTransaction t = new ClientTransaction(app.getThread());
+        t.addTransactionItem(item);
+        try {
+            mAtmService.getLifecycleManager().scheduleTransaction(t);
+        } catch (Exception e) {
+            Slog.w(TAG, "Failed to relaunch: " + e);
+        }
+    }
+    // --- End Agent Checkpoint ---
+
 }

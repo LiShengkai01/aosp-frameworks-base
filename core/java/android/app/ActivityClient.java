@@ -113,6 +113,15 @@ public class ActivityClient {
         }
     }
 
+    public void checkpointSaved(IBinder token, Bundle state) {
+        try {
+            getActivityClientController().checkpointSaved(token, state);
+        } catch (RemoteException e) {
+            e.rethrowFromSystemServer();
+        }
+    }
+
+
     /** Reports the activity starts local relaunch. */
     public void activityLocalRelaunch(IBinder token) {
         try {

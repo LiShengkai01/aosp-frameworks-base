@@ -7719,4 +7719,113 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
     boolean isAgentDisplay(int displayId) {
         return displayId != 0; // TEMP: all non-primary displays are agent displays
     }
+
+    // --- Agent Checkpoint APIs ---
+    @Override
+    public String saveCheckpointOnDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+        Slog.i("CHECKPOINT_PERF", "SAVE_ENTRY_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
+            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
+            if (dc == null) return "Error: display " + displayId + " not found";
+            final Task topTask = dc.getTopRootTask();
+            if (topTask == null) return "Error: no task on display " + displayId;
+            final int[] count = {0};
+            topTask.forAllActivities(r -> {
+                if (r.attachedToProcess()) {
+                    try {
+                        r.app.getThread().scheduleCheckpointSave(r.token);
+                        count[0]++;
+                    } catch (RemoteException e) {
+                        Slog.w(TAG, "checkpoint save failed: " + e);
+                    }
+                }
+            });
+            topTask.startCheckpointSave(count[0]);
+            mH.postDelayed(() -> {
+                synchronized (mGlobalLock) {
+                    if (topTask.getCheckpointSaveStatus() != 0) {
+                        topTask.saveTaskCheckpoint();
+                        topTask.onTaskCheckpointSaved();
+                    }
+                }
+            }, 2000);
+            Slog.i("CHECKPOINT_PERF", "SAVE_ASYNC_RETURN_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
+            return "Checkpoint save scheduled for " + count[0] + " activities (event-driven, fallback 2s)";
+        }
+    }
+    @Override
+    public int getCheckpointCountOnDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
+            if (dc == null) return 0;
+            final Task topTask = dc.getTopRootTask();
+            if (topTask == null) return 0;
+            return topTask.getTaskCheckpoints().size();
+        }
+    }
+    @Override
+    public String restoreCheckpointOnDisplay(int displayId, int index) {
+        synchronized (mGlobalLock) {
+        Slog.i("CHECKPOINT_PERF", "RESTORE_ENTRY_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
+            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
+            if (dc == null) return "Error: display not found";
+            final Task topTask = dc.getTopRootTask();
+            if (topTask == null) return "Error: no task";
+            final java.util.ArrayList<Task.TaskCheckpoint> cps = topTask.getTaskCheckpoints();
+            if (index < 0 || index >= cps.size()) return "Error: invalid index";
+            final Task.TaskCheckpoint cp = cps.get(index);
+            final int targetCount = cp.components.size();
+            final java.util.ArrayList<ActivityRecord> acts = new java.util.ArrayList<>();
+            topTask.forAllActivities((java.util.function.Consumer<ActivityRecord>) r -> acts.add(r), false);
+            while (acts.size() > targetCount) {
+                acts.remove(acts.size() - 1).finishIfPossible("checkpoint_trim", false);
+            }
+            int rebuildFrom = -1;
+            final java.util.ArrayList<ActivityRecord> rem = new java.util.ArrayList<>();
+            topTask.forAllActivities((java.util.function.Consumer<ActivityRecord>) r -> rem.add(r), false);
+            for (int i = 0; i < Math.min(rem.size(), targetCount); i++) {
+                ActivityRecord r = rem.get(i);
+                Intent cpIntent = cp.intents.get(i);
+                if (r.intent.filterEquals(cpIntent)) {
+                    Bundle cpState = cp.states.get(i);
+                    r.setSavedState(cpState);
+                    if (r.attachedToProcess()) r.relaunchActivityLocked(true, 0, cpState);
+                } else {
+                    for (int j = rem.size()-1; j >= i; j--) rem.get(j).finishIfPossible("checkpoint_mismatch", false);
+                    rebuildFrom = i; break;
+                }
+            }
+            int rebuilt = 0;
+            int startFrom = rebuildFrom >= 0 ? rebuildFrom : rem.size();
+            for (int i = startFrom; i < targetCount; i++) {
+                getActivityStartController().obtainStarter(cp.intents.get(i), "checkpoint_rebuild")
+                    .setInTask(topTask).setCheckpointSavedState(cp.states.get(i)).execute();
+                rebuilt++;
+            }
+            topTask.trimTaskCheckpointsAfter(index);
+            Slog.i("CHECKPOINT_PERF", "RESTORE_DONE_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
+            return "Restored checkpoint " + index + " (target=" + targetCount + ", had=" + acts.size() + ", rebuilt=" + rebuilt + ")";
+        }
+    }
+    @Override
+    public void clearCheckpointsOnDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
+            if (dc == null) return;
+            final Task t = dc.getTopRootTask();
+            if (t != null) t.clearTaskCheckpoints();
+        }
+    }
+    @Override
+    public int getCheckpointSaveStatusOnDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
+            if (dc == null) return 0;
+            final Task t = dc.getTopRootTask();
+            if (t == null) return 0;
+            return t.getCheckpointSaveStatus();
+        }
+    }
+    // --- End Agent Checkpoint APIs ---
+
 }

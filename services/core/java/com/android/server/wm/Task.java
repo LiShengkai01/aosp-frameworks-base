@@ -143,6 +143,7 @@ import android.graphics.Point;
 import android.graphics.Rect;
 import android.internal.perfetto.protos.Windowmanagerservice.TaskProto;
 import android.os.Binder;
+import android.os.Bundle;
 import android.os.Debug;
 import android.os.Handler;
 import android.os.IBinder;
@@ -7089,4 +7090,57 @@ class Task extends TaskFragment {
                     .remove(mContainerSurface);
         }
     }
+
+    // --- Agent Checkpoint ---
+    static class TaskCheckpoint {
+        final java.util.ArrayList<android.content.ComponentName> components = new java.util.ArrayList<>();
+        final java.util.ArrayList<Bundle> states = new java.util.ArrayList<>();
+        final java.util.ArrayList<android.content.Intent> intents = new java.util.ArrayList<>();
+    }
+    private final java.util.ArrayList<TaskCheckpoint> mTaskCheckpoints = new java.util.ArrayList<>();
+    private static final int MAX_TASK_CHECKPOINTS = 30;
+    private int mCheckpointPendingSaveCount = -1;
+    private static final int CHECKPOINT_SAVE_STATUS_IDLE = 0;
+    private static final int CHECKPOINT_SAVE_STATUS_ACTIVITIES_PENDING = 1;
+    private static final int CHECKPOINT_SAVE_STATUS_TASK_PENDING = 2;
+    private int mCheckpointSaveStatus = CHECKPOINT_SAVE_STATUS_IDLE;
+
+    void saveTaskCheckpoint() {
+        TaskCheckpoint cp = new TaskCheckpoint();
+        forAllActivities(r -> {
+            cp.components.add(r.mActivityComponent);
+            Bundle state = r.getLatestCheckpointState();
+            cp.states.add(state != null ? state : r.getSavedState());
+            cp.intents.add(r.intent);
+        }, false);
+        if (mTaskCheckpoints.size() >= MAX_TASK_CHECKPOINTS) mTaskCheckpoints.remove(0);
+        mTaskCheckpoints.add(cp);
+    }
+    void startCheckpointSave(int n) {
+        mCheckpointPendingSaveCount = n;
+        mCheckpointSaveStatus = CHECKPOINT_SAVE_STATUS_ACTIVITIES_PENDING;
+    }
+    void onActivityCheckpointSaved() {
+        if (mCheckpointPendingSaveCount > 0) {
+            mCheckpointPendingSaveCount--;
+            if (mCheckpointPendingSaveCount == 0) {
+                mCheckpointSaveStatus = CHECKPOINT_SAVE_STATUS_TASK_PENDING;
+                saveTaskCheckpoint();
+                onTaskCheckpointSaved();
+            }
+        }
+    }
+    void onTaskCheckpointSaved() {
+        mCheckpointPendingSaveCount = -1;
+        mCheckpointSaveStatus = CHECKPOINT_SAVE_STATUS_IDLE;
+        android.util.Slog.i("CHECKPOINT_PERF", "SAVE_COMPLETE_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
+    }
+    int getCheckpointSaveStatus() { return mCheckpointSaveStatus; }
+    java.util.ArrayList<TaskCheckpoint> getTaskCheckpoints() { return mTaskCheckpoints; }
+    void clearTaskCheckpoints() { mTaskCheckpoints.clear(); }
+    void trimTaskCheckpointsAfter(int index) {
+        while (mTaskCheckpoints.size() > index + 1) mTaskCheckpoints.remove(mTaskCheckpoints.size() - 1);
+    }
+    // --- End Agent Checkpoint ---
+
 }

@@ -297,6 +297,7 @@ class ActivityStarter {
     ActivityRecord mLastStartActivityRecord;
     // The result of the last activity we attempted to start.
     private int mLastStartActivityResult;
+    private Bundle mCheckpointSavedState;
     // Time in milli seconds we attempted to start the last activity.
     private long mLastStartActivityTimeMs;
     // The reason we were trying to start the last activity
@@ -3807,4 +3808,10 @@ class ActivityStarter {
             default -> "Unknown error code: " + errorCode;
         };
     }
+
+    ActivityStarter setCheckpointSavedState(Bundle state) {
+        mCheckpointSavedState = state;
+        return this;
+    }
+
 }

@@ -657,6 +657,7 @@ public final class ActivityThread extends ClientTransactionHandler
         List<ReferrerIntent> pendingIntents;
 
         boolean startsNotResumed;
+        public Bundle checkpointOverrideState;
         public final boolean isForward;
         int pendingConfigChanges;
         // Whether we are in the process of performing on user leaving.
@@ -2264,6 +2265,10 @@ public final class ActivityThread extends ClientTransactionHandler
         }
 
         @Override
+        public void scheduleCheckpointSave(IBinder activityToken) {
+            sendMessage(H.SAVE_CHECKPOINT, activityToken);
+        }
+
         public void instrumentWithoutRestart(ComponentName instrumentationName,
                 Bundle instrumentationArgs, IInstrumentationWatcher instrumentationWatcher,
                 IUiAutomationConnection instrumentationUiConnection, ApplicationInfo targetInfo) {
@@ -2478,6 +2483,7 @@ public final class ActivityThread extends ClientTransactionHandler
         public static final int PING = 168;
 
         public static final int INSTRUMENT_WITHOUT_RESTART = 170;
+        public static final int SAVE_CHECKPOINT = 180;
         public static final int FINISH_INSTRUMENTATION_WITHOUT_RESTART = 171;
 
         public static final int TIMEOUT_SERVICE_FOR_TYPE = 172;
@@ -2855,6 +2861,9 @@ public final class ActivityThread extends ClientTransactionHandler
                     break;
                 case FINISH_INSTRUMENTATION_WITHOUT_RESTART:
                     handleFinishInstrumentationWithoutRestart();
+                    break;
+                case SAVE_CHECKPOINT:
+                    handleSaveCheckpoint((IBinder) msg.obj);
                     break;
             }
             long messageElapsedTimeMs = SystemClock.uptimeMillis() - messageStartUptimeMs;
@@ -5243,7 +5252,7 @@ public final class ActivityThread extends ClientTransactionHandler
             case ApplicationThreadConstants.BACKUP_MODE_FULL:
             case ApplicationThreadConstants.BACKUP_MODE_INCREMENTAL:
                 return OperationType.BACKUP;
-            default:
+                default:
                 Slog.w(TAG, "Invalid backup mode when initialising BackupAgent: "
                         + backupMode);
                 return OperationType.UNKNOWN;
@@ -6607,7 +6616,7 @@ public final class ActivityThread extends ClientTransactionHandler
                 r.overrideConfig);
         final ActivityRelaunchItem activityRelaunchItem = new ActivityRelaunchItem(
                 r.token, null /* pendingResults */, null /* pendingIntents */,
-                0 /* configChanges */, mergedConfiguration, r.mPreserveWindow,
+                0 /* configChanges */, mergedConfiguration, r.mPreserveWindow, null,
                 r.getActivityWindowInfo());
         // Make sure to match the existing lifecycle state in the end of the transaction.
         final ActivityLifecycleItem lifecycleRequest =
@@ -9143,4 +9152,16 @@ public final class ActivityThread extends ClientTransactionHandler
     // ------------------ Regular JNI ------------------------
     private native void nPurgePendingResources();
     private native void nInitZygoteChildHeapProfiling();
+
+    private void handleSaveCheckpoint(IBinder token) {
+        ActivityClientRecord r = mActivities.get(token);
+        if (r == null || r.activity == null) return;
+        Bundle state = new Bundle();
+        mInstrumentation.callActivityOnSaveInstanceState(r.activity, state);
+        try {
+            ActivityClient.getInstance().checkpointSaved(token, state);
+        } catch (Exception e) {
+            android.util.Log.w(TAG, "checkpoint save failed", e);
+        }
+    }
 }
