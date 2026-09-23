@@ -202,6 +202,6 @@ interface IActivityClientController {
     @JavaPassthrough(annotation = "@android.annotation.RequiresPermission(android.Manifest"
             + ".permission.INTERNAL_SYSTEM_WINDOW)")
     oneway void setActivityRecordInputSinkEnabled(in IBinder activityToken, boolean enabled);
-    void checkpointSaved(IBinder token, in Bundle state);
+    void checkpointSaved(IBinder token, in Bundle state, in Intent intent);
 
 }

@@ -113,9 +113,9 @@ public class ActivityClient {
         }
     }
 
-    public void checkpointSaved(IBinder token, Bundle state) {
+    public void checkpointSaved(IBinder token, Bundle state, Intent intent) {
         try {
-            getActivityClientController().checkpointSaved(token, state);
+            getActivityClientController().checkpointSaved(token, state, intent);
         } catch (RemoteException e) {
             e.rethrowFromSystemServer();
         }

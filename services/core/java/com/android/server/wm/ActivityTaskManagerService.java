@@ -6976,6 +6976,14 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
                 boolean dumpAll, boolean dumpClient, String dumpPackage, int displayIdFilter) {
             synchronized (mGlobalLock) {
                 if (DUMP_ACTIVITIES_CMD.equals(cmd) || DUMP_ACTIVITIES_SHORT_CMD.equals(cmd)) {
+                    for (String arg : args) {
+                        if ("--checkpoint-sizes".equals(arg)) {
+                            mRootWindowContainer.forAllTasks(task -> {
+                                if (task.getDisplayId() == 0) task.dumpCheckpointSizes(pw);
+                            });
+                            return;
+                        }
+                    }
                     dumpActivitiesLocked(fd, pw, args, opti, dumpAll, dumpClient, dumpPackage,
                             displayIdFilter);
                 } else if (DUMP_LASTANR_CMD.equals(cmd)) {
@@ -7788,7 +7796,15 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
                 Intent cpIntent = cp.intents.get(i);
                 if (r.intent.filterEquals(cpIntent)) {
                     Bundle cpState = cp.states.get(i);
-                    r.setSavedState(cpState);
+                    // Keep the selected state as the post-resume/process-death baseline.
+                    r.addCheckpoint(cpState != null ? new Bundle(cpState) : null);
+                    r.setCheckpointIntent(cpIntent);
+                    final Intent restoredIntent = Task.copyCheckpointIntent(cpIntent);
+                    r.intent.replaceExtras(restoredIntent);
+                    r.intent.setFlags(restoredIntent.getFlags());
+                    r.intent.setClipData(restoredIntent.getClipData());
+                    r.intent.setSourceBounds(restoredIntent.getSourceBounds());
+                    r.intent.setSelector(restoredIntent.getSelector());
                     if (r.attachedToProcess()) r.relaunchActivityLocked(true, 0, cpState);
                 } else {
                     for (int j = rem.size()-1; j >= i; j--) rem.get(j).finishIfPossible("checkpoint_mismatch", false);
@@ -7798,7 +7814,7 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
             int rebuilt = 0;
             int startFrom = rebuildFrom >= 0 ? rebuildFrom : rem.size();
             for (int i = startFrom; i < targetCount; i++) {
-                getActivityStartController().obtainStarter(cp.intents.get(i), "checkpoint_rebuild")
+                getActivityStartController().obtainStarter(Task.copyCheckpointIntent(cp.intents.get(i)), "checkpoint_rebuild")
                     .setInTask(topTask).setCheckpointSavedState(cp.states.get(i)).execute();
                 rebuilt++;
             }

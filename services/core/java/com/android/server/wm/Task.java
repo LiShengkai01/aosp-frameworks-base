@@ -7093,6 +7093,7 @@ class Task extends TaskFragment {
 
     // --- Agent Checkpoint ---
     static class TaskCheckpoint {
+        final long createdNs = android.os.SystemClock.elapsedRealtimeNanos();
         final java.util.ArrayList<android.content.ComponentName> components = new java.util.ArrayList<>();
         final java.util.ArrayList<Bundle> states = new java.util.ArrayList<>();
         final java.util.ArrayList<android.content.Intent> intents = new java.util.ArrayList<>();
@@ -7111,11 +7112,61 @@ class Task extends TaskFragment {
             cp.components.add(r.mActivityComponent);
             Bundle state = r.getLatestCheckpointState();
             cp.states.add(state != null ? state : r.getSavedState());
-            cp.intents.add(r.intent);
+            cp.intents.add(copyCheckpointIntent(r.getCheckpointIntent() != null
+                    ? r.getCheckpointIntent() : r.intent));
         }, false);
         if (mTaskCheckpoints.size() >= MAX_TASK_CHECKPOINTS) mTaskCheckpoints.remove(0);
         mTaskCheckpoints.add(cp);
     }
+
+    void dumpCheckpointSizes(PrintWriter pw) {
+        final long started = android.os.SystemClock.elapsedRealtimeNanos();
+        long total = 0;
+        boolean complete = true;
+        for (int i = 0; i < mTaskCheckpoints.size(); i++) {
+            TaskCheckpoint cp = mTaskCheckpoints.get(i);
+            try {
+                int bytes = checkpointSerializedSize(cp);
+                total += bytes;
+                pw.println("CHECKPOINT_SIZE task=" + mTaskId + " index=" + i
+                        + " created_ns=" + cp.createdNs + " activities=" + cp.states.size()
+                        + " serialized_bytes=" + bytes + " owned_ram_bytes=unavailable");
+            } catch (RuntimeException error) {
+                complete = false;
+                pw.println("CHECKPOINT_SIZE task=" + mTaskId + " index=" + i
+                        + " unavailable=" + error.getClass().getSimpleName());
+            }
+        }
+        pw.println("CHECKPOINT_SIZE_TOTAL task=" + mTaskId + " count=" + mTaskCheckpoints.size()
+                + " serialized_bytes=" + total + " complete=" + complete
+                + " start_ns=" + started + " end_ns=" + android.os.SystemClock.elapsedRealtimeNanos());
+    }
+
+    private static int checkpointSerializedSize(TaskCheckpoint checkpoint) {
+        android.os.Parcel parcel = android.os.Parcel.obtain();
+        try {
+            parcel.writeTypedList(checkpoint.components, 0);
+            parcel.writeTypedList(checkpoint.states, 0);
+            parcel.writeTypedList(checkpoint.intents, 0);
+            return parcel.dataSize();
+        } finally {
+            parcel.recycle();
+        }
+    }
+
+    // Round-trip without unpacking application Parcelable extras in system_server.
+    // Neither the ActivityRecord nor ActivityStarter may mutate the saved Intent.
+    static Intent copyCheckpointIntent(Intent intent) {
+        android.os.Parcel parcel = android.os.Parcel.obtain();
+        try {
+            intent.writeToParcel(parcel, 0);
+            parcel.setDataPosition(0);
+            return Intent.CREATOR.createFromParcel(parcel);
+        } finally {
+            parcel.recycle();
+        }
+    }
+
     void startCheckpointSave(int n) {
         mCheckpointPendingSaveCount = n;
         mCheckpointSaveStatus = CHECKPOINT_SAVE_STATUS_ACTIVITIES_PENDING;
@@ -7137,7 +7188,10 @@ class Task extends TaskFragment {
     }
     int getCheckpointSaveStatus() { return mCheckpointSaveStatus; }
     java.util.ArrayList<TaskCheckpoint> getTaskCheckpoints() { return mTaskCheckpoints; }
-    void clearTaskCheckpoints() { mTaskCheckpoints.clear(); }
+    void clearTaskCheckpoints() {
+        mTaskCheckpoints.clear();
+        forAllActivities(ActivityRecord::clearCheckpoints);
+    }
     void trimTaskCheckpointsAfter(int index) {
         while (mTaskCheckpoints.size() > index + 1) mTaskCheckpoints.remove(mTaskCheckpoints.size() - 1);
     }

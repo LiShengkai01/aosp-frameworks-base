@@ -2413,7 +2413,12 @@ public class DecorView extends FrameLayout implements RootViewSurfaceTaker, Wind
 
     @Override
     public int getAccessibilityViewId() {
-        return AccessibilityNodeInfo.ROOT_ITEM_ID;
+        // Only the window root may use the ROOT alias. ActivityGroup/TabHost can
+        // attach another DecorView below a ViewGroup; reusing ROOT there makes
+        // accessibility child queries return the outer window root indefinitely.
+        // Such embedded decor views need the same unique IDs as ordinary Views.
+        return getParent() instanceof View ? super.getAccessibilityViewId()
+                : AccessibilityNodeInfo.ROOT_ITEM_ID;
     }
 
     @Override

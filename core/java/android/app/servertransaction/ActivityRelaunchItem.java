@@ -63,6 +63,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
     private final int mConfigChanges;
     private final boolean mPreserveWindow;
     private final android.os.Bundle mOverrideState;
+    private final android.content.Intent mCheckpointIntent;
 
     /**
      * A record that was properly configured for relaunch. Execution will be cancelled if not
@@ -76,7 +77,20 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
             @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
             @NonNull MergedConfiguration config, boolean preserveWindow, android.os.Bundle overrideState,
             @NonNull ActivityWindowInfo activityWindowInfo) {
+        this(activityToken, pendingResults, pendingNewIntents, configChanges, config,
+                preserveWindow, overrideState, activityWindowInfo, null);
+    }
+
+    public ActivityRelaunchItem(@NonNull IBinder activityToken,
+            @Nullable List<ResultInfo> pendingResults,
+            @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
+            @NonNull MergedConfiguration config, boolean preserveWindow,
+            @Nullable android.os.Bundle overrideState,
+            @NonNull ActivityWindowInfo activityWindowInfo,
+            @Nullable android.content.Intent checkpointIntent) {
         super(activityToken);
+        mCheckpointIntent = checkpointIntent != null
+                ? new android.content.Intent(checkpointIntent) : null;
         mPendingResults = pendingResults != null ? new ArrayList<>(pendingResults) : null;
         mPendingNewIntents =
                 pendingNewIntents != null ? new ArrayList<>(pendingNewIntents) : null;
@@ -95,8 +109,10 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         }
         mActivityClientRecord = client.prepareRelaunchActivity(getActivityToken(), mPendingResults,
                 mPendingNewIntents, mConfigChanges, mConfig, mPreserveWindow, mActivityWindowInfo);
-        if (mOverrideState != null && mActivityClientRecord != null) {
+        if ((mOverrideState != null || mCheckpointIntent != null)
+                && mActivityClientRecord != null) {
             mActivityClientRecord.checkpointOverrideState = mOverrideState;
+            mActivityClientRecord.checkpointOverrideIntent = mCheckpointIntent;
         }
     }
 
@@ -132,6 +148,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         dest.writeInt(mConfigChanges);
         dest.writeBoolean(mPreserveWindow);
         dest.writeBundle(mOverrideState);
+        dest.writeTypedObject(mCheckpointIntent, flags);
     }
 
     /** Reads from Parcel. */
@@ -144,6 +161,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         mConfigChanges = in.readInt();
         mPreserveWindow = in.readBoolean();
         mOverrideState = in.readBundle(getClass().getClassLoader());
+        mCheckpointIntent = in.readTypedObject(android.content.Intent.CREATOR);
     }
 
     public static final @NonNull Creator<ActivityRelaunchItem> CREATOR =

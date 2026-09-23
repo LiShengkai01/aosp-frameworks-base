@@ -658,6 +658,7 @@ public final class ActivityThread extends ClientTransactionHandler
 
         boolean startsNotResumed;
         public Bundle checkpointOverrideState;
+        public Intent checkpointOverrideIntent;
         public final boolean isForward;
         int pendingConfigChanges;
         // Whether we are in the process of performing on user leaving.
@@ -4305,6 +4306,7 @@ public final class ActivityThread extends ClientTransactionHandler
                 // ActivityLifecycleCallbacks#onActivityCreated() or
                 // ActivityLifecycleCallback#onActivityPostCreated().
                 r.activity = activity;
+                logCheckpointState("CREATE", r, r.state, activity.getIntent());
                 if (r.isPersistable()) {
                     mInstrumentation.callActivityOnCreate(activity, r.state, r.persistentState);
                 } else {
@@ -6559,6 +6561,14 @@ public final class ActivityThread extends ClientTransactionHandler
 
         r.activity.mChangingConfigurations = true;
 
+        // The transaction carries the checkpoint on the temporary relaunch record.
+        // Move it to the live record consumed by handleRelaunchActivityInner.
+        final Bundle checkpointState = tmp.checkpointOverrideState;
+        tmp.checkpointOverrideState = null;
+        r.checkpointOverrideState = checkpointState;
+        r.checkpointOverrideIntent = tmp.checkpointOverrideIntent;
+        tmp.checkpointOverrideIntent = null;
+
         handleRelaunchActivityInner(r, tmp.pendingResults, tmp.pendingIntents,
                 pendingActions, tmp.startsNotResumed, tmp.overrideConfig, tmp.mActivityWindowInfo,
                 "handleRelaunchActivity");
@@ -6635,7 +6645,18 @@ public final class ActivityThread extends ClientTransactionHandler
             @NonNull Configuration overrideConfig, @NonNull ActivityWindowInfo activityWindowInfo,
             @NonNull String reason) {
         // Preserve last used intent, it may be set from Activity#setIntent().
-        final Intent customIntent = r.activity.mIntent;
+        final Intent checkpointIntent = r.checkpointOverrideIntent;
+        r.checkpointOverrideIntent = null;
+        final Intent customIntent;
+        if (checkpointIntent != null) {
+            r.intent = new Intent(checkpointIntent);
+            // Launch prepares this Intent with the application extras ClassLoader and
+            // process attribution. Do not replace it after attach with the unprepared
+            // checkpoint Intent received through Binder.
+            customIntent = r.intent;
+        } else {
+            customIntent = r.activity.mIntent;
+        }
         // Need to ensure state is saved.
         if (!r.paused) {
             performPauseActivity(r, false, reason, null /* pendingActions */);
@@ -6644,7 +6665,23 @@ public final class ActivityThread extends ClientTransactionHandler
             callActivityOnStop(r, true /* saveState */, reason);
         }
 
-        handleDestroyActivity(r, false /* finishing */, true /* getNonConfigInstance */, reason);
+        // Pause/stop may save the current UI. Apply the historical checkpoint
+        // afterwards, including when the activity was already stopped.
+        final boolean restoringCheckpoint = checkpointIntent != null
+                || r.checkpointOverrideState != null;
+        if (restoringCheckpoint) {
+            r.state = r.checkpointOverrideState;
+            if (r.state != null) r.state.setClassLoader(r.activity.getClassLoader());
+            r.checkpointOverrideState = null;
+            // Live retained fragments/ViewModels describe the current UI, not the
+            // historical checkpoint. Let onDestroy release them and recreate
+            // their owners from the checkpoint Bundle, keeping the window.
+            r.activity.mChangingConfigurations = false;
+            r.lastNonConfigurationInstances = null;
+        }
+
+        handleDestroyActivity(r, false /* finishing */,
+                !restoringCheckpoint /* getNonConfigInstance */, reason);
 
         r.activity = null;
         r.window = null;
@@ -9153,13 +9190,57 @@ public final class ActivityThread extends ClientTransactionHandler
     private native void nPurgePendingResources();
     private native void nInitZygoteChildHeapProfiling();
 
+    // Opt-in diagnostics only: never log Bundle values or Intent extras.
+    private void logCheckpointState(String stage, ActivityClientRecord r, Bundle state,
+            Intent intent) {
+        if (!android.os.SystemProperties.getBoolean("debug.checkpoint.state", false)) return;
+        android.os.Parcel parcel = android.os.Parcel.obtain();
+        try {
+            parcel.writeBundle(state);
+            byte[] bytes = parcel.marshall();
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes);
+            StringBuilder hash = new StringBuilder();
+            for (byte value : digest) hash.append(String.format("%02x", value & 0xff));
+            android.util.Log.i("CHECKPOINT_STATE", stage + " component="
+                    + r.activity.getComponentName().flattenToShortString()
+                    + " stateNull=" + (state == null) + " bytes=" + bytes.length
+                    + " sha256=" + hash);
+        } catch (Exception exception) {
+            android.util.Log.i("CHECKPOINT_STATE", stage + " component="
+                    + r.activity.getComponentName().flattenToShortString()
+                    + " digestUnavailable=" + exception.getClass().getSimpleName());
+        } finally {
+            parcel.recycle();
+        }
+    }
+
     private void handleSaveCheckpoint(IBinder token) {
         ActivityClientRecord r = mActivities.get(token);
-        if (r == null || r.activity == null) return;
-        Bundle state = new Bundle();
-        mInstrumentation.callActivityOnSaveInstanceState(r.activity, state);
+        if (r == null || r.activity == null || r.activity.mFinished) return;
+        // onSaveInstanceState also marks app/Fragment state as saved. A foreground
+        // activity must receive a normal resume afterwards before navigation can
+        // continue. Pause first so application lifecycle callbacks stay balanced.
+        final boolean resumeAfterSave = r.getLifecycleState() == ON_RESUME;
+        Bundle state = resumeAfterSave
+                ? performPauseActivity(r, false, "checkpoint-save", null) : null;
+        Intent checkpointIntent = null;
         try {
-            ActivityClient.getInstance().checkpointSaved(token, state);
+            // Pre-Honeycomb pause already saved state. Other activities need a
+            // fresh Bundle; never mutate a previously retained checkpoint.
+            if (state == null) {
+                state = new Bundle();
+                state.setAllowFds(false);
+                mInstrumentation.callActivityOnSaveInstanceState(r.activity, state);
+            }
+            checkpointIntent = new Intent(r.activity.getIntent());
+            logCheckpointState("SAVE", r, state, checkpointIntent);
+        } finally {
+            if (resumeAfterSave && !r.activity.mFinished) {
+                performResumeActivity(r, false, "checkpoint-save");
+            }
+        }
+        try {
+            ActivityClient.getInstance().checkpointSaved(token, state, checkpointIntent);
         } catch (Exception e) {
             android.util.Log.w(TAG, "checkpoint save failed", e);
         }

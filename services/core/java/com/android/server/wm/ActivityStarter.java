@@ -743,6 +743,7 @@ class ActivityStarter {
      * @param starter
      */
     void set(ActivityStarter starter) {
+        mCheckpointSavedState = starter.mCheckpointSavedState;
         mStartActivity = starter.mStartActivity;
         mIntent = starter.mIntent;
         mCallingUid = starter.mCallingUid;
@@ -1491,6 +1492,14 @@ class ActivityStarter {
                 .setActivityOptions(checkedOptions)
                 .setSourceRecord(sourceRecord)
                 .build();
+
+        if (mCheckpointSavedState != null) {
+            // Install state before launch; retaining it as the latest checkpoint
+            // also preserves it when the rebuilt activity reports RESUMED.
+            r.addCheckpoint(new Bundle(mCheckpointSavedState));
+            r.setCheckpointIntent(r.intent);
+            mCheckpointSavedState = null;
+        }
 
         mLastStartActivityRecord = r;
 
@@ -2711,6 +2720,9 @@ class ActivityStarter {
         mIntentDelivered = false;
 
         if (clearRequest) {
+            // Starters are pooled: an aborted checkpoint launch must not leak
+            // its state into the next, unrelated start request.
+            mCheckpointSavedState = null;
             mRequest.reset();
         }
     }

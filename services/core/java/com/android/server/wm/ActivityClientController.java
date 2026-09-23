@@ -1903,13 +1903,14 @@ class ActivityClientController extends IActivityClientController.Stub {
     }
 
     @Override
-    public void checkpointSaved(IBinder token, Bundle state) {
+    public void checkpointSaved(IBinder token, Bundle state, Intent intent) {
         final long origId = Binder.clearCallingIdentity();
         try {
             synchronized (mGlobalLock) {
                 final ActivityRecord r = ActivityRecord.isInAnyTask(token);
                 if (r != null) {
                     r.addCheckpoint(state);
+                    r.setCheckpointIntent(intent);
                     final Task task = r.getTask();
                     if (task != null) {
                         task.onActivityCheckpointSaved();

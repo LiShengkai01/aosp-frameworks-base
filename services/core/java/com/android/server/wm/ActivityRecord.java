@@ -509,6 +509,7 @@ final class ActivityRecord extends WindowToken {
     WindowProcessController app;      // if non-null, hosting application
     private State mState;    // current state we are in
     private Bundle mIcicle;
+    private Intent mLatestCheckpointIntent;
     private Bundle mLatestCheckpointState;         // last saved activity state
     private boolean mHandoffEnabled = false; // if Handoff is enabled for this activity
     private boolean mAllowFullTaskRecreation = false; // if the entire task stack can be recreated
@@ -9723,7 +9724,15 @@ final class ActivityRecord extends WindowToken {
         setSavedState(state);
     }
     int getCheckpointCount() { return mLatestCheckpointState != null ? 1 : 0; }
-    void clearCheckpoints() { mLatestCheckpointState = null; }
+    void clearCheckpoints() {
+        mLatestCheckpointState = null;
+        mLatestCheckpointIntent = null;
+    }
+    void setCheckpointIntent(Intent checkpointIntent) {
+        mLatestCheckpointIntent = checkpointIntent != null
+                ? Task.copyCheckpointIntent(checkpointIntent) : null;
+    }
+    Intent getCheckpointIntent() { return mLatestCheckpointIntent; }
     Bundle getLatestCheckpointState() { return mLatestCheckpointState; }
 
     void relaunchActivityLocked(boolean preserveWindow, int configFlags, Bundle overrideState) {
@@ -9736,9 +9745,31 @@ final class ActivityRecord extends WindowToken {
                 getProcessGlobalConfiguration(), getMergedOverrideConfiguration());
         final ClientTransactionItem item = new ActivityRelaunchItem(
                 token, null, null, configFlags, mc, preserveWindow, overrideState,
-                getActivityWindowInfo());
+                getActivityWindowInfo(), getCheckpointIntent());
         final ClientTransaction t = new ClientTransaction(app.getThread());
         t.addTransactionItem(item);
+        // Relaunch ends at ON_CREATE. Restore the lifecycle too, otherwise a
+        // visible activity never resumes and cannot continue the agent task.
+        switch (mState) {
+            case RESUMED:
+                t.addTransactionItem(new ResumeActivityItem(token, isTransitionForward(),
+                        shouldSendCompatFakeFocus()));
+                break;
+            case STARTED:
+                t.addTransactionItem(new StartActivityItem(token, null));
+                break;
+            case PAUSING:
+            case PAUSED:
+                t.addTransactionItem(new PauseActivityItem(token));
+                break;
+            case STOPPING:
+            case STOPPED:
+                t.addTransactionItem(new StopActivityItem(token));
+                break;
+            default:
+                Slog.w(TAG, "Agent relaunch: unsupported lifecycle state: " + mState);
+                return;
+        }
         try {
             mAtmService.getLifecycleManager().scheduleTransaction(t);
         } catch (Exception e) {
