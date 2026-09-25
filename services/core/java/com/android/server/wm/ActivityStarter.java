@@ -298,6 +298,7 @@ class ActivityStarter {
     // The result of the last activity we attempted to start.
     private int mLastStartActivityResult;
     private Bundle mCheckpointSavedState;
+    private Intent mCheckpointSavedIntent;
     // Time in milli seconds we attempted to start the last activity.
     private long mLastStartActivityTimeMs;
     // The reason we were trying to start the last activity
@@ -744,6 +745,7 @@ class ActivityStarter {
      */
     void set(ActivityStarter starter) {
         mCheckpointSavedState = starter.mCheckpointSavedState;
+        mCheckpointSavedIntent = starter.mCheckpointSavedIntent;
         mStartActivity = starter.mStartActivity;
         mIntent = starter.mIntent;
         mCallingUid = starter.mCallingUid;
@@ -1493,12 +1495,17 @@ class ActivityStarter {
                 .setSourceRecord(sourceRecord)
                 .build();
 
-        if (mCheckpointSavedState != null) {
-            // Install state before launch; retaining it as the latest checkpoint
-            // also preserves it when the rebuilt activity reports RESUMED.
-            r.addCheckpoint(new Bundle(mCheckpointSavedState));
-            r.setCheckpointIntent(r.intent);
+        if (mCheckpointSavedState != null || mCheckpointSavedIntent != null) {
+            // A null Bundle is also a valid checkpoint. Route using the original
+            // launch Intent, but deliver the saved runtime Intent to the client.
+            r.addCheckpoint(mCheckpointSavedState != null
+                    ? new Bundle(mCheckpointSavedState) : null);
+            final Intent savedIntent = mCheckpointSavedIntent != null
+                    ? mCheckpointSavedIntent : r.intent;
+            r.setCheckpointIntent(savedIntent);
+            r.setCheckpointLaunchIntent(savedIntent);
             mCheckpointSavedState = null;
+            mCheckpointSavedIntent = null;
         }
 
         mLastStartActivityRecord = r;
@@ -2723,6 +2730,7 @@ class ActivityStarter {
             // Starters are pooled: an aborted checkpoint launch must not leak
             // its state into the next, unrelated start request.
             mCheckpointSavedState = null;
+            mCheckpointSavedIntent = null;
             mRequest.reset();
         }
     }
@@ -3823,6 +3831,11 @@ class ActivityStarter {
 
     ActivityStarter setCheckpointSavedState(Bundle state) {
         mCheckpointSavedState = state;
+        return this;
+    }
+
+    ActivityStarter setCheckpointSavedIntent(Intent intent) {
+        mCheckpointSavedIntent = Task.copyCheckpointIntent(intent);
         return this;
     }
 

@@ -7785,6 +7785,21 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
             final int targetCount = cp.components.size();
             final java.util.ArrayList<ActivityRecord> acts = new java.util.ArrayList<>();
             topTask.forAllActivities((java.util.function.Consumer<ActivityRecord>) r -> acts.add(r), false);
+            // Reject incompatible explicit-task launches before finishing any record.
+            for (int i = 0; i < targetCount; i++) {
+                if (i < acts.size() && cp.components.get(i).equals(acts.get(i).mActivityComponent)) {
+                    continue;
+                }
+                final int mode = cp.launchModes.get(i);
+                if (mode == android.content.pm.ActivityInfo.LAUNCH_SINGLE_TASK
+                        || mode == android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE) {
+                    final Intent baseIntent = topTask.getBaseIntent();
+                    if (i != 0 || baseIntent == null || !java.util.Objects.equals(
+                            baseIntent.getComponent(), cp.launchIntents.get(i).getComponent())) {
+                        return "Error: incompatible checkpoint task identity at index " + i;
+                    }
+                }
+            }
             while (acts.size() > targetCount) {
                 acts.remove(acts.size() - 1).finishIfPossible("checkpoint_trim", false);
             }
@@ -7794,17 +7809,16 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
             for (int i = 0; i < Math.min(rem.size(), targetCount); i++) {
                 ActivityRecord r = rem.get(i);
                 Intent cpIntent = cp.intents.get(i);
-                if (r.intent.filterEquals(cpIntent)) {
+                // Activity.getIntent() may legitimately change action, data or alias.
+                // Match resolved identity at this stack position, not routing payload.
+                if (cp.components.get(i).equals(r.mActivityComponent)) {
                     Bundle cpState = cp.states.get(i);
                     // Keep the selected state as the post-resume/process-death baseline.
                     r.addCheckpoint(cpState != null ? new Bundle(cpState) : null);
                     r.setCheckpointIntent(cpIntent);
-                    final Intent restoredIntent = Task.copyCheckpointIntent(cpIntent);
-                    r.intent.replaceExtras(restoredIntent);
-                    r.intent.setFlags(restoredIntent.getFlags());
-                    r.intent.setClipData(restoredIntent.getClipData());
-                    r.intent.setSourceBounds(restoredIntent.getSourceBounds());
-                    r.intent.setSelector(restoredIntent.getSelector());
+                    // Preserve server launch identity. A later process launch must
+                    // receive the same runtime payload as an in-process relaunch.
+                    r.setCheckpointLaunchIntent(cpIntent);
                     if (r.attachedToProcess()) r.relaunchActivityLocked(true, 0, cpState);
                 } else {
                     for (int j = rem.size()-1; j >= i; j--) rem.get(j).finishIfPossible("checkpoint_mismatch", false);
@@ -7814,8 +7828,19 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
             int rebuilt = 0;
             int startFrom = rebuildFrom >= 0 ? rebuildFrom : rem.size();
             for (int i = startFrom; i < targetCount; i++) {
-                getActivityStartController().obtainStarter(Task.copyCheckpointIntent(cp.intents.get(i)), "checkpoint_rebuild")
-                    .setInTask(topTask).setCheckpointSavedState(cp.states.get(i)).execute();
+                final int result = getActivityStartController().obtainStarter(
+                        Task.copyCheckpointIntent(cp.launchIntents.get(i)), "checkpoint_rebuild")
+                    .setInTask(topTask).setCheckpointSavedState(cp.states.get(i))
+                    .setCheckpointSavedIntent(cp.intents.get(i)).execute();
+                // Merely bringing a task forward or delivering an Intent does not
+                // establish that a new Activity consumed the checkpoint Bundle.
+                if (result != ActivityManager.START_SUCCESS) {
+                    Slog.e(TAG, "Checkpoint rebuild failed at " + i + ": " + result);
+                    Slog.i("CHECKPOINT_PERF", "RESTORE_FAILED_ts="
+                            + android.os.SystemClock.elapsedRealtimeNanos());
+                    return "Error: checkpoint rebuild failed at index " + i
+                            + " (result=" + result + ", rebuilt=" + rebuilt + ")";
+                }
                 rebuilt++;
             }
             topTask.trimTaskCheckpointsAfter(index);

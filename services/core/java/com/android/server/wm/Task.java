@@ -7096,6 +7096,9 @@ class Task extends TaskFragment {
         final long createdNs = android.os.SystemClock.elapsedRealtimeNanos();
         final java.util.ArrayList<android.content.ComponentName> components = new java.util.ArrayList<>();
         final java.util.ArrayList<Bundle> states = new java.util.ArrayList<>();
+        // Keep task/alias routing separate from Activity.getIntent() runtime state.
+        final java.util.ArrayList<android.content.Intent> launchIntents = new java.util.ArrayList<>();
+        final java.util.ArrayList<Integer> launchModes = new java.util.ArrayList<>();
         final java.util.ArrayList<android.content.Intent> intents = new java.util.ArrayList<>();
     }
     private final java.util.ArrayList<TaskCheckpoint> mTaskCheckpoints = new java.util.ArrayList<>();
@@ -7110,6 +7113,8 @@ class Task extends TaskFragment {
         TaskCheckpoint cp = new TaskCheckpoint();
         forAllActivities(r -> {
             cp.components.add(r.mActivityComponent);
+            cp.launchIntents.add(copyCheckpointIntent(r.intent));
+            cp.launchModes.add(r.info.launchMode);
             Bundle state = r.getLatestCheckpointState();
             cp.states.add(state != null ? state : r.getSavedState());
             cp.intents.add(copyCheckpointIntent(r.getCheckpointIntent() != null
@@ -7148,6 +7153,8 @@ class Task extends TaskFragment {
             parcel.writeTypedList(checkpoint.components, 0);
             parcel.writeTypedList(checkpoint.states, 0);
             parcel.writeTypedList(checkpoint.intents, 0);
+            parcel.writeTypedList(checkpoint.launchIntents, 0);
+            parcel.writeList(checkpoint.launchModes);
             return parcel.dataSize();
         } finally {
             parcel.recycle();

@@ -1023,8 +1023,10 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
         final boolean isTransitionForward = r.isTransitionForward();
         final IBinder fragmentToken = r.getTaskFragment().getFragmentToken();
         final int deviceId = getDeviceIdForDisplayId(r.getDisplayId());
+        final Intent checkpointLaunchIntent = r.getCheckpointLaunchIntent();
         final LaunchActivityItem launchActivityItem = new LaunchActivityItem(r.token,
-                r.intent, System.identityHashCode(r), r.info,
+                checkpointLaunchIntent != null ? Task.copyCheckpointIntent(checkpointLaunchIntent)
+                        : r.intent, System.identityHashCode(r), r.info,
                 procConfig, overrideConfig, deviceId,
                 r.getFilteredReferrer(r.launchedFromPackage), task.voiceInteractor,
                 proc.getReportedProcState(), r.getSavedState(), r.getPersistentSavedState(),
@@ -1062,6 +1064,9 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
             return new DeadObjectException("Failed to dispatch the ClientTransaction to dead"
                     + " process. See earlier log for more details.");
         }
+
+        // Keep the payload if dispatch failed so a process-start retry can use it.
+        r.clearCheckpointLaunchIntent();
 
         if (procConfig.seq > mRootWindowContainer.getConfiguration().seq) {
             // If the seq is increased, there should be something changed (e.g. registered

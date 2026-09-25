@@ -510,6 +510,8 @@ final class ActivityRecord extends WindowToken {
     private State mState;    // current state we are in
     private Bundle mIcicle;
     private Intent mLatestCheckpointIntent;
+    // A restore-only launch payload; never changes the server's task/alias identity.
+    private Intent mCheckpointLaunchIntent;
     private Bundle mLatestCheckpointState;         // last saved activity state
     private boolean mHandoffEnabled = false; // if Handoff is enabled for this activity
     private boolean mAllowFullTaskRecreation = false; // if the entire task stack can be recreated
@@ -9727,12 +9729,19 @@ final class ActivityRecord extends WindowToken {
     void clearCheckpoints() {
         mLatestCheckpointState = null;
         mLatestCheckpointIntent = null;
+        mCheckpointLaunchIntent = null;
     }
     void setCheckpointIntent(Intent checkpointIntent) {
         mLatestCheckpointIntent = checkpointIntent != null
                 ? Task.copyCheckpointIntent(checkpointIntent) : null;
     }
     Intent getCheckpointIntent() { return mLatestCheckpointIntent; }
+    void setCheckpointLaunchIntent(Intent savedIntent) {
+        mCheckpointLaunchIntent = savedIntent != null
+                ? Task.copyCheckpointIntent(savedIntent) : null;
+    }
+    Intent getCheckpointLaunchIntent() { return mCheckpointLaunchIntent; }
+    void clearCheckpointLaunchIntent() { mCheckpointLaunchIntent = null; }
     Bundle getLatestCheckpointState() { return mLatestCheckpointState; }
 
     void relaunchActivityLocked(boolean preserveWindow, int configFlags, Bundle overrideState) {
