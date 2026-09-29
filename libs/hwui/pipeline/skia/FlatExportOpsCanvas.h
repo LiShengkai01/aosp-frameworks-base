@@ -20,12 +20,15 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include <SkCanvas.h>
+#include <SkData.h>
 #include <SkColor.h>
 #include <SkImage.h>
 #include <SkRRect.h>
@@ -206,7 +209,14 @@ protected:
                 }
                 mOutput << "{\"font\":\"";
                 writeEscaped(family.c_str());
-                mOutput << "\",\"glyphs\":[";
+                mOutput << "\"";
+                if (run.fTypeface) {
+                    mOutput << ",\"fontFingerprint\":\"" << fontFingerprint(run.fTypeface) << "\""
+                            << ",\"fontWeight\":" << run.fTypeface->fontStyle().weight()
+                            << ",\"fontWidth\":" << run.fTypeface->fontStyle().width()
+                            << ",\"fontSlant\":" << (int)run.fTypeface->fontStyle().slant();
+                }
+                mOutput << ",\"glyphs\":[";
                 for (int i = 0; i < run.fGlyphCount; ++i) {
                     if (i) mOutput << ",";
                     mOutput << (unsigned int)run.fGlyphIndices[i];
@@ -289,6 +299,34 @@ protected:
     }
 
 private:
+    // Identity of tables that determine glyph numbering, names and substitutions.
+    // FNV-1a is an identity hint, not a cryptographic integrity claim. Host assets
+    // retain SHA256 independently. Cache once per typeface, never once per run.
+    static std::string fontFingerprint(const SkTypeface* typeface) {
+        static std::mutex lock;
+        static std::unordered_map<SkTypefaceID, std::string> cache;
+        std::lock_guard<std::mutex> guard(lock);
+        const auto id = typeface->uniqueID();
+        auto found = cache.find(id);
+        if (found != cache.end()) return found->second;
+        uint64_t hash = UINT64_C(14695981039346656037);
+        auto byte = [&hash](uint8_t b) { hash ^= b; hash *= UINT64_C(1099511628211); };
+        constexpr SkFontTableTag tags[] = {0x636d6170, 0x6d617870, 0x706f7374, 0x47535542};
+        for (const auto tag : tags) {
+            auto data = typeface->copyTableData(tag);
+            const uint32_t size = data ? static_cast<uint32_t>(data->size()) : 0;
+            for (int shift = 24; shift >= 0; shift -= 8) byte((tag >> shift) & 0xff);
+            for (int shift = 24; shift >= 0; shift -= 8) byte((size >> shift) & 0xff);
+            if (data) {
+                const auto* bytes = static_cast<const uint8_t*>(data->data());
+                for (size_t i = 0; i < data->size(); ++i) byte(bytes[i]);
+            }
+        }
+        std::ostringstream result;
+        result << "fnv1a64:" << std::hex << std::setw(16) << std::setfill('0') << hash;
+        if (cache.size() >= 512) cache.clear();
+        return cache.emplace(id, result.str()).first->second;
+    }
     static constexpr int kMaxImageSampleDimension = 64;
     static constexpr size_t kMaxImageColorRuns = 1024;
     static constexpr int kMaxPathVerbs = 256;
