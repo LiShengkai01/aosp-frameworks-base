@@ -70,13 +70,16 @@ namespace renderthread {
 namespace {
 class ScopedActiveContext {
 public:
-    ScopedActiveContext(CanvasContext* context) { sActiveContext = context; }
+    ScopedActiveContext(CanvasContext* context) : mPreviousContext(sActiveContext) {
+        sActiveContext = context;
+    }
 
-    ~ScopedActiveContext() { sActiveContext = nullptr; }
+    ~ScopedActiveContext() { sActiveContext = mPreviousContext; }
 
     static CanvasContext* getActiveContext() { return sActiveContext; }
 
 private:
+    CanvasContext* mPreviousContext;
     static CanvasContext* sActiveContext;
 };
 
@@ -1083,6 +1086,9 @@ void CanvasContext::dumpFrames(int fd) {
 
 void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
                                     int surfaceInsetX, int surfaceInsetY) {
+    // Replay ops (e.g. non-antialiased DrawPoints) consult the active context
+    // for pixel snapping, even when the target canvas does not rasterize.
+    ScopedActiveContext activeContext(this);
     // Use the same render path as GPU rendering (SkiaPipeline::renderFrameImpl)
     // to ensure we capture every RenderNode in the tree, including nested
     // HardwareLayers and child RenderNodes that don't appear in mRootNode's
@@ -1137,6 +1143,7 @@ void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOrigi
 }
 
 uint64_t CanvasContext::computeSemanticHash() {
+    ScopedActiveContext activeContext(this);
     // Walk the same RenderNode tree as dumpDisplayList(), but fold only the
     // agent-stable semantic content (text glyphs + device-space layout bounds)
     // into a 64-bit fingerprint. No JSON, no allocation per op.
