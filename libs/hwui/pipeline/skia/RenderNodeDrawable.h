@@ -61,6 +61,11 @@ public:
      */
     void forceDraw(SkCanvas* canvas) const;
 
+    // Replay recorded commands instead of cached layer pixels, including descendants
+    // reached through Z-reordering and backwards projection. Only for observation.
+    void forceDrawForObservation(SkCanvas* canvas) const;
+    static bool isObservationReplay();
+
     /**
      * Returns readonly render properties for this render node.
      */

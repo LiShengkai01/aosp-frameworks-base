@@ -17,10 +17,12 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 #include <SkCanvas.h>
 #include <SkTextBlob.h>
 #include <SkRRect.h>
+#include <src/text/GlyphRun.h>
 
 namespace android {
 namespace uirenderer {
@@ -59,6 +61,22 @@ public:
     uint64_t hash() const { return mHash; }
 
 protected:
+    void onDrawGlyphRunList(const sktext::GlyphRunList& list, const SkPaint&) override {
+        if (list.empty()) return;
+        SkScalar x = list.origin().x(), y = list.origin().y();
+        pointToDevice(&x, &y);
+        foldInt((int32_t)x);
+        foldInt((int32_t)y);
+        foldDeviceRect(list.sourceBoundsWithOrigin());
+        for (const auto& run : list) {
+            for (SkGlyphID glyph : run.glyphsIDs()) foldInt((int32_t)glyph);
+        }
+    }
+
+    SaveLayerStrategy getSaveLayerStrategy(const SaveLayerRec&) override {
+        return kNoLayer_SaveLayerStrategy;
+    }
+
     void onDrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y,
                         const SkPaint&) override {
         if (!blob) return;
@@ -93,6 +111,9 @@ protected:
     // FlatExportOpsCanvas so the hash covers the whole tree.
     void onDrawDrawable(SkDrawable* drawable, const SkMatrix* matrix) override {
         if (!drawable) return;
+        const char* type = drawable->getTypeName();
+        if (type && (!strcmp(type, "FunctorDrawable") || !strcmp(type, "LayerDrawable") ||
+                     !strcmp(type, "BackdropFilterDrawable"))) return;
         if (matrix) {
             this->save();
             this->concat(*matrix);

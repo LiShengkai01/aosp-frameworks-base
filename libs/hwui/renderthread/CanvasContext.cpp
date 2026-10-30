@@ -1089,19 +1089,13 @@ void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOrigi
     // Replay ops (e.g. non-antialiased DrawPoints) consult the active context
     // for pixel snapping, even when the target canvas does not rasterize.
     ScopedActiveContext activeContext(this);
-    // Use the same render path as GPU rendering (SkiaPipeline::renderFrameImpl)
-    // to ensure we capture every RenderNode in the tree, including nested
-    // HardwareLayers and child RenderNodes that don't appear in mRootNode's
-    // own DisplayList.
-    //
-    // RenderNodeDrawable.draw() recursively traverses the entire subtree by
-    // replaying each node's DisplayList ops onto the canvas. The default
-    // SkCanvas::onDrawDrawable() inlines each drawable into the current
-    // canvas via drawable->draw(this), giving us full visibility into the
-    // tree even when complex apps use HardwareLayers.
+    // Preserve normal node ordering/transforms, but expand cached RenderLayers
+    // into their active commands. Normal GPU replay can replace them with image
+    // snapshots and would hide their text from a command observer.
     std::ostringstream oss;
     oss << "{\"frame\":\"flat_render\",\"width\":" << mLastFrameWidth
         << ",\"height\":" << mLastFrameHeight
+        << ",\"exportVersion\":2,\"layerContent\":\"active_commands\""
         << ",\"coordinateSpace\":\"screen\""
         << ",\"surfaceOrigin\":[" << surfaceOriginX << "," << surfaceOriginY << "]"
         << ",\"surfaceInsets\":[" << surfaceInsetX << "," << surfaceInsetY << "]"
@@ -1117,7 +1111,9 @@ void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOrigi
     for (const sp<RenderNode>& node : mRenderNodes) {
         if (!firstNode) oss << ",";
         firstNode = false;
-        oss << "{\"name\":\"" << node->getName() << "\",\"ops\":[";
+        oss << "{\"name\":\"";
+        skiapipeline::FlatExportOpsCanvas::writeEscaped(oss, node->getName());
+        oss << "\",\"ops\":[";
         if (!node->nothingToDraw()) {
             // Create a FlatExportOpsCanvas with frame dimensions. SkCanvas with
             // explicit dimensions creates a "no-draw" canvas where draw ops
@@ -1133,7 +1129,7 @@ void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOrigi
             // child RenderNodes by calling canvas->drawDrawable(child), which
             // our FlatExportOpsCanvas captures as nested drawDrawable ops.
             skiapipeline::RenderNodeDrawable drawable(node.get(), &canvas, false);
-            drawable.forceDraw(&canvas);
+            drawable.forceDrawForObservation(&canvas);
         }
         oss << "]}";
     }
@@ -1146,7 +1142,7 @@ uint64_t CanvasContext::computeSemanticHash() {
     ScopedActiveContext activeContext(this);
     // Walk the same RenderNode tree as dumpDisplayList(), but fold only the
     // agent-stable semantic content (text glyphs + device-space layout bounds)
-    // into a 64-bit fingerprint. No JSON, no allocation per op.
+    // into a 64-bit fingerprint without JSON serialization.
     int width = std::max(mLastFrameWidth, 1);
     int height = std::max(mLastFrameHeight, 1);
     skiapipeline::SemanticHashCanvas canvas(width, height);
@@ -1155,7 +1151,7 @@ uint64_t CanvasContext::computeSemanticHash() {
             continue;
         }
         skiapipeline::RenderNodeDrawable drawable(node.get(), &canvas, false);
-        drawable.forceDraw(&canvas);
+        drawable.forceDrawForObservation(&canvas);
     }
     return canvas.hash();
 }

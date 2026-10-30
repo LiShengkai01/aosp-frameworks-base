@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include <SkCanvas.h>
+#include <SkCanvasVirtualEnforcer.h>
 #include <SkData.h>
 #include <SkColor.h>
 #include <SkImage.h>
@@ -40,18 +42,23 @@
 #include <SkPicture.h>
 #include <SkString.h>
 #include <SkTypeface.h>
+#include <SkShader.h>
+#include <SkMesh.h>
+#include <SkVertices.h>
+#include <src/core/SkVerticesPriv.h>
+#include <src/core/SkDrawShadowInfo.h>
+#include <src/text/GlyphRun.h>
+#include <include/private/chromium/Slug.h>
 
 namespace android {
 namespace uirenderer {
 namespace skiapipeline {
 
 /**
- * FlatExportOpsCanvas captures a fully-rendered frame as a hierarchical JSON
- * stream. It's designed to be the target SkCanvas for RenderNodeDrawable.draw(),
- * which traverses the entire RenderNode tree (including nested HardwareLayers)
- * just like GPU rendering does. By default, SkCanvas's onDrawDrawable() inlines
- * a drawable's content via drawable->draw(this), so nested RenderNodes are
- * captured recursively.
+ * FlatExportOpsCanvas exports recorded drawing commands as hierarchical JSON.
+ * Use RenderNodeDrawable::forceDrawForObservation to expand cached RenderLayers.
+ * External pixels, shaders and effects are identified explicitly; this stream
+ * is not a lossless screenshot or a proof of final pixel visibility.
  *
  * All bounds and points emitted are in global logical SCREEN space:
  * every onDrawXxx callback maps its local-space inputs through the current
@@ -80,11 +87,11 @@ namespace skiapipeline {
  *   ]},
  *   ...
  */
-class FlatExportOpsCanvas : public SkCanvas {
+class FlatExportOpsCanvas : public SkCanvasVirtualEnforcer<SkCanvas> {
 public:
     FlatExportOpsCanvas(std::ostream& output, int width, int height,
                         int screenOffsetX = 0, int screenOffsetY = 0)
-            : SkCanvas(width, height)
+            : SkCanvasVirtualEnforcer<SkCanvas>(width, height)
             , mOutput(output)
             , mLevel(0)
             , mFirstStack({true})
@@ -93,43 +100,99 @@ public:
 
 protected:
     // ── State ─────────────────────────────────────────────────────────
-    void onClipRect(const SkRect& rect, SkClipOp, ClipEdgeStyle) override {
+    void willSave() override { stateOp("save"); }
+    void willRestore() override { stateOp("restore"); }
+
+    SaveLayerStrategy getSaveLayerStrategy(const SaveLayerRec& rec) override {
         sep();
-        mOutput << indent() << "{\"op\":\"clipRect\",\"bounds\":" << rectJsonDevice(rect) << "}";
+        mOutput << "{\"op\":\"saveLayer\"";
+        if (rec.fBounds) mOutput << ",\"bounds\":" << rectJsonDevice(*rec.fBounds);
+        if (rec.fPaint) writePaint(*rec.fPaint);
+        mOutput << ",\"hasBackdropFilter\":" << (rec.fBackdrop ? "true" : "false") << "}";
+        return kNoLayer_SaveLayerStrategy;  // Record state, never allocate/rasterize a layer.
     }
 
-    void onClipRRect(const SkRRect& rrect, SkClipOp, ClipEdgeStyle) override {
+    bool onDoSaveBehind(const SkRect* bounds) override {
+        sep();
+        mOutput << "{\"op\":\"saveBehind\"";
+        if (bounds) mOutput << ",\"bounds\":" << rectJsonDevice(*bounds);
+        mOutput << ",\"contentStatus\":\"backdrop_pixels_required\"}";
+        return false;
+    }
+
+    void onClipRect(const SkRect& rect, SkClipOp op, ClipEdgeStyle edge) override {
+        sep();
+        mOutput << indent() << "{\"op\":\"clipRect\",\"bounds\":" << rectJsonDevice(rect);
+        mOutput << ",\"axisAligned\":" << (currentMatrix().rectStaysRect() ? "true" : "false");
+        writeClip(op, edge);
+        mOutput << "}";
+        SkCanvas::onClipRect(rect, op, edge);
+    }
+
+    void onClipRRect(const SkRRect& rrect, SkClipOp op, ClipEdgeStyle edge) override {
         sep();
         mOutput << indent() << "{\"op\":\"clipRRect\",\"bounds\":" << rectJsonDevice(rrect.rect())
                 << ",\"rx\":" << rrect.getSimpleRadii().x()
-                << ",\"ry\":" << rrect.getSimpleRadii().y() << "}";
+                << ",\"ry\":" << rrect.getSimpleRadii().y();
+        writeClip(op, edge);
+        mOutput << "}";
+        SkCanvas::onClipRRect(rrect, op, edge);
     }
 
-    void onClipPath(const SkPath& path, SkClipOp, ClipEdgeStyle) override {
+    void onClipPath(const SkPath& path, SkClipOp op, ClipEdgeStyle edge) override {
         sep();
-        mOutput << indent() << "{\"op\":\"clipPath\",\"bounds\":" << rectJsonDevice(path.getBounds())
-                << "}";
+        mOutput << indent() << "{\"op\":\"clipPath\",\"bounds\":" << rectJsonDevice(path.getBounds());
+        writeClip(op, edge);
+        SkPath mapped;
+        path.transform(currentMatrix(), &mapped);
+        mapped.offset(mScreenOffsetX, mScreenOffsetY);
+        writeNormalizedPath(mapped);
+        mOutput << "}";
+        SkCanvas::onClipPath(path, op, edge);
     }
 
-    void onClipRegion(const SkRegion&, SkClipOp) override {
+    void onClipRegion(const SkRegion& region, SkClipOp op) override {
         sep();
-        mOutput << indent() << "{\"op\":\"clipRegion\"}";
+        mOutput << indent() << "{\"op\":\"clipRegion\",\"clipOp\":" << (int)op;
+        writeRegion(region, false); // SkRegion clipping is already in device coordinates.
+        mOutput << "}";
+        SkCanvas::onClipRegion(region, op);
+    }
+
+    void onClipShader(sk_sp<SkShader> shader, SkClipOp op) override {
+        sep();
+        mOutput << "{\"op\":\"clipShader\",\"clipOp\":" << (int)op
+                << ",\"contentStatus\":\"shader_pixels_required\"}";
+        SkCanvas::onClipShader(std::move(shader), op);
     }
 
     void onResetClip() override {
         sep();
         mOutput << indent() << "{\"op\":\"resetClip\"}";
+        SkCanvas::onResetClip();
     }
+
+    void onDiscard() override { stateOp("discard"); }
 
     // ── Draws ─────────────────────────────────────────────────────────
     void onDrawPaint(const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawPaint\",\"color\":\"" << colorHex(paint) << "\"}";
+        mOutput << indent() << "{\"op\":\"drawPaint\",\"color\":\"" << colorHex(paint) << "\"";
+        writePaint(paint);
+        mOutput << "}";
+    }
+
+    void onDrawBehind(const SkPaint& paint) override {
+        sep();
+        mOutput << "{\"op\":\"drawBehind\",\"contentStatus\":\"backdrop_pixels_required\"";
+        writePaint(paint);
+        mOutput << "}";
     }
 
     void onDrawRect(const SkRect& rect, const SkPaint& paint) override {
         sep();
         mOutput << indent() << "{\"op\":\"drawRect\",\"bounds\":" << rectJsonDevice(rect)
+                << ",\"axisAligned\":" << (currentMatrix().rectStaysRect() ? "true" : "false")
                 << ",\"color\":\"" << colorHex(paint) << "\""
                 << paintStyle(paint) << "}";
     }
@@ -148,21 +211,22 @@ protected:
         sep();
         mOutput << indent() << "{\"op\":\"drawDRRect\",\"outer\":" << rectJsonDevice(outer.rect())
                 << ",\"inner\":" << rectJsonDevice(inner.rect())
-                << ",\"color\":\"" << colorHex(paint) << "\"}";
+                << ",\"color\":\"" << colorHex(paint) << "\"" << paintStyle(paint) << "}";
     }
 
     void onDrawOval(const SkRect& rect, const SkPaint& paint) override {
         sep();
         mOutput << indent() << "{\"op\":\"drawOval\",\"bounds\":" << rectJsonDevice(rect)
-                << ",\"color\":\"" << colorHex(paint) << "\"}";
+                << ",\"color\":\"" << colorHex(paint) << "\"" << paintStyle(paint) << "}";
     }
 
     void onDrawArc(const SkRect& rect, SkScalar startAngle, SkScalar sweepAngle,
-                   bool, const SkPaint& paint) override {
+                   bool useCenter, const SkPaint& paint) override {
         sep();
         mOutput << indent() << "{\"op\":\"drawArc\",\"bounds\":" << rectJsonDevice(rect)
                 << ",\"start\":" << startAngle << ",\"sweep\":" << sweepAngle
-                << ",\"color\":\"" << colorHex(paint) << "\"}";
+                << ",\"useCenter\":" << (useCenter ? "true" : "false")
+                << ",\"color\":\"" << colorHex(paint) << "\"" << paintStyle(paint) << "}";
     }
 
     void onDrawPath(const SkPath& path, const SkPaint& paint) override {
@@ -180,60 +244,93 @@ protected:
 
     void onDrawTextBlob(const SkTextBlob* blob, SkScalar x, SkScalar y,
                         const SkPaint& paint) override {
-        sep();
-        // Bounds and baseline in global logical-screen space.
-        SkRect localBounds = blob ? blob->bounds().makeOffset(x, y) : SkRect::MakeEmpty();
-        SkScalar bx = x, by = y;
-        pointToDevice(&bx, &by);
-        mOutput << indent() << "{\"op\":\"drawText\""
-                << ",\"x\":" << bx << ",\"y\":" << by
-                << ",\"bounds\":" << rectJsonDevice(localBounds)
-                << ",\"size\":" << localBounds.height()
-                << ",\"color\":\"" << colorHex(paint) << "\"";
+        // Route blobs and direct drawGlyphs/drawSimpleText through one exporter.
+        if (blob) SkCanvas::onDrawTextBlob(blob, x, y, paint);
+    }
 
-        // Emit raw glyph IDs per run for external Python reverse-cmap.
-        // Skia's SkTextBlob::Iter exposes typeface + glyph array per run; the
-        // run does not carry UTF-8 once shaped, hence the side-channel reverse
-        // map. Family name + glyph IDs is the minimal set required.
-        if (blob) {
-            mOutput << ",\"runs\":[";
-            bool firstRun = true;
-            SkTextBlob::Iter iter(*blob);
-            SkTextBlob::Iter::Run run;
-            while (iter.next(&run)) {
-                if (!firstRun) mOutput << ",";
-                firstRun = false;
-                SkString family;
-                if (run.fTypeface) {
-                    run.fTypeface->getFamilyName(&family);
-                }
-                mOutput << "{\"font\":\"";
-                writeEscaped(family.c_str());
-                mOutput << "\"";
-                if (run.fTypeface) {
-                    mOutput << ",\"fontFingerprint\":\"" << fontFingerprint(run.fTypeface) << "\""
-                            << ",\"fontWeight\":" << run.fTypeface->fontStyle().weight()
-                            << ",\"fontWidth\":" << run.fTypeface->fontStyle().width()
-                            << ",\"fontSlant\":" << (int)run.fTypeface->fontStyle().slant();
-                }
-                mOutput << ",\"glyphs\":[";
-                for (int i = 0; i < run.fGlyphCount; ++i) {
-                    if (i) mOutput << ",";
-                    mOutput << (unsigned int)run.fGlyphIndices[i];
-                }
-                mOutput << "]}";
+    void onDrawGlyphRunList(const sktext::GlyphRunList& list, const SkPaint& paint) override {
+        if (list.empty()) return;
+        sep();
+        const SkRect bounds = list.sourceBoundsWithOrigin();
+        SkScalar x = list.origin().x(), y = list.origin().y();
+        pointToDevice(&x, &y);
+        mOutput << "{\"op\":\"drawText\",\"x\":" << x << ",\"y\":" << y
+                << ",\"bounds\":" << rectJsonDevice(bounds)
+                << ",\"size\":" << bounds.height()
+                << ",\"color\":\"" << colorHex(paint) << "\"";
+        writePaint(paint);
+        mOutput << ",\"runs\":[";
+        bool first = true;
+        for (const auto& run : list) {
+            if (!first) mOutput << ',';
+            first = false;
+            const SkFont& font = run.font();
+            const SkTypeface* face = font.getTypeface();
+            SkString family;
+            if (face) face->getFamilyName(&family);
+            mOutput << "{\"font\":\"";
+            writeEscaped(family.c_str());
+            mOutput << "\",\"fontSize\":" << font.getSize()
+                    << ",\"fontScaleX\":" << font.getScaleX()
+                    << ",\"fontSkewX\":" << font.getSkewX();
+            if (face) {
+                mOutput << ",\"fontFingerprint\":\"" << fontFingerprint(face) << "\""
+                        << ",\"fontWeight\":" << face->fontStyle().weight()
+                        << ",\"fontWidth\":" << face->fontStyle().width()
+                        << ",\"fontSlant\":" << (int)face->fontStyle().slant();
             }
-            mOutput << "]";
+            mOutput << ",\"glyphs\":[";
+            for (size_t i = 0; i < run.runSize(); ++i) {
+                if (i) mOutput << ',';
+                mOutput << (unsigned int)run.glyphsIDs()[i];
+            }
+            mOutput << "],\"positions\":[";
+            for (size_t i = 0; i < run.runSize(); ++i) {
+                if (i) mOutput << ',';
+                SkScalar px = run.positions()[i].x() + list.origin().x();
+                SkScalar py = run.positions()[i].y() + list.origin().y();
+                pointToDevice(&px, &py);
+                mOutput << '[' << px << ',' << py << ']';
+            }
+            mOutput << ']';
+            if (!run.text().empty()) {
+                mOutput << ",\"textUtf8\":\"";
+                writeEscaped(mOutput, run.text().data(), run.text().size());
+                mOutput << "\",\"clusters\":[";
+                writeNumbers(run.clusters().data(), run.clusters().size());
+                mOutput << ']';
+            }
+            if (!run.scaledRotations().empty()) {
+                mOutput << ",\"scaledRotations\":[";
+                for (size_t i = 0; i < run.scaledRotations().size(); ++i) {
+                    if (i) mOutput << ',';
+                    mOutput << '[' << run.scaledRotations()[i].x() << ','
+                            << run.scaledRotations()[i].y() << ']';
+                }
+                mOutput << ']';
+            }
+            mOutput << '}';
         }
-        mOutput << "}";
+        mOutput << "]}";
+    }
+
+    void onDrawImage2(const SkImage* image, SkScalar x, SkScalar y,
+                      const SkSamplingOptions& sampling, const SkPaint* paint) override {
+        if (!image) return;
+        onDrawImageRect2(image, SkRect::MakeIWH(image->width(), image->height()),
+                        SkRect::MakeXYWH(x, y, image->width(), image->height()),
+                        sampling, paint, kFast_SrcRectConstraint);
     }
 
     void onDrawImageRect2(const SkImage* image, const SkRect& src, const SkRect& dst,
-                          const SkSamplingOptions&, const SkPaint*,
-                          SrcRectConstraint) override {
+                          const SkSamplingOptions& sampling, const SkPaint* paint,
+                          SrcRectConstraint constraint) override {
         sep();
         mOutput << indent() << "{\"op\":\"drawImage\",\"src\":" << rectJson(src)
-                << ",\"dst\":" << rectJsonDevice(dst);
+                << ",\"dst\":" << rectJsonDevice(dst)
+                << ",\"filter\":" << (int)sampling.filter
+                << ",\"srcConstraint\":" << (int)constraint;
+        if (paint) writePaint(*paint);
         if (image) {
             mOutput << ",\"w\":" << image->width() << ",\"h\":" << image->height()
                     << ",\"imageId\":" << image->uniqueID();
@@ -244,27 +341,201 @@ protected:
         mOutput << "}";
     }
 
-    void onDrawImageLattice2(const SkImage*, const Lattice&, const SkRect& dst,
-                             SkFilterMode, const SkPaint*) override {
+    void onDrawImageLattice2(const SkImage* image, const Lattice& lattice, const SkRect& dst,
+                             SkFilterMode filter, const SkPaint* paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawImageLattice\",\"dst\":" << rectJsonDevice(dst) << "}";
+        mOutput << "{\"op\":\"drawImageLattice\",\"dst\":" << rectJsonDevice(dst)
+                << ",\"filter\":" << (int)filter << ",\"xDivs\":[";
+        writeNumbers(lattice.fXDivs, lattice.fXCount);
+        mOutput << "],\"yDivs\":[";
+        writeNumbers(lattice.fYDivs, lattice.fYCount);
+        mOutput << ']';
+        if (lattice.fBounds) mOutput << ",\"src\":" << rectJson(SkRect::Make(*lattice.fBounds));
+        if (lattice.fRectTypes) {
+            mOutput << ",\"rectTypes\":[";
+            const int cells = (lattice.fXCount + 1) * (lattice.fYCount + 1);
+            for (int i = 0; i < cells; ++i) {
+                if (i) mOutput << ',';
+                mOutput << (int)lattice.fRectTypes[i];
+            }
+            mOutput << ']';
+            if (lattice.fColors) {
+                mOutput << ",\"colors\":[";
+                writeNumbers(lattice.fColors, cells);
+                mOutput << ']';
+            }
+        }
+        if (paint) writePaint(*paint);
+        if (image) {
+            mOutput << ",\"imageId\":" << image->uniqueID()
+                    << ",\"w\":" << image->width() << ",\"h\":" << image->height();
+            writeImageVisual(image, SkRect::MakeIWH(image->width(), image->height()));
+        }
+        mOutput << '}';
     }
 
-    void onDrawPoints(SkCanvas::PointMode, size_t count, const SkPoint[],
+    void onDrawPoints(SkCanvas::PointMode mode, size_t count, const SkPoint points[],
                       const SkPaint& paint) override {
         sep();
         mOutput << indent() << "{\"op\":\"drawPoints\",\"count\":" << count
-                << ",\"color\":\"" << colorHex(paint) << "\"}";
+                << ",\"color\":\"" << colorHex(paint) << "\""
+                << ",\"mode\":" << (int)mode << ",\"points\":";
+        writePoints(points, count);
+        writePaint(paint);
+        mOutput << '}';
     }
 
-    void onDrawRegion(const SkRegion&, const SkPaint& paint) override {
+    void onDrawRegion(const SkRegion& region, const SkPaint& paint) override {
         sep();
-        mOutput << indent() << "{\"op\":\"drawRegion\",\"color\":\"" << colorHex(paint) << "\"}";
+        mOutput << "{\"op\":\"drawRegion\",\"color\":\"" << colorHex(paint) << "\"";
+        writeRegion(region, true);
+        writePaint(paint);
+        mOutput << '}';
     }
 
-    void onDrawPicture(const SkPicture*, const SkMatrix*, const SkPaint*) override {
+    void onDrawPicture(const SkPicture* picture, const SkMatrix* matrix,
+                       const SkPaint* paint) override {
+        if (!picture) return;
         sep();
-        mOutput << indent() << "{\"op\":\"drawPicture\"}";
+        mOutput << "{\"op\":\"drawPicture\",\"ops\":[";
+        mFirstStack.push_back(true);
+        ++mLevel;
+        // The base implementation preserves the optional matrix/saveLayer paint
+        // and plays the picture back through this canvas's virtual draw hooks.
+        SkCanvas::onDrawPicture(picture, matrix, paint);
+        --mLevel;
+        mFirstStack.pop_back();
+        mOutput << "]}";
+    }
+
+    void onDrawPatch(const SkPoint cubics[12], const SkColor colors[4],
+                     const SkPoint texCoords[4], SkBlendMode mode, const SkPaint& paint) override {
+        sep();
+        mOutput << "{\"op\":\"drawPatch\",\"patchBlendMode\":" << (int)mode << ",\"cubics\":";
+        writePoints(cubics, 12);
+        if (colors) { mOutput << ",\"colors\":["; writeNumbers(colors, 4); mOutput << ']'; }
+        if (texCoords) { mOutput << ",\"texCoords\":"; writePoints(texCoords, 4, false); }
+        writePaint(paint);
+        mOutput << '}';
+    }
+
+    void onDrawVerticesObject(const SkVertices* vertices, SkBlendMode mode,
+                              const SkPaint& paint) override {
+        if (!vertices) return;
+        const auto data = vertices->priv();
+        sep();
+        mOutput << "{\"op\":\"drawVertices\",\"bounds\":" << rectJsonDevice(vertices->bounds())
+                << ",\"vertexMode\":" << (int)data.mode() << ",\"vertexBlendMode\":" << (int)mode
+                << ",\"positions\":";
+        writePoints(data.positions(), data.vertexCount());
+        if (data.texCoords()) {
+            mOutput << ",\"texCoords\":"; writePoints(data.texCoords(), data.vertexCount(), false);
+        }
+        if (data.colors()) {
+            mOutput << ",\"colors\":["; writeNumbers(data.colors(), data.vertexCount()); mOutput << ']';
+        }
+        mOutput << ",\"indices\":[";
+        writeNumbers(data.indices(), data.indexCount());
+        mOutput << ']';
+        writePaint(paint);
+        mOutput << '}';
+    }
+
+    void onDrawMesh(const SkMesh& mesh, sk_sp<SkBlender>, const SkPaint& paint) override {
+        sep();
+        mOutput << "{\"op\":\"drawMesh\",\"bounds\":" << rectJsonDevice(mesh.bounds())
+                << ",\"contentStatus\":\"mesh_shader_required\"";
+        writePaint(paint);
+        mOutput << '}';
+    }
+
+    void onDrawAtlas2(const SkImage* atlas, const SkRSXform transforms[], const SkRect src[],
+                      const SkColor colors[], int count, SkBlendMode mode,
+                      const SkSamplingOptions& sampling, const SkRect*, const SkPaint* paint) override {
+        sep();
+        mOutput << "{\"op\":\"drawAtlas\",\"atlasBlendMode\":" << (int)mode;
+        if (colors) { mOutput << ",\"colors\":["; writeNumbers(colors, count); mOutput << ']'; }
+        mOutput << ",\"ops\":[";
+        mFirstStack.push_back(true);
+        ++mLevel;
+        for (int i = 0; i < count; ++i) {
+            SkAutoCanvasRestore restore(this, true);
+            SkMatrix transform;
+            transform.setRSXform(transforms[i]);
+            concat(transform);
+            onDrawImageRect2(atlas, src[i], SkRect::MakeWH(src[i].width(), src[i].height()),
+                             sampling, paint, kStrict_SrcRectConstraint);
+        }
+        --mLevel;
+        mFirstStack.pop_back();
+        mOutput << "]}";
+    }
+
+    void onDrawEdgeAAImageSet2(const ImageSetEntry entries[], int count, const SkPoint clips[],
+                               const SkMatrix matrices[], const SkSamplingOptions& sampling,
+                               const SkPaint* paint, SrcRectConstraint constraint) override {
+        int clipIndex = 0;
+        for (int i = 0; i < count; ++i) {
+            SkAutoCanvasRestore restore(this, true);
+            if (entries[i].fMatrixIndex >= 0) concat(matrices[entries[i].fMatrixIndex]);
+            if (entries[i].fHasClip) {
+                SkPath clip;
+                clip.addPoly(clips + clipIndex, 4, true);
+                clipPath(clip);
+                clipIndex += 4;
+            }
+            SkPaint p = paint ? *paint : SkPaint();
+            p.setAlphaf(p.getAlphaf() * entries[i].fAlpha);
+            onDrawImageRect2(entries[i].fImage.get(), entries[i].fSrcRect, entries[i].fDstRect,
+                             sampling, &p, constraint);
+        }
+    }
+
+    void onDrawEdgeAAQuad(const SkRect& rect, const SkPoint clip[4], QuadAAFlags flags,
+                          const SkColor4f& color, SkBlendMode mode) override {
+        sep();
+        mOutput << "{\"op\":\"drawEdgeAAQuad\",\"bounds\":" << rectJsonDevice(rect)
+                << ",\"aaFlags\":" << (int)flags << ",\"blendMode\":" << (int)mode
+                << ",\"color\":\"" << colorHex(color.toSkColor()) << "\"";
+        if (clip) { mOutput << ",\"clipPoints\":"; writePoints(clip, 4); }
+        mOutput << '}';
+    }
+
+    void onDrawAnnotation(const SkRect& rect, const char key[], SkData* value) override {
+        sep();
+        mOutput << "{\"op\":\"annotation\",\"bounds\":" << rectJsonDevice(rect);
+        if (key && !strcmp(key, "hwui.mesh.shader_required")) {
+            mOutput << ",\"contentStatus\":\"mesh_shader_required\"";
+        }
+        mOutput << ",\"key\":\"";
+        writeEscaped(key);
+        mOutput << "\",\"dataHex\":\"";
+        static constexpr char hex[] = "0123456789abcdef";
+        if (value) {
+            const auto* bytes = static_cast<const uint8_t*>(value->data());
+            for (size_t i = 0; i < value->size(); ++i) mOutput << hex[bytes[i] >> 4] << hex[bytes[i] & 15];
+        }
+        mOutput << "\"}";
+    }
+
+    void onDrawShadowRec(const SkPath& path, const SkDrawShadowRec& rec) override {
+        sep();
+        mOutput << "{\"op\":\"drawShadow\",\"bounds\":" << rectJsonDevice(path.getBounds())
+                << ",\"contentStatus\":\"shadow_effect\",\"flags\":" << rec.fFlags
+                << ",\"ambientColor\":\"" << colorHex(rec.fAmbientColor)
+                << "\",\"spotColor\":\"" << colorHex(rec.fSpotColor) << "\"}";
+    }
+
+    sk_sp<sktext::gpu::Slug> onConvertGlyphRunListToSlug(
+            const sktext::GlyphRunList&, const SkPaint&) override {
+        return nullptr;  // An observation canvas cannot allocate a GPU text cache.
+    }
+
+    void onDrawSlug(const sktext::gpu::Slug* slug, const SkPaint&) override {
+        if (!slug) return;
+        sep();
+        mOutput << "{\"op\":\"drawSlug\",\"bounds\":" << rectJsonDevice(slug->sourceBoundsWithOrigin())
+                << ",\"contentStatus\":\"gpu_text_cache_unavailable\"}";
     }
 
     /**
@@ -281,8 +552,21 @@ protected:
         if (!drawable) return;
         sep();
         SkRect b = drawable->getBounds();
+        if (matrix) matrix->mapRect(&b);
+        const char* type = drawable->getTypeName();
         mOutput << indent() << "{\"op\":\"drawDrawable\",\"bounds\":" << rectJsonDevice(b)
-                << ",\"ops\":[";
+                << ",\"drawableType\":\"";
+        writeEscaped(type);
+        mOutput << "\"";
+        if (type && (!strcmp(type, "FunctorDrawable") || !strcmp(type, "LayerDrawable") ||
+                     !strcmp(type, "BackdropFilterDrawable"))) {
+            // WebView/TextureView/backdrop pixels are external to this command
+            // stream. Do not replace them with misleading dummy rectangles or
+            // invoke a GPU functor during observation.
+            mOutput << ",\"contentStatus\":\"external_pixels_required\",\"ops\":[]}";
+            return;
+        }
+        mOutput << ",\"ops\":[";
         mLevel++;
         mFirstStack.push_back(true);
         if (matrix) {
@@ -293,12 +577,65 @@ protected:
         } else {
             drawable->draw(this);
         }
+        const bool noCommands = mFirstStack.back();
         mFirstStack.pop_back();
         mLevel--;
-        mOutput << "]}";
+        mOutput << ']';
+        if (noCommands) mOutput << ",\"contentStatus\":\"no_replayed_commands\"";
+        mOutput << '}';
     }
 
 private:
+    void stateOp(const char* op) {
+        sep();
+        mOutput << "{\"op\":\"" << op << "\"}";
+    }
+
+    void writeClip(SkClipOp op, ClipEdgeStyle edge) {
+        mOutput << ",\"clipOp\":" << (int)op
+                << ",\"antiAlias\":" << (edge == kSoft_ClipEdgeStyle ? "true" : "false");
+    }
+
+    void writePaint(const SkPaint& paint) {
+        mOutput << ",\"paintColor\":\"" << colorHex(paint) << "\"" << paintStyle(paint);
+    }
+
+    template <typename T>
+    void writeNumbers(const T* values, size_t count) {
+        for (size_t i = 0; values && i < count; ++i) {
+            if (i) mOutput << ',';
+            mOutput << values[i];
+        }
+    }
+
+    void writePoints(const SkPoint* points, size_t count, bool transform = true) {
+        mOutput << '[';
+        for (size_t i = 0; i < count; ++i) {
+            if (i) mOutput << ',';
+            SkScalar x = points[i].x(), y = points[i].y();
+            if (transform) pointToDevice(&x, &y);
+            mOutput << '[' << x << ',' << y << ']';
+        }
+        mOutput << ']';
+    }
+
+    void writeRegion(const SkRegion& region, bool transform) {
+        mOutput << ",\"rects\":[";
+        bool first = true;
+        for (SkRegion::Iterator it(region); !it.done(); it.next()) {
+            if (!first) mOutput << ',';
+            first = false;
+            SkRect rect = SkRect::Make(it.rect());
+            if (transform) {
+                mOutput << rectJsonDevice(rect);
+            } else {
+                rect.offset(mScreenOffsetX, mScreenOffsetY);
+                mOutput << rectJson(rect);
+            }
+        }
+        mOutput << ']';
+    }
+
     // Identity of tables that determine glyph numbering, names and substitutions.
     // FNV-1a is an identity hint, not a cryptographic integrity claim. Host assets
     // retain SHA256 independently. Cache once per typeface, never once per run.
@@ -329,7 +666,6 @@ private:
     }
     static constexpr int kMaxImageSampleDimension = 64;
     static constexpr size_t kMaxImageColorRuns = 1024;
-    static constexpr int kMaxPathVerbs = 256;
 
     void sep() {
         if (!mFirstStack.back()) {
@@ -374,8 +710,16 @@ private:
 
     static std::string rectJson(const SkRect& r) {
         std::ostringstream s;
-        s << "[" << (int)r.fLeft << "," << (int)r.fTop << ","
-          << (int)r.fRight << "," << (int)r.fBottom << "]";
+        // RenderNode drawables can use SkRectMakeLargest(). Casting those
+        // coordinates to int overflows; retain finite scalar coordinates.
+        s << '[';
+        const SkScalar values[] = {r.fLeft, r.fTop, r.fRight, r.fBottom};
+        for (int i = 0; i < 4; ++i) {
+            if (i) s << ',';
+            if (std::isfinite(values[i])) s << values[i];
+            else s << "null";
+        }
+        s << ']';
         return s.str();
     }
 
@@ -387,12 +731,22 @@ private:
     }
 
     static std::string paintStyle(const SkPaint& paint) {
+        std::ostringstream s;
+        s << ",\"alpha\":" << paint.getAlphaf()
+          << ",\"hasShader\":" << (paint.getShader() ? "true" : "false")
+          << ",\"hasImageFilter\":" << (paint.getImageFilter() ? "true" : "false")
+          << ",\"hasColorFilter\":" << (paint.getColorFilter() ? "true" : "false")
+          << ",\"hasMaskFilter\":" << (paint.getMaskFilter() ? "true" : "false");
+        s << ",\"hasPathEffect\":" << (paint.getPathEffect() ? "true" : "false");
+        const auto blend = paint.asBlendMode();
+        if (blend) s << ",\"blendMode\":" << (int)*blend;
+        else s << ",\"customBlender\":true";
         if (paint.getStyle() == SkPaint::kStroke_Style) {
-            std::ostringstream s;
             s << ",\"style\":\"stroke\",\"strokeWidth\":" << paint.getStrokeWidth();
-            return s.str();
+        } else if (paint.getStyle() == SkPaint::kStrokeAndFill_Style) {
+            s << ",\"style\":\"strokeAndFill\",\"strokeWidth\":" << paint.getStrokeWidth();
         }
-        return "";
+        return s.str();
     }
 
     static std::string colorHex(SkColor color) {
@@ -488,13 +842,13 @@ private:
     /**
      * Export scale- and translation-independent path geometry.
      *
-     * Points are normalized into the path's local bounds. Python can rasterize
-     * the data at any desired mask size after libhwui has been compiled.
+     * Points are normalized into the path's bounds. A zero-width/height axis
+     * uses divisor 1, retaining stroked horizontal/vertical paths. Export all
+     * verbs; consumer-side icon previews may impose their own complexity cap.
      */
     void writeNormalizedPath(const SkPath& path) {
         const SkRect bounds = path.getBounds();
-        if (!bounds.isFinite() || bounds.isEmpty() ||
-            bounds.width() <= 0.0f || bounds.height() <= 0.0f) {
+        if (!bounds.isFinite()) {
             mOutput << ",\"pathVisualStatus\":\"invalid_bounds\"";
             return;
         }
@@ -510,15 +864,10 @@ private:
         commands.reserve(32);
         SkPath::RawIter iter(path);
         SkPoint points[4];
-        bool tooComplex = false;
 
         while (true) {
             const SkPath::Verb verb = iter.next(points);
             if (verb == SkPath::kDone_Verb) break;
-            if (commands.size() >= static_cast<size_t>(kMaxPathVerbs)) {
-                tooComplex = true;
-                break;
-            }
 
             PathCommand command;
             int pointCount = 0;
@@ -555,16 +904,12 @@ private:
             command.points.reserve(pointCount);
             for (int i = 0; i < pointCount; ++i) {
                 command.points.push_back(SkPoint::Make(
-                        (points[i].x() - bounds.left()) / bounds.width(),
-                        (points[i].y() - bounds.top()) / bounds.height()));
+                        (points[i].x() - bounds.left()) /
+                                (bounds.width() > 0 ? bounds.width() : 1),
+                        (points[i].y() - bounds.top()) /
+                                (bounds.height() > 0 ? bounds.height() : 1)));
             }
             commands.push_back(std::move(command));
-        }
-
-        if (tooComplex) {
-            mOutput << ",\"pathVisualStatus\":\"too_complex\""
-                    << ",\"pathVerbLimit\":" << kMaxPathVerbs;
-            return;
         }
 
         mOutput << ",\"pathVisualStatus\":\"available\""
@@ -588,30 +933,36 @@ private:
         mOutput << "]";
     }
 
-    // JSON-escape and write a C-string to mOutput. Font family names from
+    // JSON-escape and write a C-string to a stream. Font family names from
     // SkTypeface are usually plain ASCII (e.g. "Roboto", "sans-serif",
     // "NotoSerifCJK-Regular"), but guard against quotes/backslashes anyway.
-    void writeEscaped(const char* s) {
+public:
+    static void writeEscaped(std::ostream& output, const char* s,
+                             size_t size = std::string::npos) {
         if (!s) return;
-        for (; *s; ++s) {
-            char c = *s;
+        if (size == std::string::npos) size = strlen(s);
+        for (size_t i = 0; i < size; ++i) {
+            char c = s[i];
             switch (c) {
-                case '"':  mOutput << "\\\""; break;
-                case '\\': mOutput << "\\\\"; break;
-                case '\n': mOutput << "\\n";  break;
-                case '\r': mOutput << "\\r";  break;
-                case '\t': mOutput << "\\t";  break;
+                case '"':  output << "\\\""; break;
+                case '\\': output << "\\\\"; break;
+                case '\n': output << "\\n";  break;
+                case '\r': output << "\\r";  break;
+                case '\t': output << "\\t";  break;
                 default:
                     if ((unsigned char)c < 0x20) {
                         char buf[8];
                         std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)(unsigned char)c);
-                        mOutput << buf;
+                        output << buf;
                     } else {
-                        mOutput << c;
+                        output << c;
                     }
             }
         }
     }
+
+private:
+    void writeEscaped(const char* s) { writeEscaped(mOutput, s); }
 
     std::ostream& mOutput;
     int mLevel;

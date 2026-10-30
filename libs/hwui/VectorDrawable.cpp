@@ -28,6 +28,7 @@
 #include "SkScalar.h"
 #include "hwui/Paint.h"
 #include "renderthread/RenderThread.h"
+#include "pipeline/skia/RenderNodeDrawable.h"
 #include "utils/Macros.h"
 #include "utils/VectorDrawableUtils.h"
 
@@ -501,6 +502,23 @@ void Tree::draw(SkCanvas* canvas, const SkRect& bounds, const SkPaint& inPaint) 
     // Update the paint for any animatable properties
     SkPaint paint = inPaint;
     paint.setAlpha(mProperties.getRootAlpha() * 255);
+
+    if (skiapipeline::RenderNodeDrawable::isObservationReplay()) {
+        // VectorDrawable normally becomes a cached bitmap even on a no-draw
+        // canvas. Export its active vector paths without allocating/updating
+        // that bitmap, preserving the viewport, destination and group paint.
+        const float width = mProperties.getViewportWidth();
+        const float height = mProperties.getViewportHeight();
+        if (width <= 0 || height <= 0) return;
+        SkAutoCanvasRestore restore(canvas, true);
+        canvas->saveLayer(&bounds, &paint);
+        canvas->clipRect(bounds);
+        canvas->translate(bounds.left(), bounds.top());
+        canvas->scale(bounds.width() / width, bounds.height() / height);
+        canvas->drawAnnotation(SkRect::MakeWH(width, height), "hwui.vector.expanded", nullptr);
+        mRootNode->draw(canvas, false);
+        return;
+    }
 
     sk_sp<SkImage> cachedBitmap = getBitmapUpdateIfDirty().makeImage();
 

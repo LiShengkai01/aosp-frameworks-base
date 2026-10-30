@@ -27,6 +27,7 @@
 #include <include/gpu/ganesh/SkImageGanesh.h>
 #endif
 
+#include <cstring>
 #include <optional>
 
 #include "RenderNode.h"
@@ -37,6 +38,26 @@
 namespace android {
 namespace uirenderer {
 namespace skiapipeline {
+
+namespace {
+// RenderNodeDrawable children may be replayed by reorder barriers rather than by
+// SkCanvas::onDrawDrawable. Scope the mode around the entire synchronous replay.
+// Never change a recorded drawable's mComposeLayer or the node's cached surface.
+thread_local bool sObservationReplay = false;
+}
+
+void RenderNodeDrawable::forceDrawForObservation(SkCanvas* canvas) const {
+    struct RestoreMode {
+        bool previous = sObservationReplay;
+        ~RestoreMode() { sObservationReplay = previous; }
+    } restore;
+    sObservationReplay = true;
+    forceDraw(canvas);
+}
+
+bool RenderNodeDrawable::isObservationReplay() {
+    return sObservationReplay;
+}
 
 RenderNodeDrawable::RenderNodeDrawable(RenderNode* node, SkCanvas* canvas, bool composeLayer,
                                        bool inReorderingSection)
@@ -208,6 +229,15 @@ protected:
     }
 
     void onDrawDrawable(SkDrawable* drawable, const SkMatrix* matrix) override {
+        const char* type = drawable->getTypeName();
+        if (sObservationReplay && type &&
+            (!strcmp(type, "FunctorDrawable") || !strcmp(type, "LayerDrawable") ||
+             !strcmp(type, "BackdropFilterDrawable"))) {
+            // Let the observer report external content instead of executing
+            // its GPU/fallback drawing through this alpha wrapper.
+            SkPaintFilterCanvas::onDrawDrawable(drawable, matrix);
+            return;
+        }
         // We unroll the drawable using "this" canvas, so that draw calls contained inside will
         // get their alpha applied. The default SkPaintFilterCanvas::onDrawDrawable does not unroll.
         drawable->draw(this, matrix);
@@ -240,6 +270,24 @@ void RenderNodeDrawable::drawContent(SkCanvas* canvas) const {
         SkIPoint offset = SkIPoint::Make(0.0f, 0.0f);
         SkiaDisplayList* displayList = renderNode->getDisplayList().asSkiaDl();
         const LayerProperties& layerProperties = properties.layerProperties();
+        if (sObservationReplay && mComposeLayer &&
+            properties.effectiveLayerType() == LayerType::RenderLayer) {
+            // Keep the node transforms/clips above, but do not substitute a
+            // potentially stale GPU texture for its current active commands.
+            SkAutoCanvasRestore restore(canvas, true);
+            canvas->clipRect(bounds);
+            SkPaint paint;
+            layerNeedsPaint(layerProperties, alphaMultiplier, &paint);
+            paint.setImageFilter(sk_ref_sp(layerProperties.getImageFilter()));
+            canvas->saveLayer(&bounds, &paint);
+            canvas->drawAnnotation(bounds, "hwui.layer.expanded", nullptr);
+            if (!layerProperties.getStretchEffect().isEmpty() &&
+                Properties::getStretchEffectBehavior() != StretchEffectBehavior::UniformScale) {
+                canvas->drawAnnotation(bounds, "hwui.effect.non_linear_stretch", nullptr);
+            }
+            displayList->draw(canvas);
+            return;
+        }
         // composing a hardware layer
         if (renderNode->getLayerSurface() && mComposeLayer) {
             SkASSERT(properties.effectiveLayerType() == LayerType::RenderLayer);

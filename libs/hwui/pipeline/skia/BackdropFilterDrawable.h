@@ -34,6 +34,7 @@ namespace skiapipeline {
  */
 class BackdropFilterDrawable : public SkDrawable {
 public:
+    const char* getTypeName() const override { return "BackdropFilterDrawable"; }
     BackdropFilterDrawable(RenderNode* renderNode, SkCanvas* canvas)
             : mTargetRenderNode(renderNode), mBounds(canvas->getLocalClipBounds()) {}
 

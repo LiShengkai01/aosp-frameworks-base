@@ -17,19 +17,25 @@
 #include <SkBlendMode.h>
 #include <SkClipStack.h>
 #include <SkSurface_Base.h>
+#include <SkPictureRecorder.h>
 #include <VectorDrawable.h>
 #include <gtest/gtest.h>
 #include <include/effects/SkImageFilters.h>
+#include <include/gpu/ganesh/SkMeshGanesh.h>
 #include <string.h>
 
 #include "AnimationContext.h"
 #include "DamageAccumulator.h"
 #include "FatalTestCanvas.h"
 #include "IContextFactory.h"
+#include "Mesh.h"
 #include "RecordingCanvas.h"
 #include "SkiaCanvas.h"
 #include "hwui/Paint.h"
 #include "pipeline/skia/BackdropFilterDrawable.h"
+#include "pipeline/skia/FlatExportOpsCanvas.h"
+#include "pipeline/skia/FunctorDrawable.h"
+#include "pipeline/skia/SemanticHashCanvas.h"
 #include "pipeline/skia/SkiaDisplayList.h"
 #include "pipeline/skia/SkiaOpenGLPipeline.h"
 #include "pipeline/skia/SkiaPipeline.h"
@@ -42,6 +48,313 @@ using namespace android;
 using namespace android::uirenderer;
 using namespace android::uirenderer::renderthread;
 using namespace android::uirenderer::skiapipeline;
+
+namespace {
+size_t occurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    for (size_t pos = 0; (pos = text.find(needle, pos)) != std::string::npos; pos += needle.size()) {
+        ++count;
+    }
+    return count;
+}
+
+void recordObservationGlyph(SkCanvas* canvas, SkGlyphID glyph) {
+    const SkPoint position = {5, 15};
+    canvas->drawGlyphs(1, &glyph, &position, {0, 0}, TestUtils::defaultFont(), SkPaint());
+}
+
+void recordObservationGlyph(Canvas* canvas, SkGlyphID glyph) {
+    SkPictureRecorder recorder;
+    recordObservationGlyph(recorder.beginRecording(80, 60), glyph);
+    auto picture = recorder.finishRecordingAsPicture();
+    canvas->drawPicture(*picture);
+}
+}
+
+TEST(DisplayListObservation, expandsCachedChildWithoutChangingNormalRendering) {
+    const auto glyph = TestUtils::defaultFont().unicharToGlyph('A');
+    auto child = TestUtils::createSkiaNode(10, 20, 90, 80,
+            [glyph](RenderProperties& props, SkiaRecordingCanvas& recorder) {
+                props.mutateLayerProperties().setType(LayerType::RenderLayer);
+                recordObservationGlyph(&recorder, glyph);
+            });
+    auto parent = TestUtils::createSkiaNode(0, 0, 200, 200,
+            [&](RenderProperties&, SkiaRecordingCanvas& recorder) { recorder.drawRenderNode(child.get()); });
+    auto cached = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(80, 60));
+    cached->getCanvas()->clear(SK_ColorBLUE);
+    child->setLayerSurface(cached);
+    std::ostringstream before, exported, after;
+    {
+        FlatExportOpsCanvas canvas(before, 200, 200);
+        RenderNodeDrawable(parent.get(), &canvas, false).forceDraw(&canvas);
+    }
+    {
+        FlatExportOpsCanvas canvas(exported, 200, 200, 7, 9);
+        RenderNodeDrawable(parent.get(), &canvas, false).forceDrawForObservation(&canvas);
+        EXPECT_EQ(1u, occurrences(exported.str(), "\"op\":\"drawText\""));
+        EXPECT_NE(std::string::npos, exported.str().find("\"positions\":[[22,44]]"));
+        EXPECT_NE(std::string::npos, exported.str().find("hwui.layer.expanded"));
+        EXPECT_EQ(std::string::npos, exported.str().find("\"op\":\"drawImage\""));
+    }
+    {
+        FlatExportOpsCanvas canvas(after, 200, 200);
+        RenderNodeDrawable(parent.get(), &canvas, false).forceDraw(&canvas);
+    }
+    EXPECT_NE(std::string::npos, before.str().find("\"op\":\"drawImage\""));
+    EXPECT_EQ(std::string::npos, before.str().find("\"op\":\"drawText\""));
+    RecordProperty("export_json", "[" + exported.str() + "]");
+    EXPECT_EQ(before.str(), after.str());
+    EXPECT_EQ(SK_ColorBLUE, TestUtils::getColor(cached, 0, 0));
+    child->setLayerSurface(nullptr);
+}
+
+TEST(DisplayListObservation, expandsLayerWithoutCachedPixelsAndKeepsZOrdering) {
+    auto parent = TestUtils::createSkiaNode(0, 0, 200, 200,
+            [](RenderProperties&, SkiaRecordingCanvas& recorder) {
+                recorder.enableZ(true);
+                for (int z : {2, -1, 0}) {
+                    auto node = TestUtils::createSkiaNode(10, 20, 90, 80,
+                            [z](RenderProperties& props, SkiaRecordingCanvas& child) {
+                                props.mutateLayerProperties().setType(LayerType::RenderLayer);
+                                props.setTranslationZ(z);
+                                recordObservationGlyph(&child, 10 + z);
+                            });
+                    recorder.drawRenderNode(node.get());
+                }
+                recorder.enableZ(false);
+            });
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200);
+    RenderNodeDrawable(parent.get(), &canvas, false).forceDrawForObservation(&canvas);
+    const auto text = out.str();
+    RecordProperty("export_json", "[" + text + "]");
+    EXPECT_EQ(3u, occurrences(text, "\"op\":\"drawText\""));
+    EXPECT_LT(text.find("\"glyphs\":[9]"), text.find("\"glyphs\":[10]"));
+    EXPECT_LT(text.find("\"glyphs\":[10]"), text.find("\"glyphs\":[12]"));
+}
+
+TEST(DisplayListObservation, recordsPictureContentsMatrixAndLayerPaint) {
+    SkPictureRecorder recorder;
+    auto* recording = recorder.beginRecording(100, 100);
+    // Force an actual SkPicture callback (tiny pictures may be inlined by Skia).
+    for (int i = 0; i < 30; ++i) recording->drawRect(SkRect::MakeXYWH(i, i, 2, 2), SkPaint());
+    recordObservationGlyph(recording, TestUtils::defaultFont().unicharToGlyph('B'));
+    auto picture = recorder.finishRecordingAsPicture();
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 300, 300, 7, 9);
+    SkMatrix matrix = SkMatrix::Translate(40, 50);
+    SkPaint paint;
+    paint.setAlphaf(0.5f);
+    canvas.drawPicture(picture, &matrix, &paint);
+    EXPECT_NE(std::string::npos, out.str().find("\"op\":\"drawPicture\""));
+    EXPECT_EQ(1u, occurrences(out.str(), "\"op\":\"drawText\""));
+    EXPECT_NE(std::string::npos, out.str().find("\"positions\":[[52,74]]"));
+    EXPECT_NE(std::string::npos, out.str().find("\"alpha\":0.5"));
+    RecordProperty("export_json", "[" + out.str() + "]");
+    EXPECT_TRUE(canvas.getTotalMatrix().isIdentity());
+    EXPECT_EQ(1, canvas.getSaveCount());
+}
+
+TEST(DisplayListObservation, clipStateIsAppliedAndRestored) {
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200);
+    canvas.save();
+    canvas.clipRect(SkRect::MakeLTRB(10, 20, 90, 80));
+    EXPECT_EQ(SkIRect::MakeLTRB(10, 20, 90, 80), canvas.getDeviceClipBounds());
+    canvas.clipRect(SkRect::MakeLTRB(10, 20, 90, 80), SkClipOp::kDifference);
+    EXPECT_TRUE(canvas.isClipEmpty());
+    canvas.restore();
+    EXPECT_EQ(SkIRect::MakeWH(200, 200), canvas.getDeviceClipBounds());
+    EXPECT_NE(std::string::npos, out.str().find("\"clipOp\":0"));
+    EXPECT_NE(std::string::npos, out.str().find("\"clipOp\":1"));
+    EXPECT_NE(std::string::npos, out.str().find("\"axisAligned\":true"));
+    canvas.rotate(30);
+    canvas.clipRect(SkRect::MakeWH(50, 50));
+    EXPECT_NE(std::string::npos, out.str().find("\"axisAligned\":false"));
+    EXPECT_NE(std::string::npos, out.str().find("\"op\":\"restore\""));
+}
+
+TEST(DisplayListObservation, directGlyphsAndGeometryAreNotDropped) {
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200);
+    recordObservationGlyph(&canvas, TestUtils::defaultFont().unicharToGlyph('C'));
+    SkPoint points[] = {{1, 2}, {3, 4}, {5, 6}};
+    canvas.drawPoints(SkCanvas::kPolygon_PointMode, 3, points, SkPaint());
+    auto vertices = SkVertices::MakeCopy(SkVertices::kTriangles_VertexMode, 3, points, nullptr, nullptr);
+    canvas.drawVertices(vertices, SkBlendMode::kSrcOver, SkPaint());
+    SkRegion region(SkIRect::MakeLTRB(1, 2, 4, 5));
+    // Rectangular regions are canonicalized to drawRect by SkCanvas.
+    region.op(SkIRect::MakeLTRB(6, 7, 8, 9), SkRegion::kUnion_Op);
+    canvas.drawRegion(region, SkPaint());
+    EXPECT_EQ(1u, occurrences(out.str(), "\"op\":\"drawText\""));
+    EXPECT_NE(std::string::npos, out.str().find("\"points\":[[1,2],[3,4],[5,6]]"));
+    EXPECT_NE(std::string::npos, out.str().find("\"positions\":[[1,2],[3,4],[5,6]]"));
+    EXPECT_NE(std::string::npos, out.str().find("\"rects\":[[1,2,4,5],[6,7,8,9]]"));
+    RecordProperty("export_json", "[" + out.str() + "]");
+}
+
+TEST(DisplayListObservation, externalFunctorIsMarkedWithoutExecutingIt) {
+    class External : public SkDrawable {
+    public:
+        bool called = false;
+        const char* getTypeName() const override { return "FunctorDrawable"; }
+        SkRect onGetBounds() override { return SkRect::MakeWH(20, 30); }
+        void onDraw(SkCanvas*) override { called = true; }
+    } drawable;
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200, 7, 9);
+    auto transform = SkMatrix::Translate(10, 20);
+    canvas.drawDrawable(&drawable, &transform);
+    RecordProperty("export_json", "[" + out.str() + "]");
+    EXPECT_FALSE(drawable.called);
+    EXPECT_NE(std::string::npos, out.str().find("external_pixels_required"));
+    EXPECT_NE(std::string::npos, out.str().find("\"bounds\":[17,29,37,59]"));
+
+    // Non-overlapping translucent nodes use AlphaFilterCanvas, which normally
+    // executes drawables itself rather than forwarding to the observer.
+    auto node = TestUtils::createSkiaNode(0, 0, 100, 100,
+            [](RenderProperties& props, SkiaRecordingCanvas& recorder) {
+                props.setAlpha(0.5f);
+                props.setHasOverlappingRendering(false);
+                recorder.drawRect(0, 0, 5, 5, Paint());
+            });
+    RecordingCanvas recorder;
+    node->getDisplayList().asSkiaDl()->attachRecorder(&recorder, SkIRect::MakeWH(100, 100));
+    recorder.drawDrawable(&drawable, nullptr);
+    std::ostringstream alphaOut;
+    FlatExportOpsCanvas alphaCanvas(alphaOut, 200, 200);
+    RenderNodeDrawable(node.get(), &alphaCanvas, true).forceDrawForObservation(&alphaCanvas);
+    EXPECT_FALSE(drawable.called);
+    EXPECT_NE(std::string::npos, alphaOut.str().find("external_pixels_required"));
+}
+
+TEST(DisplayListObservation, recordedMeshDoesNotRequireGpuContext) {
+    using Attribute = SkMeshSpecification::Attribute;
+    const Attribute attrs[] = {{Attribute::Type::kFloat2, 0, SkString("pos")}};
+    auto spec = SkMeshSpecification::Make(attrs, sizeof(SkPoint), {},
+            SkString("Varyings main(const Attributes a) { Varyings v; v.position = a.pos; return v; }"),
+            SkString("float2 main(const Varyings v) { return v.position; }"));
+    ASSERT_TRUE(spec.specification) << spec.error.c_str();
+    const SkPoint points[] = {{1, 1}, {20, 1}, {1, 20}};
+    auto buffer = SkMeshes::MakeVertexBuffer(nullptr, points, sizeof(points));
+    auto result = SkMesh::Make(spec.specification, SkMesh::Mode::kTriangles, buffer, 3, 0,
+                              nullptr, {}, SkRect::MakeLTRB(1, 1, 20, 20));
+    ASSERT_TRUE(result.mesh.isValid()) << result.error.c_str();
+    auto node = TestUtils::createSkiaNode(0, 0, 100, 100,
+            [](RenderProperties&, SkiaRecordingCanvas& recorder) {
+                recorder.drawRect(0, 0, 5, 5, Paint());
+            });
+    RecordingCanvas recorder;
+    node->getDisplayList().asSkiaDl()->attachRecorder(&recorder, SkIRect::MakeWH(100, 100));
+    static_cast<SkCanvas&>(recorder).drawMesh(result.mesh, nullptr, SkPaint());
+    std::vector<uint8_t> bytes(sizeof(points));
+    memcpy(bytes.data(), points, sizeof(points));
+    Mesh hwMesh(spec.specification, SkMesh::Mode::kTriangles, std::move(bytes), 3, 0,
+                SkRect::MakeLTRB(1, 1, 20, 20));
+    // Do not upload MeshBufferData: observation must also work before buffers exist.
+    recorder.drawMesh(hwMesh, nullptr, SkPaint());
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200);
+    ASSERT_EQ(nullptr, canvas.recordingContext());
+    RenderNodeDrawable(node.get(), &canvas, false).forceDrawForObservation(&canvas);
+    EXPECT_EQ(2u, occurrences(out.str(), "\"contentStatus\":\"mesh_shader_required\""));
+    RecordProperty("export_json", "[" + out.str() + "]");
+}
+
+TEST(DisplayListObservation, recordedWebViewWithComplexClipNeedsNoSurface) {
+    class External : public FunctorDrawable {
+    public:
+        explicit External(SkCanvas* canvas) : FunctorDrawable(0, canvas) {}
+        bool called = false;
+        void onDraw(SkCanvas*) override { called = true; }
+    };
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200);
+    auto functor = sk_make_sp<External>(&canvas);
+    auto node = TestUtils::createSkiaNode(0, 0, 100, 100,
+            [](RenderProperties&, SkiaRecordingCanvas& recorder) {
+                recorder.drawRect(0, 0, 5, 5, Paint());
+            });
+    RecordingCanvas recorder;
+    node->getDisplayList().asSkiaDl()->attachRecorder(&recorder, SkIRect::MakeWH(100, 100));
+    SkRegion clip(SkIRect::MakeWH(100, 100));
+    clip.op(SkIRect::MakeLTRB(20, 20, 40, 40), SkRegion::kDifference_Op);
+    recorder.clipRegion(clip, SkClipOp::kIntersect);
+    recorder.drawWebView(functor.get());
+    RenderNodeDrawable(node.get(), &canvas, false).forceDrawForObservation(&canvas);
+    EXPECT_FALSE(functor->called);
+    EXPECT_NE(std::string::npos, out.str().find("external_pixels_required"));
+    RecordProperty("export_json", "[" + out.str() + "]");
+}
+
+TEST(DisplayListObservation, semanticHashSeesChangedTextInsideCachedLayer) {
+    auto hash = [](SkGlyphID glyph, bool observe) {
+        auto child = TestUtils::createSkiaNode(10, 20, 90, 80,
+                [glyph](RenderProperties& props, SkiaRecordingCanvas& recorder) {
+                    props.mutateLayerProperties().setType(LayerType::RenderLayer);
+                    recordObservationGlyph(&recorder, glyph);
+                });
+        auto parent = TestUtils::createSkiaNode(0, 0, 200, 200,
+                [&](RenderProperties&, SkiaRecordingCanvas& recorder) {
+                    recorder.drawRenderNode(child.get());
+                });
+        auto cached = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(80, 60));
+        child->setLayerSurface(cached);
+        SemanticHashCanvas canvas(200, 200);
+        RenderNodeDrawable drawable(parent.get(), &canvas, false);
+        if (observe) drawable.forceDrawForObservation(&canvas);
+        else drawable.forceDraw(&canvas);
+        child->setLayerSurface(nullptr);
+        return canvas.hash();
+    };
+    EXPECT_EQ(hash(30, false), hash(31, false));
+    EXPECT_NE(hash(30, true), hash(31, true));
+    EXPECT_EQ(hash(30, true), hash(30, true));
+}
+
+TEST(DisplayListObservation, vectorPathsAreExpandedWithViewportTransform) {
+    const char* data = "M1,2 L3,2 L3,4 Z";
+    auto* path = new VectorDrawable::FullPath(data, strlen(data));
+    path->mutateStagingProperties()->setFillColor(SK_ColorRED);
+    auto* group = new VectorDrawable::Group();
+    group->addChild(path);
+    sp<VectorDrawableRoot> vector(new VectorDrawableRoot(group));
+    vector->mutateStagingProperties()->setViewportSize(10, 10);
+    vector->mutateStagingProperties()->setScaledSize(100, 100);
+    vector->mutateStagingProperties()->setBounds(SkRect::MakeXYWH(20, 30, 100, 100));
+    vector->syncProperties();
+    auto node = TestUtils::createSkiaNode(0, 0, 200, 200,
+            [&](RenderProperties&, SkiaRecordingCanvas& recorder) {
+                recorder.drawVectorDrawable(vector.get());
+            });
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 200, 200, 7, 9);
+    RenderNodeDrawable(node.get(), &canvas, false).forceDrawForObservation(&canvas);
+    EXPECT_NE(std::string::npos, out.str().find("hwui.vector.expanded"));
+    EXPECT_NE(std::string::npos, out.str().find("\"bounds\":[37,59,57,79]"));
+    EXPECT_EQ(1u, occurrences(out.str(), "\"op\":\"drawPath\""));
+    EXPECT_EQ(std::string::npos, out.str().find("\"op\":\"drawImage\""));
+    RecordProperty("export_json", "[" + out.str() + "]");
+}
+
+TEST(DisplayListObservation, longAndFlatPathsRetainTheirGeometry) {
+    std::ostringstream out;
+    FlatExportOpsCanvas canvas(out, 500, 500);
+    SkPath path;
+    path.moveTo(1, 1);
+    for (int i = 0; i < 300; ++i) path.lineTo(i, i % 10);
+    canvas.drawPath(path, SkPaint());
+    SkPaint stroke;
+    stroke.setStyle(SkPaint::kStroke_Style);
+    path.reset();
+    path.moveTo(1, 20);
+    path.lineTo(10, 20);
+    canvas.drawPath(path, stroke);
+    EXPECT_EQ(301u, occurrences(out.str(), "\"verb\":\"L\""));
+    EXPECT_EQ(std::string::npos, out.str().find("invalid_bounds"));
+    EXPECT_EQ(std::string::npos, out.str().find("too_complex"));
+    RecordProperty("export_json", "[" + out.str() + "]");
+}
 
 TEST(RenderNodeDrawable, create) {
     auto rootNode =
