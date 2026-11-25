@@ -37,6 +37,7 @@ import android.os.Parcelable;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.text.TextUtils;
 import android.text.style.AccessibilityClickableSpan;
 import android.text.style.ClickableSpan;
 import android.util.LongSparseArray;
@@ -198,7 +199,10 @@ public final class AccessibilityInteractionController {
         message.obj = args;
 
         synchronized (mLock) {
-            mPendingFindNodeByIdMessages.add(message);
+            // A prefetched node cannot witness the parent and slot of a directed read.
+            if (!isCheckpointChildRequest(arguments)) {
+                mPendingFindNodeByIdMessages.add(message);
+            }
             scheduleMessage(message, interrogatingPid, interrogatingTid,
                     CONSIDER_REQUEST_PREPARERS);
         }
@@ -369,6 +373,22 @@ public final class AccessibilityInteractionController {
                 return;
             }
             setAccessibilityFetchFlags(flags);
+            if (isCheckpointChildRequest(arguments)) {
+                try {
+                    if (virtualDescendantId == AccessibilityNodeProvider.HOST_VIEW_ID
+                            && (flags & AccessibilityNodeInfo.FLAG_PREFETCH_MASK) == 0
+                            && interruptPrefetch) {
+                        requestedNode = readCheckpointChild(accessibilityViewId, arguments);
+                    }
+                } catch (RuntimeException exception) {
+                    // App delegates can invalidate their hierarchy while constructing a node.
+                    Slog.w(LOG_TAG, "Checkpoint child could not be read", exception);
+                } finally {
+                    resetAccessibilityFetchFlags();
+                }
+                // The normal finally block applies viewport transforms and delivers the reply.
+                return;
+            }
             requestedView = findViewByAccessibilityId(accessibilityViewId);
             if (requestedView != null && isShown(requestedView)) {
                 requestedNode = populateAccessibilityNodeInfoForView(
@@ -418,6 +438,74 @@ public final class AccessibilityInteractionController {
         if (satisfiedRequest != null) {
             returnFindNodeResult(satisfiedRequest);
         }
+    }
+
+    private static boolean isCheckpointChildRequest(Bundle arguments) {
+        return arguments != null
+                && arguments.containsKey(AccessibilityNodeInfo.EXTRA_CHECKPOINT_PARENT_VIEW_ID);
+    }
+
+    private static boolean publishesCheckpointChild(AccessibilityNodeInfo parent, long parentId,
+            long childId, int windowId, int index, int count) {
+        return parent != null && parent.getSourceNodeId() == parentId
+                && parent.getWindowId() == windowId && parent.getChildCount() == count
+                && parent.getChildId(index) == childId;
+    }
+
+    private AccessibilityNodeInfo readCheckpointChild(int childViewId, Bundle edge) {
+        final int parentViewId = edge.getInt(AccessibilityNodeInfo.EXTRA_CHECKPOINT_PARENT_VIEW_ID,
+                AccessibilityNodeInfo.UNDEFINED_ITEM_ID);
+        final int index = edge.getInt(AccessibilityNodeInfo.EXTRA_CHECKPOINT_CHILD_INDEX, -1);
+        final int count = edge.getInt(AccessibilityNodeInfo.EXTRA_CHECKPOINT_CHILD_COUNT, -1);
+        if (index < 0 || index >= count || parentViewId == childViewId
+                || parentViewId == AccessibilityNodeInfo.UNDEFINED_ITEM_ID) {
+            return null;
+        }
+        final View parent = findViewByAccessibilityId(parentViewId);
+        if (!(parent instanceof ViewGroup) || parent.getViewRootImpl() != mViewRootImpl
+                || parent.getAccessibilityViewId() != parentViewId || !isShown(parent)
+                || !parent.includeForAccessibility() || !isVisibleToAccessibilityService(parent)
+                || parent.getAccessibilityNodeProvider() != null) {
+            return null;
+        }
+        final ViewGroup group = (ViewGroup) parent;
+        final int window = group.getAccessibilityWindowId();
+        final long parentId = AccessibilityNodeInfo.makeNodeId(
+                parentViewId, AccessibilityNodeProvider.HOST_VIEW_ID);
+        final long childId = AccessibilityNodeInfo.makeNodeId(
+                childViewId, AccessibilityNodeProvider.HOST_VIEW_ID);
+        // Native and accessibility order usually agree. A delegate can reorder the public
+        // children or expose a descendant through an unimportant container.
+        View child = index < group.getChildCount() ? group.getChildAt(index) : null;
+        if (child == null || child.getAccessibilityViewId() != childViewId) {
+            if (!publishesCheckpointChild(group.createAccessibilityNodeInfo(), parentId, childId,
+                    window, index, count)) {
+                return null;
+            }
+            child = group.findViewByAccessibilityIdTraversal(childViewId);
+        }
+        if (child == null || child.getViewRootImpl() != mViewRootImpl
+                || child.getParentForAccessibility() != group || !isShown(child)
+                || !child.includeForAccessibility() || !isVisibleToAccessibilityService(child)
+                || child.getAccessibilityNodeProvider() != null) {
+            return null;
+        }
+        final AccessibilityNodeInfo result = child.createAccessibilityNodeInfo();
+        if (result == null || result.getSourceNodeId() != childId || result.getWindowId() != window
+                || result.getParentNodeId() != parentId || result.getPackageName() == null) {
+            return null;
+        }
+        // A node delegate may change the hierarchy while producing the child. Verify the live
+        // public edge on this UI thread before delivering the single node to the caller.
+        final AccessibilityNodeInfo currentParent = group.createAccessibilityNodeInfo();
+        if (!publishesCheckpointChild(currentParent, parentId, childId, window, index, count)
+                || !TextUtils.equals(result.getPackageName(), currentParent.getPackageName())
+                || child.getViewRootImpl() != mViewRootImpl || child.getParentForAccessibility() != group
+                || !isShown(child) || !child.includeForAccessibility()
+                || !isVisibleToAccessibilityService(child) || !isVisibleToAccessibilityService(group)) {
+            return null;
+        }
+        return result;
     }
 
     private AccessibilityNodeInfo populateAccessibilityNodeInfoForView(

@@ -237,6 +237,44 @@ public abstract class ClientTransactionHandler {
             @NonNull MergedConfiguration config, boolean preserveWindow,
             @NonNull ActivityWindowInfo activityWindowInfo);
 
+    /** Checkpoint payload must be merged even when an existing relaunch is reused. */
+    public ActivityClientRecord prepareRelaunchActivity(@NonNull IBinder token,
+            @Nullable List<ResultInfo> pendingResults,
+            @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
+            @NonNull MergedConfiguration config, boolean preserveWindow,
+            @NonNull ActivityWindowInfo activityWindowInfo,
+            @Nullable android.os.Bundle checkpointState,
+            @Nullable android.content.Intent checkpointIntent) {
+        final ActivityClientRecord r = prepareRelaunchActivity(token, pendingResults,
+                pendingNewIntents, configChanges, config, preserveWindow, activityWindowInfo);
+        if (r != null && (checkpointState != null || checkpointIntent != null)) {
+            r.checkpointOverrideState = checkpointState;
+            r.checkpointOverrideIntent = checkpointIntent;
+        }
+        return r;
+    }
+
+    /** @hide Correlated restore context follows the actual merged relaunch. */
+    public ActivityClientRecord prepareRelaunchActivity(@NonNull IBinder token,
+            @Nullable List<ResultInfo> pendingResults,
+            @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
+            @NonNull MergedConfiguration config, boolean preserveWindow,
+            @NonNull ActivityWindowInfo activityWindowInfo,
+            @Nullable android.os.Bundle checkpointState,
+            @Nullable android.content.Intent checkpointIntent,
+            @Nullable android.os.Bundle checkpointContext) {
+        final ActivityClientRecord r = prepareRelaunchActivity(token, pendingResults,
+                pendingNewIntents, configChanges, config, preserveWindow, activityWindowInfo,
+                checkpointState, checkpointIntent);
+        if (r != null && checkpointContext != null) {
+            r.checkpointRestoreContext = new android.os.Bundle(checkpointContext);
+        }
+        return r;
+    }
+
+    /** @hide Called after transaction items have advanced the actual instance. */
+    public void reportCheckpointLifecycle(IBinder token) {}
+
     /**
      * Perform activity relaunch.
      * @param r Activity client record prepared for relaunch.

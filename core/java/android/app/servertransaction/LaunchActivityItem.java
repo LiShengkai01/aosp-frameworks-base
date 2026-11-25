@@ -87,6 +87,13 @@ public class LaunchActivityItem extends ClientTransactionItem {
 
     @Nullable
     private final Bundle mState;
+    private Bundle mCheckpointContext;
+
+    public LaunchActivityItem setCheckpointContext(Bundle context) {
+        mCheckpointContext = context != null ? new Bundle(context) : null;
+        return this;
+    }
+
 
     @Nullable
     private final PersistableBundle mPersistentState;
@@ -219,6 +226,8 @@ public class LaunchActivityItem extends ClientTransactionItem {
                 mPendingResults, mPendingNewIntents, mSceneTransitionInfo, mIsForward,
                 mProfilerInfo, client, mAssistToken, mShareableActivityToken, mLaunchedFromBubble,
                 mTaskFragmentToken, mInitialCallerInfoAccessToken, mActivityWindowInfo);
+        r.checkpointRestoreContext = mCheckpointContext != null
+                ? new Bundle(mCheckpointContext) : null;
         client.handleLaunchActivity(r, pendingActions, mDeviceId, null /* customIntent */);
         Trace.traceEnd(TRACE_TAG_ACTIVITY_MANAGER);
     }
@@ -266,6 +275,7 @@ public class LaunchActivityItem extends ClientTransactionItem {
 
         dest.writeTypedObject(mIntent, flags);
         dest.writeTypedObject(mInfo, flags);
+        dest.writeBundle(mCheckpointContext);
     }
 
     /** Reads from Parcel. */
@@ -297,6 +307,7 @@ public class LaunchActivityItem extends ClientTransactionItem {
         );
         mIntent = in.readTypedObject(Intent.CREATOR);
         mInfo = in.readTypedObject(ActivityInfo.CREATOR);
+        mCheckpointContext = in.readBundle(getClass().getClassLoader());
     }
 
     public static final @NonNull Creator<LaunchActivityItem> CREATOR = new Creator<>() {
@@ -338,7 +349,8 @@ public class LaunchActivityItem extends ClientTransactionItem {
                 && Objects.equals(mTaskFragmentToken, other.mTaskFragmentToken)
                 && Objects.equals(mInitialCallerInfoAccessToken,
                         other.mInitialCallerInfoAccessToken)
-                && Objects.equals(mActivityWindowInfo, other.mActivityWindowInfo);
+                && Objects.equals(mActivityWindowInfo, other.mActivityWindowInfo)
+                && Objects.equals(checkpointContextKey(), other.checkpointContextKey());
     }
 
     @Override
@@ -364,7 +376,13 @@ public class LaunchActivityItem extends ClientTransactionItem {
         result = 31 * result + Objects.hashCode(mTaskFragmentToken);
         result = 31 * result + Objects.hashCode(mInitialCallerInfoAccessToken);
         result = 31 * result + Objects.hashCode(mActivityWindowInfo);
+        result = 31 * result + Objects.hashCode(checkpointContextKey());
         return result;
+    }
+
+    private String checkpointContextKey() {
+        return mCheckpointContext == null ? null
+                : mCheckpointContext.getString("op_id") + "/" + mCheckpointContext.getString("nonce");
     }
 
     private boolean activityInfoEqual(@Nullable ActivityInfo other) {

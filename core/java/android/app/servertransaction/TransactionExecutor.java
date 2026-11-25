@@ -103,6 +103,7 @@ public class TransactionExecutor {
                 executeNonLifecycleItem(transaction, item,
                         shouldExcludeLastLifecycleState(items, i));
             }
+            mTransactionHandler.reportCheckpointLifecycle(item.getActivityToken());
         }
     }
 

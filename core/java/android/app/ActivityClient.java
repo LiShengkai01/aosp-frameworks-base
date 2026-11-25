@@ -113,15 +113,6 @@ public class ActivityClient {
         }
     }
 
-    public void checkpointSaved(IBinder token, Bundle state, Intent intent) {
-        try {
-            getActivityClientController().checkpointSaved(token, state, intent);
-        } catch (RemoteException e) {
-            e.rethrowFromSystemServer();
-        }
-    }
-
-
     /** Reports the activity starts local relaunch. */
     public void activityLocalRelaunch(IBinder token) {
         try {
@@ -745,4 +736,15 @@ public class ActivityClient {
             }
         }
     }
+
+    /** @hide Result of a correlated checkpoint request, not a lifecycle baseline write. */
+    public void checkpointOperationResult(IBinder token, Bundle result, Bundle state,
+            android.content.Intent intent) {
+        try {
+            getActivityClientController().checkpointOperationResult(token, result, state, intent);
+        } catch (RemoteException error) {
+            throw error.rethrowFromSystemServer();
+        }
+    }
+
 }

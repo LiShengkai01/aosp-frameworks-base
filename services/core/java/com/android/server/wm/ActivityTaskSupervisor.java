@@ -109,6 +109,7 @@ import android.app.servertransaction.LaunchActivityItem;
 import android.app.servertransaction.PauseActivityItem;
 import android.app.servertransaction.ResumeActivityItem;
 import android.app.servertransaction.StopActivityItem;
+import android.app.servertransaction.StartActivityItem;
 import android.content.AttributionSource;
 import android.content.ComponentName;
 import android.content.Context;
@@ -867,7 +868,18 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
                         true /* deferResume */);
             }
 
-            if (mKeyguardController.checkKeyguardVisibility(r) && r.allowMoveToFront()) {
+            // A checkpoint may explicitly start an occluded lower record to STOP.
+            // The ordinary launch path below would request visibility even when
+            // andResume=false, changing this into Launch -> Resume -> Pause.
+            // Keep normal handling for visible/transparent/multi-window records.
+            final boolean hiddenCheckpointLaunch = !andResume
+                    && r.mCheckpointRestoreContext != null
+                    && r.mCheckpointRestoreContext.getInt("expected_state", -1)
+                            == ActivityLifecycleItem.ON_STOP
+                    && !r.shouldBeVisible(true /* ignoringKeyguard */)
+                    && !r.isVisibleRequested() && !r.isVisible() && !r.nowVisible;
+            if (!hiddenCheckpointLaunch
+                    && mKeyguardController.checkKeyguardVisibility(r) && r.allowMoveToFront()) {
                 // We only set the visibility to true if the activity is not being launched in
                 // background, and is allowed to be visible based on keyguard state. This avoids
                 // setting this into motion in window manager that is later cancelled due to later
@@ -891,6 +903,7 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
             final IActivityClientController activityClientController =
                     proc.hasEverLaunchedActivity() ? null : mService.mActivityClientController;
             r.launchCount++;
+            r.mCheckpointGeneration++;
 
             if (DEBUG_ALL) Slog.v(TAG, "Launching: " + r);
 
@@ -1023,13 +1036,15 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
         final boolean isTransitionForward = r.isTransitionForward();
         final IBinder fragmentToken = r.getTaskFragment().getFragmentToken();
         final int deviceId = getDeviceIdForDisplayId(r.getDisplayId());
-        final Intent checkpointLaunchIntent = r.getCheckpointLaunchIntent();
+        final ActivityRecord.CheckpointPayload checkpointPayload = r.getCheckpointLaunchPayload();
         final LaunchActivityItem launchActivityItem = new LaunchActivityItem(r.token,
-                checkpointLaunchIntent != null ? Task.copyCheckpointIntent(checkpointLaunchIntent)
+                checkpointPayload != null ? CheckpointController.copyIntent(checkpointPayload.intent)
                         : r.intent, System.identityHashCode(r), r.info,
                 procConfig, overrideConfig, deviceId,
                 r.getFilteredReferrer(r.launchedFromPackage), task.voiceInteractor,
-                proc.getReportedProcState(), r.getSavedState(), r.getPersistentSavedState(),
+                proc.getReportedProcState(),
+                checkpointPayload != null ? checkpointPayload.state : r.getSavedState(),
+                r.getPersistentSavedState(),
                 results, newIntents, r.takeSceneTransitionInfo(), isTransitionForward,
                 proc.createProfilerInfoIfNeeded(), r.assistToken, activityClientController,
                 r.shareableActivityToken, r.getLaunchedFromBubble(), fragmentToken,
@@ -1046,6 +1061,15 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
             lifecycleItem = new StopActivityItem(r.token);
         }
 
+        final boolean hiddenCheckpoint = r.mCheckpointRestoreContext != null
+                && lifecycleItem.getTargetState() == ActivityLifecycleItem.ON_STOP
+                && !r.isVisibleRequested() && !r.isVisible() && !r.nowVisible;
+        if (r.mCheckpointRestoreContext != null) {
+            r.mCheckpointRestoreContext.putInt("expected_state", lifecycleItem.getTargetState());
+            r.mCheckpointRestoreContext.putBoolean("hidden_restore", hiddenCheckpoint);
+            launchActivityItem.setCheckpointContext(r.mCheckpointRestoreContext);
+        }
+
         // Schedule transaction.
         if (shouldDispatchLaunchActivityItemIndependently(r.info.packageName, r.getUid())) {
             // LaunchActivityItem has @UnsupportedAppUsage usages.
@@ -1054,19 +1078,21 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
             // transaction.
             mService.getLifecycleManager().dispatchPendingTransaction(proc.getThread());
         }
-        final boolean isSuccessful = mService.getLifecycleManager().scheduleTransactionItems(
-                proc.getThread(),
-                // Immediately dispatch the transaction, so that if it fails, the server can
-                // restart the process and retry now.
-                true /* shouldDispatchImmediately */,
-                launchActivityItem, lifecycleItem);
+        // A hidden checkpoint cold launch needs the same START -> STOP path
+        // as an attached relaunch, without a transient RESUME or visible Decor.
+        final boolean isSuccessful = hiddenCheckpoint
+                ? mService.getLifecycleManager().scheduleTransactionItems(proc.getThread(),
+                        true /* shouldDispatchImmediately */, launchActivityItem,
+                        new StartActivityItem(r.token, null), lifecycleItem)
+                : mService.getLifecycleManager().scheduleTransactionItems(proc.getThread(),
+                        true /* shouldDispatchImmediately */, launchActivityItem, lifecycleItem);
         if (!isSuccessful) {
             return new DeadObjectException("Failed to dispatch the ClientTransaction to dead"
                     + " process. See earlier log for more details.");
         }
 
         // Keep the payload if dispatch failed so a process-start retry can use it.
-        r.clearCheckpointLaunchIntent();
+        if (r.mCheckpointRestoreContext == null) r.clearCheckpointLaunchIntent();
 
         if (procConfig.seq > mRootWindowContainer.getConfiguration().seq) {
             // If the seq is increased, there should be something changed (e.g. registered

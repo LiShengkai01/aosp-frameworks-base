@@ -173,10 +173,13 @@ class ClientLifecycleManager {
 
     /** Executes the pending transaction for the given client process. */
     void dispatchPendingTransaction(@NonNull IApplicationThread client) {
+        dispatchPendingTransactionWithResult(client);
+    }
+
+    /** A completion fence must not silently discard a failed pending transaction. */
+    boolean dispatchPendingTransactionWithResult(@NonNull IApplicationThread client) {
         final ClientTransaction pendingTransaction = mPendingTransactions.remove(client.asBinder());
-        if (pendingTransaction != null) {
-            scheduleTransaction(pendingTransaction);
-        }
+        return pendingTransaction == null || scheduleTransaction(pendingTransaction);
     }
 
     /**

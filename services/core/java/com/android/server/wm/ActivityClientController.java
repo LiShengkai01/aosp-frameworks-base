@@ -1903,22 +1903,18 @@ class ActivityClientController extends IActivityClientController.Stub {
     }
 
     @Override
-    public void checkpointSaved(IBinder token, Bundle state, Intent intent) {
-        final long origId = Binder.clearCallingIdentity();
+    public void checkpointOperationResult(IBinder token, Bundle result, Bundle state, Intent intent) {
+        final int callingUid = Binder.getCallingUid();
+        final int callingPid = Binder.getCallingPid();
+        final long identity = Binder.clearCallingIdentity();
         try {
             synchronized (mGlobalLock) {
-                final ActivityRecord r = ActivityRecord.isInAnyTask(token);
-                if (r != null) {
-                    r.addCheckpoint(state);
-                    r.setCheckpointIntent(intent);
-                    final Task task = r.getTask();
-                    if (task != null) {
-                        task.onActivityCheckpointSaved();
-                    }
-                }
+                mService.checkpointController().onResult(token, result, state, intent,
+                        callingUid, callingPid);
             }
         } finally {
-            Binder.restoreCallingIdentity(origId);
+            Binder.restoreCallingIdentity(identity);
         }
     }
+
 }

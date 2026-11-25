@@ -6976,14 +6976,6 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
                 boolean dumpAll, boolean dumpClient, String dumpPackage, int displayIdFilter) {
             synchronized (mGlobalLock) {
                 if (DUMP_ACTIVITIES_CMD.equals(cmd) || DUMP_ACTIVITIES_SHORT_CMD.equals(cmd)) {
-                    for (String arg : args) {
-                        if ("--checkpoint-sizes".equals(arg)) {
-                            mRootWindowContainer.forAllTasks(task -> {
-                                if (task.getDisplayId() == 0) task.dumpCheckpointSizes(pw);
-                            });
-                            return;
-                        }
-                    }
                     dumpActivitiesLocked(fd, pw, args, opti, dumpAll, dumpClient, dumpPackage,
                             displayIdFilter);
                 } else if (DUMP_LASTANR_CMD.equals(cmd)) {
@@ -7728,145 +7720,32 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
         return displayId != 0; // TEMP: all non-primary displays are agent displays
     }
 
-    // --- Agent Checkpoint APIs ---
+
+
+
+    private CheckpointController mCheckpointController;
+    CheckpointController checkpointController() {
+        if (mCheckpointController == null) mCheckpointController = new CheckpointController(this);
+        return mCheckpointController;
+    }
+
     @Override
-    public String saveCheckpointOnDisplay(int displayId) {
-        synchronized (mGlobalLock) {
-        Slog.i("CHECKPOINT_PERF", "SAVE_ENTRY_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
-            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
-            if (dc == null) return "Error: display " + displayId + " not found";
-            final Task topTask = dc.getTopRootTask();
-            if (topTask == null) return "Error: no task on display " + displayId;
-            final int[] count = {0};
-            topTask.forAllActivities(r -> {
-                if (r.attachedToProcess()) {
-                    try {
-                        r.app.getThread().scheduleCheckpointSave(r.token);
-                        count[0]++;
-                    } catch (RemoteException e) {
-                        Slog.w(TAG, "checkpoint save failed: " + e);
-                    }
-                }
-            });
-            topTask.startCheckpointSave(count[0]);
-            mH.postDelayed(() -> {
-                synchronized (mGlobalLock) {
-                    if (topTask.getCheckpointSaveStatus() != 0) {
-                        topTask.saveTaskCheckpoint();
-                        topTask.onTaskCheckpointSaved();
-                    }
-                }
-            }, 2000);
-            Slog.i("CHECKPOINT_PERF", "SAVE_ASYNC_RETURN_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
-            return "Checkpoint save scheduled for " + count[0] + " activities (event-driven, fallback 2s)";
+    public String checkpointCommand(Bundle request) {
+        final long entryNs = android.os.SystemClock.elapsedRealtimeNanos();
+        CheckpointController.enforceCaller();
+        final int uid = Binder.getCallingUid();
+        if (request == null) throw new IllegalArgumentException("Checkpoint request required");
+        final Bundle copy = new Bundle(request);
+        final CheckpointController controller;
+        synchronized (mGlobalLock) { controller = checkpointController(); }
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            if ("inspect".equals(copy.getString("command"))) return controller.inspect(copy, uid);
+            if ("await".equals(copy.getString("command"))) return controller.awaitCompletion(copy, uid, entryNs);
+            synchronized (mGlobalLock) { return controller.command(copy, uid, entryNs); }
+        } finally {
+            Binder.restoreCallingIdentity(identity);
         }
     }
-    @Override
-    public int getCheckpointCountOnDisplay(int displayId) {
-        synchronized (mGlobalLock) {
-            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
-            if (dc == null) return 0;
-            final Task topTask = dc.getTopRootTask();
-            if (topTask == null) return 0;
-            return topTask.getTaskCheckpoints().size();
-        }
-    }
-    @Override
-    public String restoreCheckpointOnDisplay(int displayId, int index) {
-        synchronized (mGlobalLock) {
-        Slog.i("CHECKPOINT_PERF", "RESTORE_ENTRY_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
-            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
-            if (dc == null) return "Error: display not found";
-            final Task topTask = dc.getTopRootTask();
-            if (topTask == null) return "Error: no task";
-            final java.util.ArrayList<Task.TaskCheckpoint> cps = topTask.getTaskCheckpoints();
-            if (index < 0 || index >= cps.size()) return "Error: invalid index";
-            final Task.TaskCheckpoint cp = cps.get(index);
-            final int targetCount = cp.components.size();
-            final java.util.ArrayList<ActivityRecord> acts = new java.util.ArrayList<>();
-            topTask.forAllActivities((java.util.function.Consumer<ActivityRecord>) r -> acts.add(r), false);
-            // Reject incompatible explicit-task launches before finishing any record.
-            for (int i = 0; i < targetCount; i++) {
-                if (i < acts.size() && cp.components.get(i).equals(acts.get(i).mActivityComponent)) {
-                    continue;
-                }
-                final int mode = cp.launchModes.get(i);
-                if (mode == android.content.pm.ActivityInfo.LAUNCH_SINGLE_TASK
-                        || mode == android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE) {
-                    final Intent baseIntent = topTask.getBaseIntent();
-                    if (i != 0 || baseIntent == null || !java.util.Objects.equals(
-                            baseIntent.getComponent(), cp.launchIntents.get(i).getComponent())) {
-                        return "Error: incompatible checkpoint task identity at index " + i;
-                    }
-                }
-            }
-            while (acts.size() > targetCount) {
-                acts.remove(acts.size() - 1).finishIfPossible("checkpoint_trim", false);
-            }
-            int rebuildFrom = -1;
-            final java.util.ArrayList<ActivityRecord> rem = new java.util.ArrayList<>();
-            topTask.forAllActivities((java.util.function.Consumer<ActivityRecord>) r -> rem.add(r), false);
-            for (int i = 0; i < Math.min(rem.size(), targetCount); i++) {
-                ActivityRecord r = rem.get(i);
-                Intent cpIntent = cp.intents.get(i);
-                // Activity.getIntent() may legitimately change action, data or alias.
-                // Match resolved identity at this stack position, not routing payload.
-                if (cp.components.get(i).equals(r.mActivityComponent)) {
-                    Bundle cpState = cp.states.get(i);
-                    // Keep the selected state as the post-resume/process-death baseline.
-                    r.addCheckpoint(cpState != null ? new Bundle(cpState) : null);
-                    r.setCheckpointIntent(cpIntent);
-                    // Preserve server launch identity. A later process launch must
-                    // receive the same runtime payload as an in-process relaunch.
-                    r.setCheckpointLaunchIntent(cpIntent);
-                    if (r.attachedToProcess()) r.relaunchActivityLocked(true, 0, cpState);
-                } else {
-                    for (int j = rem.size()-1; j >= i; j--) rem.get(j).finishIfPossible("checkpoint_mismatch", false);
-                    rebuildFrom = i; break;
-                }
-            }
-            int rebuilt = 0;
-            int startFrom = rebuildFrom >= 0 ? rebuildFrom : rem.size();
-            for (int i = startFrom; i < targetCount; i++) {
-                final int result = getActivityStartController().obtainStarter(
-                        Task.copyCheckpointIntent(cp.launchIntents.get(i)), "checkpoint_rebuild")
-                    .setInTask(topTask).setCheckpointSavedState(cp.states.get(i))
-                    .setCheckpointSavedIntent(cp.intents.get(i)).execute();
-                // Merely bringing a task forward or delivering an Intent does not
-                // establish that a new Activity consumed the checkpoint Bundle.
-                if (result != ActivityManager.START_SUCCESS) {
-                    Slog.e(TAG, "Checkpoint rebuild failed at " + i + ": " + result);
-                    Slog.i("CHECKPOINT_PERF", "RESTORE_FAILED_ts="
-                            + android.os.SystemClock.elapsedRealtimeNanos());
-                    return "Error: checkpoint rebuild failed at index " + i
-                            + " (result=" + result + ", rebuilt=" + rebuilt + ")";
-                }
-                rebuilt++;
-            }
-            topTask.trimTaskCheckpointsAfter(index);
-            Slog.i("CHECKPOINT_PERF", "RESTORE_DONE_ts=" + android.os.SystemClock.elapsedRealtimeNanos());
-            return "Restored checkpoint " + index + " (target=" + targetCount + ", had=" + acts.size() + ", rebuilt=" + rebuilt + ")";
-        }
-    }
-    @Override
-    public void clearCheckpointsOnDisplay(int displayId) {
-        synchronized (mGlobalLock) {
-            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
-            if (dc == null) return;
-            final Task t = dc.getTopRootTask();
-            if (t != null) t.clearTaskCheckpoints();
-        }
-    }
-    @Override
-    public int getCheckpointSaveStatusOnDisplay(int displayId) {
-        synchronized (mGlobalLock) {
-            final DisplayContent dc = mRootWindowContainer.getDisplayContent(displayId);
-            if (dc == null) return 0;
-            final Task t = dc.getTopRootTask();
-            if (t == null) return 0;
-            return t.getCheckpointSaveStatus();
-        }
-    }
-    // --- End Agent Checkpoint APIs ---
 
 }

@@ -958,6 +958,16 @@ public class AccessibilityNodeInfo implements Parcelable {
     public static final String EXTRA_DATA_REQUESTED_KEY =
             "android.view.accessibility.AccessibilityNodeInfo.extra_data_requested";
 
+    /** @hide Native parent view ID of a checkpoint child read. */
+    public static final String EXTRA_CHECKPOINT_PARENT_VIEW_ID =
+            "android.view.accessibility.extra.CHECKPOINT_PARENT_VIEW_ID";
+    /** @hide Child's index in the parent's published node. */
+    public static final String EXTRA_CHECKPOINT_CHILD_INDEX =
+            "android.view.accessibility.extra.CHECKPOINT_CHILD_INDEX";
+    /** @hide Child count in that same snapshot. */
+    public static final String EXTRA_CHECKPOINT_CHILD_COUNT =
+            "android.view.accessibility.extra.CHECKPOINT_CHILD_COUNT";
+
     // Tri-state checked states.
 
     /** @hide */
@@ -1466,6 +1476,74 @@ public class AccessibilityNodeInfo implements Parcelable {
 
         return client.findAccessibilityNodeInfoByAccessibilityId(mConnectionId, mWindowId,
                 childId, false, prefetchingStrategy, null);
+    }
+
+    /**
+     * Re-read a single native child declared by this snapshot after the ordinary lookup missed.
+     * The window must still expose the same parent, child ID, slot and child count.
+     * @hide
+     */
+    @Nullable
+    public AccessibilityNodeInfo getChildForCheckpoint(int index) {
+        enforceSealed();
+        if (index < 0 || index >= getChildCount()
+                || !canPerformRequestOverConnection(mConnectionId, mWindowId, mSourceNodeId)
+                || getVirtualDescendantId(mSourceNodeId) != AccessibilityNodeProvider.HOST_VIEW_ID) {
+            return null;
+        }
+        final long childId = getChildId(index);
+        if (childId == LEASHED_NODE_ID || childId == mSourceNodeId
+                || getVirtualDescendantId(childId) != AccessibilityNodeProvider.HOST_VIEW_ID) {
+            return null;
+        }
+        final Bundle edge = new Bundle(3);
+        edge.putInt(EXTRA_CHECKPOINT_PARENT_VIEW_ID, getAccessibilityViewId(mSourceNodeId));
+        edge.putInt(EXTRA_CHECKPOINT_CHILD_INDEX, index);
+        edge.putInt(EXTRA_CHECKPOINT_CHILD_COUNT, getChildCount());
+        final AccessibilityNodeInfo child = AccessibilityInteractionClient.getInstance()
+                .findAccessibilityNodeInfoByAccessibilityId(mConnectionId, mWindowId, childId,
+                        true /* bypassCache */, 0 /* prefetchFlags */, edge);
+        if (child == null || child.getSourceNodeId() != childId
+                || child.getParentNodeId() != mSourceNodeId || child.getWindowId() != mWindowId
+                || mPackageName == null || !TextUtils.equals(mPackageName, child.getPackageName())) {
+            return null;
+        }
+        return child;
+    }
+
+    /**
+     * Refresh the current node before a checkpoint action, including an unregistered native
+     * child that its original parent still exposes. No node is added to the ID registry.
+     * @hide
+     */
+    public boolean refreshForCheckpoint() {
+        final long source = mSourceNodeId;
+        final long originalParent = mParentNodeId;
+        final int window = mWindowId;
+        if (refresh()) {
+            return mSourceNodeId == source && mParentNodeId == originalParent && mWindowId == window;
+        }
+        if (mParentNodeId == UNDEFINED_NODE_ID || mParentNodeId == LEASHED_NODE_ID
+                || getVirtualDescendantId(mSourceNodeId) != AccessibilityNodeProvider.HOST_VIEW_ID
+                || getVirtualDescendantId(mParentNodeId) != AccessibilityNodeProvider.HOST_VIEW_ID
+                || !canPerformRequestOverConnection(mConnectionId, mWindowId, mParentNodeId)) {
+            return false;
+        }
+        final AccessibilityNodeInfo parent = AccessibilityInteractionClient.getInstance()
+                .findAccessibilityNodeInfoByAccessibilityId(mConnectionId, mWindowId, mParentNodeId,
+                        true /* bypassCache */, 0 /* prefetchFlags */, null);
+        if (parent == null || parent.mSourceNodeId != mParentNodeId || parent.mWindowId != mWindowId
+                || mPackageName == null || !TextUtils.equals(mPackageName, parent.mPackageName)
+                || parent.mChildNodeIds == null) {
+            return false;
+        }
+        final int index = parent.mChildNodeIds.indexOf(mSourceNodeId);
+        final AccessibilityNodeInfo current = parent.getChildForCheckpoint(index);
+        if (current == null) {
+            return false;
+        }
+        init(current);
+        return true;
     }
 
     /**

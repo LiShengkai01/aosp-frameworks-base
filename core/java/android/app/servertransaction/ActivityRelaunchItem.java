@@ -64,6 +64,12 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
     private final boolean mPreserveWindow;
     private final android.os.Bundle mOverrideState;
     private final android.content.Intent mCheckpointIntent;
+    private android.os.Bundle mCheckpointContext;
+
+    public ActivityRelaunchItem setCheckpointContext(android.os.Bundle context) {
+        mCheckpointContext = context != null ? new android.os.Bundle(context) : null;
+        return this;
+    }
 
     /**
      * A record that was properly configured for relaunch. Execution will be cancelled if not
@@ -108,12 +114,8 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
             CompatibilityInfo.applyOverrideIfNeeded(mConfig);
         }
         mActivityClientRecord = client.prepareRelaunchActivity(getActivityToken(), mPendingResults,
-                mPendingNewIntents, mConfigChanges, mConfig, mPreserveWindow, mActivityWindowInfo);
-        if ((mOverrideState != null || mCheckpointIntent != null)
-                && mActivityClientRecord != null) {
-            mActivityClientRecord.checkpointOverrideState = mOverrideState;
-            mActivityClientRecord.checkpointOverrideIntent = mCheckpointIntent;
-        }
+                mPendingNewIntents, mConfigChanges, mConfig, mPreserveWindow, mActivityWindowInfo,
+                mOverrideState, mCheckpointIntent, mCheckpointContext);
     }
 
     @Override
@@ -149,6 +151,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         dest.writeBoolean(mPreserveWindow);
         dest.writeBundle(mOverrideState);
         dest.writeTypedObject(mCheckpointIntent, flags);
+        dest.writeBundle(mCheckpointContext);
     }
 
     /** Reads from Parcel. */
@@ -162,6 +165,7 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         mPreserveWindow = in.readBoolean();
         mOverrideState = in.readBundle(getClass().getClassLoader());
         mCheckpointIntent = in.readTypedObject(android.content.Intent.CREATOR);
+        mCheckpointContext = in.readBundle(getClass().getClassLoader());
     }
 
     public static final @NonNull Creator<ActivityRelaunchItem> CREATOR =
@@ -189,7 +193,8 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
                 && Objects.equals(mConfig, other.mConfig)
                 && Objects.equals(mActivityWindowInfo, other.mActivityWindowInfo)
                 && mConfigChanges == other.mConfigChanges
-                && mPreserveWindow == other.mPreserveWindow;
+                && mPreserveWindow == other.mPreserveWindow
+                && java.util.Objects.equals(checkpointContextKey(), other.checkpointContextKey());
     }
 
     @Override
@@ -202,7 +207,13 @@ public class ActivityRelaunchItem extends ActivityTransactionItem {
         result = 31 * result + Objects.hashCode(mActivityWindowInfo);
         result = 31 * result + mConfigChanges;
         result = 31 * result + (mPreserveWindow ? 1 : 0);
+        result = 31 * result + java.util.Objects.hashCode(checkpointContextKey());
         return result;
+    }
+
+    private String checkpointContextKey() {
+        return mCheckpointContext == null ? null
+                : mCheckpointContext.getString("op_id") + "/" + mCheckpointContext.getString("nonce");
     }
 
     @Override

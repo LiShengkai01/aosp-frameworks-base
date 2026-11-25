@@ -419,10 +419,7 @@ interface IActivityTaskManager {
     * @hide
     */
     void moveRootTaskToDisplayOnTopOrBottom(int taskId, int displayId, boolean onTop);
-    String saveCheckpointOnDisplay(int displayId);
-    String restoreCheckpointOnDisplay(int displayId, int index);
-    int getCheckpointCountOnDisplay(int displayId);
-    void clearCheckpointsOnDisplay(int displayId);
-    int getCheckpointSaveStatusOnDisplay(int displayId);
+
+    String checkpointCommand(in Bundle request);
 
 }

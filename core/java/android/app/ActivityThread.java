@@ -657,6 +657,12 @@ public final class ActivityThread extends ClientTransactionHandler
         List<ReferrerIntent> pendingIntents;
 
         boolean startsNotResumed;
+        public Bundle checkpointRestoreContext;
+        public boolean checkpointPayloadApplied;
+        // A checkpoint can relaunch a visible lower Activity directly to STARTED.
+        // Its window must be initialized even when no resume callback is requested.
+        boolean checkpointWindowPending;
+        public long checkpointInstanceId;
         public Bundle checkpointOverrideState;
         public Intent checkpointOverrideIntent;
         public final boolean isForward;
@@ -2266,8 +2272,9 @@ public final class ActivityThread extends ClientTransactionHandler
         }
 
         @Override
-        public void scheduleCheckpointSave(IBinder activityToken) {
-            sendMessage(H.SAVE_CHECKPOINT, activityToken);
+        public void scheduleCheckpointCapture(IBinder activityToken, Bundle context) {
+            final Bundle request = new Bundle(context);
+            mH.post(() -> handleCheckpointCapture(activityToken, request));
         }
 
         public void instrumentWithoutRestart(ComponentName instrumentationName,
@@ -2484,7 +2491,7 @@ public final class ActivityThread extends ClientTransactionHandler
         public static final int PING = 168;
 
         public static final int INSTRUMENT_WITHOUT_RESTART = 170;
-        public static final int SAVE_CHECKPOINT = 180;
+
         public static final int FINISH_INSTRUMENTATION_WITHOUT_RESTART = 171;
 
         public static final int TIMEOUT_SERVICE_FOR_TYPE = 172;
@@ -2863,9 +2870,7 @@ public final class ActivityThread extends ClientTransactionHandler
                 case FINISH_INSTRUMENTATION_WITHOUT_RESTART:
                     handleFinishInstrumentationWithoutRestart();
                     break;
-                case SAVE_CHECKPOINT:
-                    handleSaveCheckpoint((IBinder) msg.obj);
-                    break;
+
             }
             long messageElapsedTimeMs = SystemClock.uptimeMillis() - messageStartUptimeMs;
             Object obj = msg.obj;
@@ -4306,8 +4311,8 @@ public final class ActivityThread extends ClientTransactionHandler
                 // ActivityLifecycleCallbacks#onActivityCreated() or
                 // ActivityLifecycleCallback#onActivityPostCreated().
                 r.activity = activity;
-                logCheckpointState("CREATE", r, r.state, activity.getIntent());
-                if (r.isPersistable()) {
+                r.checkpointInstanceId = ++mCheckpointInstanceCounter;
+                        if (r.isPersistable()) {
                     mInstrumentation.callActivityOnCreate(activity, r.state, r.persistentState);
                 } else {
                     mInstrumentation.callActivityOnCreate(activity, r.state);
@@ -4320,6 +4325,11 @@ public final class ActivityThread extends ClientTransactionHandler
                 r.mLastReportedWindowingMode = config.windowConfiguration.getWindowingMode();
             }
             r.setState(ON_CREATE);
+            if (r.checkpointRestoreContext != null && activity != null) {
+                r.checkpointPayloadApplied = true;
+                final int state = r.checkpointRestoreContext.getInt("expected_state", -1);
+                r.checkpointWindowPending = state == ON_START;
+            }
 
         } catch (SuperNotCalledException e) {
             throw e;
@@ -4338,6 +4348,9 @@ public final class ActivityThread extends ClientTransactionHandler
     public void handleStartActivity(ActivityClientRecord r,
             PendingTransactionActions pendingActions, SceneTransitionInfo sceneTransitionInfo) {
         final Activity activity = r.activity;
+        final boolean hiddenCheckpoint = r.checkpointRestoreContext != null
+                && r.checkpointRestoreContext.getBoolean("hidden_restore")
+                && r.checkpointRestoreContext.getInt("expected_state", -1) == ON_STOP;
         if (!r.stopped) {
             throw new IllegalStateException("Can't start activity that is not stopped.");
         }
@@ -4356,7 +4369,10 @@ public final class ActivityThread extends ClientTransactionHandler
         r.setState(ON_START);
 
         if (pendingActions == null) {
-            // No more work to do.
+            if (r.checkpointWindowPending && !hiddenCheckpoint) {
+                prepareCheckpointWindow(r);
+                updateVisibility(r, true /* show */);
+            }
             return;
         }
 
@@ -4390,7 +4406,12 @@ public final class ActivityThread extends ClientTransactionHandler
             }
         }
 
-        updateVisibility(r, true /* show */);
+        // Starting a lower visible Activity does not pass through handleResumeActivity.
+        // Reuse its normal window setup, without invoking onResume or changing focus.
+        if (!hiddenCheckpoint) {
+            prepareCheckpointWindow(r);
+            updateVisibility(r, true /* show */);
+        }
         mSomeActivitiesChanged = true;
     }
 
@@ -5701,6 +5722,74 @@ public final class ActivityThread extends ClientTransactionHandler
         r.mPendingRemoveWindowManager = null;
     }
 
+    /** Window setup shared by resume and checkpoint-created STARTED instances. */
+    private boolean prepareActivityWindow(ActivityClientRecord r, int forwardBit) {
+        final Activity a = r.activity;
+        // If the window hasn't yet been added to the window manager,
+        // and this guy didn't finish itself or start another activity,
+        // then go ahead and add the window.
+        boolean willBeVisible = !a.mStartedActivity;
+        if (!willBeVisible) {
+            willBeVisible = ActivityClient.getInstance().willActivityBeVisible(
+                    a.getActivityToken());
+        }
+        if (r.window == null && !a.mFinished && willBeVisible) {
+            r.window = r.activity.getWindow();
+            View decor = r.window.getDecorView();
+            decor.setVisibility(View.INVISIBLE);
+            ViewManager wm = a.getWindowManager();
+            WindowManager.LayoutParams l = r.window.getAttributes();
+            a.mDecor = decor;
+            l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
+            l.softInputMode |= forwardBit;
+            if (r.mPreserveWindow) {
+                r.mPreserveWindow = false;
+                // An application's destruction cleanup may have detached the
+                // preserved decor. Only reuse a live ViewRoot; otherwise add
+                // the rebuilt window normally below.
+                ViewRootImpl impl = decor.getViewRootImpl();
+                // A registered root may not have dispatched its first attachment
+                // yet. It is already added; adding it again would be invalid.
+                a.mWindowAdded = impl != null;
+                if (a.mWindowAdded) {
+                    impl.notifyChildRebuilt();
+                }
+            }
+            if (a.mVisibleFromClient) {
+                if (!a.mWindowAdded) {
+                    a.mWindowAdded = true;
+                    wm.addView(decor, l);
+                } else {
+                    // The activity will get a callback for this {@link LayoutParams} change
+                    // earlier. However, at that time the decor will not be set (this is set
+                    // in this method), so no action will be taken. This call ensures the
+                    // callback occurs with the decor set.
+                    a.onWindowAttributesChanged(l);
+                }
+            }
+
+            // If the window has already been added, but during resume
+            // we started another activity, then don't yet make the
+            // window visible.
+        } else if (!willBeVisible) {
+            if (localLOGV) Slog.v(TAG, "Launch " + r + " mStartedActivity set");
+            r.hideForNow = true;
+        }
+
+        // Get rid of anything left hanging around.
+        cleanUpPendingRemoveWindows(r, false /* force */);
+
+        if (r.window != null) r.checkpointWindowPending = false;
+        return willBeVisible;
+    }
+
+    private void prepareCheckpointWindow(ActivityClientRecord r) {
+        if (r.checkpointWindowPending) {
+            prepareActivityWindow(r, r.isForward
+                    ? WindowManager.LayoutParams.SOFT_INPUT_IS_FORWARD_NAVIGATION : 0);
+        }
+    }
+
     @Override
     public void handleResumeActivity(ActivityClientRecord r, boolean finalStateRequest,
             boolean isForward, boolean shouldSendCompatFakeFocus, String reason) {
@@ -5732,58 +5821,7 @@ public final class ActivityThread extends ClientTransactionHandler
         final int forwardBit = isForward
                 ? WindowManager.LayoutParams.SOFT_INPUT_IS_FORWARD_NAVIGATION : 0;
 
-        // If the window hasn't yet been added to the window manager,
-        // and this guy didn't finish itself or start another activity,
-        // then go ahead and add the window.
-        boolean willBeVisible = !a.mStartedActivity;
-        if (!willBeVisible) {
-            willBeVisible = ActivityClient.getInstance().willActivityBeVisible(
-                    a.getActivityToken());
-        }
-        if (r.window == null && !a.mFinished && willBeVisible) {
-            r.window = r.activity.getWindow();
-            View decor = r.window.getDecorView();
-            decor.setVisibility(View.INVISIBLE);
-            ViewManager wm = a.getWindowManager();
-            WindowManager.LayoutParams l = r.window.getAttributes();
-            a.mDecor = decor;
-            l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
-            l.softInputMode |= forwardBit;
-            if (r.mPreserveWindow) {
-                a.mWindowAdded = true;
-                r.mPreserveWindow = false;
-                // Normally the ViewRoot sets up callbacks with the Activity
-                // in addView->ViewRootImpl#setView. If we are instead reusing
-                // the decor view we have to notify the view root that the
-                // callbacks may have changed.
-                ViewRootImpl impl = decor.getViewRootImpl();
-                if (impl != null) {
-                    impl.notifyChildRebuilt();
-                }
-            }
-            if (a.mVisibleFromClient) {
-                if (!a.mWindowAdded) {
-                    a.mWindowAdded = true;
-                    wm.addView(decor, l);
-                } else {
-                    // The activity will get a callback for this {@link LayoutParams} change
-                    // earlier. However, at that time the decor will not be set (this is set
-                    // in this method), so no action will be taken. This call ensures the
-                    // callback occurs with the decor set.
-                    a.onWindowAttributesChanged(l);
-                }
-            }
-
-            // If the window has already been added, but during resume
-            // we started another activity, then don't yet make the
-            // window visible.
-        } else if (!willBeVisible) {
-            if (localLOGV) Slog.v(TAG, "Launch " + r + " mStartedActivity set");
-            r.hideForNow = true;
-        }
-
-        // Get rid of anything left hanging around.
-        cleanUpPendingRemoveWindows(r, false /* force */);
+        final boolean willBeVisible = prepareActivityWindow(r, forwardBit);
 
         // The window is now visible if it has been added, we are not
         // simply finishing, and we are not starting another activity.
@@ -6434,6 +6472,30 @@ public final class ActivityThread extends ClientTransactionHandler
             @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
             @NonNull MergedConfiguration config, boolean preserveWindow,
             @NonNull ActivityWindowInfo activityWindowInfo) {
+        return prepareRelaunchActivity(token, pendingResults, pendingNewIntents, configChanges,
+                config, preserveWindow, activityWindowInfo, null, null);
+    }
+
+    @Override
+    public ActivityClientRecord prepareRelaunchActivity(@NonNull IBinder token,
+            @Nullable List<ResultInfo> pendingResults,
+            @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
+            @NonNull MergedConfiguration config, boolean preserveWindow,
+            @NonNull ActivityWindowInfo activityWindowInfo,
+            @Nullable Bundle checkpointState, @Nullable Intent checkpointIntent) {
+        return prepareRelaunchActivity(token, pendingResults, pendingNewIntents, configChanges,
+                config, preserveWindow, activityWindowInfo, checkpointState, checkpointIntent,
+                null);
+    }
+
+    @Override
+    public ActivityClientRecord prepareRelaunchActivity(@NonNull IBinder token,
+            @Nullable List<ResultInfo> pendingResults,
+            @Nullable List<ReferrerIntent> pendingNewIntents, int configChanges,
+            @NonNull MergedConfiguration config, boolean preserveWindow,
+            @NonNull ActivityWindowInfo activityWindowInfo,
+            @Nullable Bundle checkpointState, @Nullable Intent checkpointIntent,
+            @Nullable Bundle checkpointContext) {
         ActivityClientRecord target = null;
         boolean scheduleRelaunch = false;
 
@@ -6470,6 +6532,24 @@ public final class ActivityThread extends ClientTransactionHandler
                 target.mPreserveWindow = preserveWindow;
                 mRelaunchingActivities.add(target);
                 scheduleRelaunch = true;
+            }
+            if (checkpointContext != null) {
+                if (target.checkpointRestoreContext != null
+                        && !java.util.Objects.equals(
+                                target.checkpointRestoreContext.getString("op_id"),
+                                checkpointContext.getString("op_id"))) {
+                    throw new IllegalStateException("Conflicting checkpoint relaunch");
+                }
+                target.checkpointRestoreContext = new Bundle(checkpointContext);
+                target.checkpointPayloadApplied = false;
+            }
+            // The returned value only controls scheduling. A merged request still
+            // owns the pending record and must receive the historical payload.
+            if (checkpointState != null || checkpointIntent != null) {
+                target.checkpointOverrideState = checkpointState != null
+                        ? new Bundle(checkpointState) : null;
+                target.checkpointOverrideIntent = checkpointIntent != null
+                        ? new Intent(checkpointIntent) : null;
             }
             target.createdConfig = config.getGlobalConfiguration();
             target.overrideConfig = config.getOverrideConfiguration();
@@ -6568,6 +6648,11 @@ public final class ActivityThread extends ClientTransactionHandler
         r.checkpointOverrideState = checkpointState;
         r.checkpointOverrideIntent = tmp.checkpointOverrideIntent;
         tmp.checkpointOverrideIntent = null;
+        if (tmp.checkpointRestoreContext != null) {
+            r.checkpointRestoreContext = tmp.checkpointRestoreContext;
+            r.checkpointPayloadApplied = false;
+            tmp.checkpointRestoreContext = null;
+        }
 
         handleRelaunchActivityInner(r, tmp.pendingResults, tmp.pendingIntents,
                 pendingActions, tmp.startsNotResumed, tmp.overrideConfig, tmp.mActivityWindowInfo,
@@ -9190,59 +9275,67 @@ public final class ActivityThread extends ClientTransactionHandler
     private native void nPurgePendingResources();
     private native void nInitZygoteChildHeapProfiling();
 
-    // Opt-in diagnostics only: never log Bundle values or Intent extras.
-    private void logCheckpointState(String stage, ActivityClientRecord r, Bundle state,
-            Intent intent) {
-        if (!android.os.SystemProperties.getBoolean("debug.checkpoint.state", false)) return;
-        android.os.Parcel parcel = android.os.Parcel.obtain();
-        try {
-            parcel.writeBundle(state);
-            byte[] bytes = parcel.marshall();
-            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes);
-            StringBuilder hash = new StringBuilder();
-            for (byte value : digest) hash.append(String.format("%02x", value & 0xff));
-            android.util.Log.i("CHECKPOINT_STATE", stage + " component="
-                    + r.activity.getComponentName().flattenToShortString()
-                    + " stateNull=" + (state == null) + " bytes=" + bytes.length
-                    + " sha256=" + hash);
-        } catch (Exception exception) {
-            android.util.Log.i("CHECKPOINT_STATE", stage + " component="
-                    + r.activity.getComponentName().flattenToShortString()
-                    + " digestUnavailable=" + exception.getClass().getSimpleName());
-        } finally {
-            parcel.recycle();
+    private long mCheckpointInstanceCounter;
+
+    private void handleCheckpointCapture(IBinder token, Bundle context) {
+        final ActivityClientRecord r = mActivities.get(token);
+        final Bundle result = new Bundle(context);
+        result.putString("kind", "CAPTURE");
+        result.putLong("sample_start_ns", SystemClock.elapsedRealtimeNanos());
+        if (r == null || r.activity == null || r.activity.mFinished) {
+            result.putString("status", "NO_INSTANCE");
+            ActivityClient.getInstance().checkpointOperationResult(token, result, null, null);
+            return;
         }
+        result.putLong("client_instance_id", r.checkpointInstanceId);
+        final boolean resume = r.getLifecycleState() == ON_RESUME;
+        Bundle state = null;
+        Intent runtimeIntent = null;
+        try {
+            try {
+                if (resume) state = performPauseActivity(r, false, "checkpoint-capture-v2", null);
+                if (state == null) {
+                    state = new Bundle();
+                    state.setAllowFds(false);
+                    mInstrumentation.callActivityOnSaveInstanceState(r.activity, state);
+                }
+                runtimeIntent = new Intent(r.activity.getIntent());
+                result.putLong("sample_end_ns", SystemClock.elapsedRealtimeNanos());
+            } finally {
+                if (resume && !r.activity.mFinished) {
+                    performResumeActivity(r, false, "checkpoint-capture-v2");
+                }
+            }
+        } catch (RuntimeException error) {
+            result.putString("status", "CALLBACK_FAILED");
+            result.putLong("completed_ns", SystemClock.elapsedRealtimeNanos());
+            try {
+                ActivityClient.getInstance().checkpointOperationResult(token, result, null, null);
+            } catch (RuntimeException ignored) {}
+            throw error; // Preserve application exception semantics.
+        }
+        result.putString("status", "FRESH");
+        result.putLong("completed_ns", SystemClock.elapsedRealtimeNanos());
+        ActivityClient.getInstance().checkpointOperationResult(token, result, state, runtimeIntent);
     }
 
-    private void handleSaveCheckpoint(IBinder token) {
-        ActivityClientRecord r = mActivities.get(token);
-        if (r == null || r.activity == null || r.activity.mFinished) return;
-        // onSaveInstanceState also marks app/Fragment state as saved. A foreground
-        // activity must receive a normal resume afterwards before navigation can
-        // continue. Pause first so application lifecycle callbacks stay balanced.
-        final boolean resumeAfterSave = r.getLifecycleState() == ON_RESUME;
-        Bundle state = resumeAfterSave
-                ? performPauseActivity(r, false, "checkpoint-save", null) : null;
-        Intent checkpointIntent = null;
-        try {
-            // Pre-Honeycomb pause already saved state. Other activities need a
-            // fresh Bundle; never mutate a previously retained checkpoint.
-            if (state == null) {
-                state = new Bundle();
-                state.setAllowFds(false);
-                mInstrumentation.callActivityOnSaveInstanceState(r.activity, state);
-            }
-            checkpointIntent = new Intent(r.activity.getIntent());
-            logCheckpointState("SAVE", r, state, checkpointIntent);
-        } finally {
-            if (resumeAfterSave && !r.activity.mFinished) {
-                performResumeActivity(r, false, "checkpoint-save");
-            }
-        }
-        try {
-            ActivityClient.getInstance().checkpointSaved(token, state, checkpointIntent);
-        } catch (Exception e) {
-            android.util.Log.w(TAG, "checkpoint save failed", e);
-        }
+    @Override
+    public void reportCheckpointLifecycle(IBinder token) {
+        if (token == null) return;
+        final ActivityClientRecord r = mActivities.get(token);
+        if (r == null || r.activity == null || r.activity.mFinished
+                || r.checkpointRestoreContext == null || !r.checkpointPayloadApplied) return;
+        final int expected = r.checkpointRestoreContext.getInt("expected_state", -1);
+        if (r.getLifecycleState() != expected) return;
+        final Bundle result = new Bundle(r.checkpointRestoreContext);
+        result.putString("kind", "RESTORE");
+        result.putString("status", "LIFECYCLE_COMPLETE");
+        result.putInt("actual_state", r.getLifecycleState());
+        result.putLong("client_instance_id", r.checkpointInstanceId);
+        result.putLong("completed_ns", SystemClock.elapsedRealtimeNanos());
+        ActivityClient.getInstance().checkpointOperationResult(token, result, null, null);
+        r.checkpointRestoreContext = null;
+        r.checkpointPayloadApplied = false;
     }
+
 }

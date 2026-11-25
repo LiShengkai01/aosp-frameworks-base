@@ -299,6 +299,7 @@ class ActivityStarter {
     private int mLastStartActivityResult;
     private Bundle mCheckpointSavedState;
     private Intent mCheckpointSavedIntent;
+    private Bundle mCheckpointRestoreContext;
     // Time in milli seconds we attempted to start the last activity.
     private long mLastStartActivityTimeMs;
     // The reason we were trying to start the last activity
@@ -746,6 +747,8 @@ class ActivityStarter {
     void set(ActivityStarter starter) {
         mCheckpointSavedState = starter.mCheckpointSavedState;
         mCheckpointSavedIntent = starter.mCheckpointSavedIntent;
+        mCheckpointRestoreContext = starter.mCheckpointRestoreContext != null
+                ? new Bundle(starter.mCheckpointRestoreContext) : null;
         mStartActivity = starter.mStartActivity;
         mIntent = starter.mIntent;
         mCallingUid = starter.mCallingUid;
@@ -1495,17 +1498,22 @@ class ActivityStarter {
                 .setSourceRecord(sourceRecord)
                 .build();
 
-        if (mCheckpointSavedState != null || mCheckpointSavedIntent != null) {
+        if (mCheckpointSavedState != null || mCheckpointSavedIntent != null
+                || mCheckpointRestoreContext != null) {
             // A null Bundle is also a valid checkpoint. Route using the original
             // launch Intent, but deliver the saved runtime Intent to the client.
-            r.addCheckpoint(mCheckpointSavedState != null
-                    ? new Bundle(mCheckpointSavedState) : null);
             final Intent savedIntent = mCheckpointSavedIntent != null
                     ? mCheckpointSavedIntent : r.intent;
-            r.setCheckpointIntent(savedIntent);
-            r.setCheckpointLaunchIntent(savedIntent);
+            if (mCheckpointRestoreContext != null) {
+                r.setCheckpointRestoreBinding(mCheckpointSavedState, savedIntent, mCheckpointRestoreContext);
+                r.mAtmService.checkpointController().onRestoreRecordCreated(r, mCheckpointRestoreContext);
+            } else {
+                r.setCheckpointBaseline(mCheckpointSavedState, savedIntent);
+                r.setCheckpointLaunchIntent(savedIntent);
+            }
             mCheckpointSavedState = null;
             mCheckpointSavedIntent = null;
+            mCheckpointRestoreContext = null;
         }
 
         mLastStartActivityRecord = r;
@@ -2731,6 +2739,7 @@ class ActivityStarter {
             // its state into the next, unrelated start request.
             mCheckpointSavedState = null;
             mCheckpointSavedIntent = null;
+            mCheckpointRestoreContext = null;
             mRequest.reset();
         }
     }
@@ -3835,7 +3844,13 @@ class ActivityStarter {
     }
 
     ActivityStarter setCheckpointSavedIntent(Intent intent) {
-        mCheckpointSavedIntent = Task.copyCheckpointIntent(intent);
+        mCheckpointSavedIntent = CheckpointController.copyIntent(intent);
+        return this;
+    }
+
+
+    ActivityStarter setCheckpointRestoreContext(Bundle context) {
+        mCheckpointRestoreContext = context != null ? new Bundle(context) : null;
         return this;
     }
 

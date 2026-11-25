@@ -509,10 +509,12 @@ final class ActivityRecord extends WindowToken {
     WindowProcessController app;      // if non-null, hosting application
     private State mState;    // current state we are in
     private Bundle mIcicle;
-    private Intent mLatestCheckpointIntent;
-    // A restore-only launch payload; never changes the server's task/alias identity.
-    private Intent mCheckpointLaunchIntent;
-    private Bundle mLatestCheckpointState;         // last saved activity state
+    // State and runtime Intent always belong to one immutable checkpoint version.
+    private CheckpointPayload mCheckpointPayload;
+    private CheckpointPayload mCheckpointLaunchPayload;
+    private long mCheckpointPayloadVersion;
+    long mCheckpointGeneration;
+    Bundle mCheckpointRestoreContext;
     private boolean mHandoffEnabled = false; // if Handoff is enabled for this activity
     private boolean mAllowFullTaskRecreation = false; // if the entire task stack can be recreated
                                                       // during handoff of this activity.
@@ -3952,6 +3954,18 @@ final class ActivityRecord extends WindowToken {
      * otherwise.
      */
     boolean destroyImmediately(String reason) {
+        return (destroyImmediatelyWithResult(reason) & DESTROY_REMOVED_FROM_HISTORY) != 0;
+    }
+
+    private static final int DESTROY_REMOVED_FROM_HISTORY = 1;
+    private static final int DESTROY_CLIENT_DISPATCH_FAILED = 2;
+
+    /** Checkpoint completion also requires the old client's destroy to be delivered. */
+    boolean destroyImmediatelyForCheckpoint(String reason) {
+        return (destroyImmediatelyWithResult(reason) & DESTROY_CLIENT_DISPATCH_FAILED) == 0;
+    }
+
+    private int destroyImmediatelyWithResult(String reason) {
         if (DEBUG_SWITCH || DEBUG_CLEANUP) {
             Slog.v(TAG_SWITCH, "Removing activity from " + reason + ": token=" + this
                     + ", app=" + (hasProcess() ? app.mName : "(null)"));
@@ -3960,13 +3974,14 @@ final class ActivityRecord extends WindowToken {
         if (isState(DESTROYING, DESTROYED)) {
             ProtoLog.v(WM_DEBUG_STATES, "activity %s already destroying, skipping "
                     + "request with reason:%s", this, reason);
-            return false;
+            return 0;
         }
 
         EventLogTags.writeWmDestroyActivity(mUserId, System.identityHashCode(this),
                 task.mTaskId, shortComponentName, reason);
 
         boolean removedFromHistory = false;
+        boolean clientDispatchFailed = false;
 
         cleanUp(false /* cleanServices */, false /* setState */);
         setVisibleRequested(false);
@@ -3991,6 +4006,7 @@ final class ActivityRecord extends WindowToken {
                         client, item);
             }
             if (!isSuccessful) {
+                clientDispatchFailed = true;
                 // We can just ignore exceptions here...  if the process has crashed, our death
                 // notification will clean things up.
                 if (finishing) {
@@ -4031,7 +4047,8 @@ final class ActivityRecord extends WindowToken {
             }
         }
 
-        return removedFromHistory;
+        return (removedFromHistory ? DESTROY_REMOVED_FROM_HISTORY : 0)
+                | (clientDispatchFailed ? DESTROY_CLIENT_DISPATCH_FAILED : 0);
     }
 
     /** Note: call {@link #cleanUp(boolean, boolean)} before this method. */
@@ -4189,6 +4206,7 @@ final class ActivityRecord extends WindowToken {
 
     @VisibleForTesting
     void startRelaunching() {
+        mCheckpointGeneration++;
         if (mPendingRelaunchCount == 0) {
             mRelaunchStartTime = SystemClock.elapsedRealtime();
             if (mVisibleRequested) {
@@ -6151,7 +6169,7 @@ final class ActivityRecord extends WindowToken {
             return;
         }
         r.setCustomizeSplashScreenExitAnimation(handleSplashScreenExit);
-        if (r.getLatestCheckpointState() != null) {
+        if (r.hasCheckpointState()) {
             r.setSavedState(r.getLatestCheckpointState());
         } else {
             r.setSavedState(null /* savedState */);
@@ -9721,70 +9739,108 @@ final class ActivityRecord extends WindowToken {
     }
 
     // --- Agent Checkpoint ---
-    void addCheckpoint(Bundle state) {
-        mLatestCheckpointState = state;
-        setSavedState(state);
-    }
-    int getCheckpointCount() { return mLatestCheckpointState != null ? 1 : 0; }
-    void clearCheckpoints() {
-        mLatestCheckpointState = null;
-        mLatestCheckpointIntent = null;
-        mCheckpointLaunchIntent = null;
-    }
-    void setCheckpointIntent(Intent checkpointIntent) {
-        mLatestCheckpointIntent = checkpointIntent != null
-                ? Task.copyCheckpointIntent(checkpointIntent) : null;
-    }
-    Intent getCheckpointIntent() { return mLatestCheckpointIntent; }
-    void setCheckpointLaunchIntent(Intent savedIntent) {
-        mCheckpointLaunchIntent = savedIntent != null
-                ? Task.copyCheckpointIntent(savedIntent) : null;
-    }
-    Intent getCheckpointLaunchIntent() { return mCheckpointLaunchIntent; }
-    void clearCheckpointLaunchIntent() { mCheckpointLaunchIntent = null; }
-    Bundle getLatestCheckpointState() { return mLatestCheckpointState; }
-
-    void relaunchActivityLocked(boolean preserveWindow, int configFlags, Bundle overrideState) {
-        if (!attachedToProcess()) {
-            Slog.w(TAG, "Agent relaunch: skipping, not attached: " + this);
-            return;
+    static final class CheckpointPayload {
+        final Bundle state;
+        final Intent intent;
+        final long version;
+        CheckpointPayload(Bundle state, Intent intent, long version) {
+            this.state = state != null ? new Bundle(state) : null;
+            this.intent = CheckpointController.copyIntent(intent);
+            this.version = version;
         }
-        if (mAtmService.mTaskSupervisor == null) return;
-        final MergedConfiguration mc = new MergedConfiguration(
-                getProcessGlobalConfiguration(), getMergedOverrideConfiguration());
-        final ClientTransactionItem item = new ActivityRelaunchItem(
-                token, null, null, configFlags, mc, preserveWindow, overrideState,
-                getActivityWindowInfo(), getCheckpointIntent());
-        final ClientTransaction t = new ClientTransaction(app.getThread());
-        t.addTransactionItem(item);
-        // Relaunch ends at ON_CREATE. Restore the lifecycle too, otherwise a
-        // visible activity never resumes and cannot continue the agent task.
+    }
+
+    void setCheckpointBaseline(Bundle state, Intent runtimeIntent) {
+        mCheckpointPayload = new CheckpointPayload(state,
+                runtimeIntent != null ? runtimeIntent : intent, ++mCheckpointPayloadVersion);
+        // A later capture replaces any older restore-only launch override as a unit.
+        mCheckpointLaunchPayload = null;
+        mCheckpointRestoreContext = null;
+        setSavedState(mCheckpointPayload.state);
+    }
+    boolean hasCheckpointState() { return mCheckpointPayload != null; }
+    long getCheckpointPayloadVersion() { return mCheckpointPayloadVersion; }
+    void clearCheckpoints() {
+        mCheckpointPayload = null;
+        mCheckpointLaunchPayload = null;
+        mCheckpointRestoreContext = null;
+    }
+    Intent getCheckpointIntent() {
+        return mCheckpointPayload != null ? mCheckpointPayload.intent : null;
+    }
+    void setCheckpointLaunchIntent(Intent savedIntent) {
+        if (mCheckpointPayload == null) {
+            throw new IllegalStateException("Checkpoint launch requires a versioned state");
+        }
+        mCheckpointLaunchPayload = new CheckpointPayload(mCheckpointPayload.state,
+                savedIntent != null ? savedIntent : mCheckpointPayload.intent,
+                mCheckpointPayload.version);
+    }
+    CheckpointPayload getCheckpointLaunchPayload() {
+        return mCheckpointLaunchPayload != null ? mCheckpointLaunchPayload : mCheckpointPayload;
+    }
+    void clearCheckpointLaunchIntent() { mCheckpointLaunchPayload = null; }
+    Bundle getLatestCheckpointState() {
+        return mCheckpointPayload != null ? mCheckpointPayload.state : null;
+    }
+
+    // --- End Agent Checkpoint ---
+
+
+    void setCheckpointRestoreBinding(Bundle state, Intent runtimeIntent, Bundle context) {
+        mCheckpointLaunchPayload = new CheckpointPayload(state,
+                runtimeIntent != null ? runtimeIntent : intent, ++mCheckpointPayloadVersion);
+        mCheckpointRestoreContext = new Bundle(context);
+    }
+
+    boolean relaunchCheckpointActivityLocked() {
+        if (!attachedToProcess() || mCheckpointRestoreContext == null
+                || mCheckpointLaunchPayload == null) return false;
+        final ClientTransaction transaction = new ClientTransaction(app.getThread());
+        final ClientTransactionItem lifecycle;
+        final int expected;
         switch (mState) {
             case RESUMED:
-                t.addTransactionItem(new ResumeActivityItem(token, isTransitionForward(),
-                        shouldSendCompatFakeFocus()));
+                expected = android.app.servertransaction.ActivityLifecycleItem.ON_RESUME;
+                lifecycle = new ResumeActivityItem(token, isTransitionForward(), shouldSendCompatFakeFocus());
                 break;
             case STARTED:
-                t.addTransactionItem(new StartActivityItem(token, null));
+                expected = android.app.servertransaction.ActivityLifecycleItem.ON_START;
+                lifecycle = new StartActivityItem(token, null);
                 break;
-            case PAUSING:
             case PAUSED:
-                t.addTransactionItem(new PauseActivityItem(token));
+            case PAUSING:
+                expected = android.app.servertransaction.ActivityLifecycleItem.ON_PAUSE;
+                lifecycle = new PauseActivityItem(token);
                 break;
-            case STOPPING:
             case STOPPED:
-                t.addTransactionItem(new StopActivityItem(token));
+            case STOPPING:
+                expected = android.app.servertransaction.ActivityLifecycleItem.ON_STOP;
+                lifecycle = new StopActivityItem(token);
                 break;
-            default:
-                Slog.w(TAG, "Agent relaunch: unsupported lifecycle state: " + mState);
-                return;
+            default: return false;
         }
+        final boolean hiddenCheckpoint = mState == State.STOPPED
+                && !isVisibleRequested() && !isVisible() && !nowVisible;
+        mCheckpointRestoreContext.putInt("expected_state", expected);
+        mCheckpointRestoreContext.putBoolean("hidden_restore", hiddenCheckpoint);
+        final ActivityRelaunchItem item = new ActivityRelaunchItem(token, null, null, 0,
+                new MergedConfiguration(getProcessGlobalConfiguration(), getMergedOverrideConfiguration()),
+                !hiddenCheckpoint, mCheckpointLaunchPayload.state, getActivityWindowInfo(),
+                mCheckpointLaunchPayload.intent).setCheckpointContext(mCheckpointRestoreContext);
+        transaction.addTransactionItem(item);
+        // CREATE -> STOP would otherwise pass through RESUME and PAUSE.
+        if (hiddenCheckpoint) transaction.addTransactionItem(new StartActivityItem(token, null));
+        transaction.addTransactionItem(lifecycle);
         try {
-            mAtmService.getLifecycleManager().scheduleTransaction(t);
-        } catch (Exception e) {
-            Slog.w(TAG, "Failed to relaunch: " + e);
+            if (!mAtmService.getLifecycleManager().scheduleTransaction(transaction)) return false;
+            // Match normal relaunch bookkeeping; finishRelaunching pairs this call.
+            startRelaunching();
+            return true;
+        } catch (Exception error) {
+            Slog.w(TAG, "Checkpoint v2 relaunch dispatch failed", error);
+            return false;
         }
     }
-    // --- End Agent Checkpoint ---
 
 }
