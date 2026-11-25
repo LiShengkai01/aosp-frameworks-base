@@ -112,6 +112,10 @@ void RenderNode::output(std::ostream& output, uint32_t level) {
     output << std::endl;
 }
 
+void RenderNode::exportDisplayList(std::ostream& output, uint32_t level) const {
+    mDisplayList.exportOps(output, level);
+}
+
 void RenderNode::visit(std::function<void(const RenderNode&)> func) const {
     func(*this);
     if (mDisplayList) {
@@ -184,6 +188,16 @@ void RenderNode::prepareLayer(TreeInfo& info, uint32_t dirtyMask) {
 }
 
 void RenderNode::pushLayerUpdate(TreeInfo& info) {
+    if (info.syncOnly) {
+        // Staging state is consumed now; remember to redraw any retained layer
+        // when a later pixel observation resumes the normal pipeline.
+        mLayerUpdateDeferred = true;
+        return;
+    }
+    if (mLayerUpdateDeferred) {
+        damageSelf(info);
+        mLayerUpdateDeferred = false;
+    }
     LayerType layerType = properties().effectiveLayerType();
     // If we are not a layer OR we cannot be rendered (eg, view was detached)
     // we need to destroy any Layers we may have had previously

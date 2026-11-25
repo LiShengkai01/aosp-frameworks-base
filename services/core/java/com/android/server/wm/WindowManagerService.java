@@ -2109,6 +2109,13 @@ public class WindowManagerService extends IWindowManager.Stub
         if (win.mActivityRecord == null || win.mActivityRecord.isClientVisible()) {
             res |= WindowManagerGlobal.ADD_FLAG_APP_VISIBLE;
         }
+        // Read the framework-owned launch origin once, including for child windows.
+        // Return it through the existing add-window response, not a separate query.
+        final ActivityRecord origin = win.getTopParentWindow().mActivityRecord;
+        if (origin != null && origin.getUid() == win.getOwningUid()
+                && origin.mSecondUiOrigin != null) {
+            res |= WindowManagerGlobal.ADD_FLAG_SECOND_UI;
+        }
 
         displayContent.getInputMonitor().setUpdateInputWindowsNeededLw();
 

@@ -16,6 +16,10 @@
 
 package android.view;
 
+import com.android.internal.secondui.SecondUiOwner;
+import com.android.internal.secondui.SecondUiMainScheduler;
+import com.android.internal.secondui.SecondUiUpdateWindow;
+
 import static android.adpf.Flags.adpfViewrootimplActionDownBoost;
 import static android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM;
 import static android.app.WindowConfiguration.WINDOWING_MODE_MULTI_WINDOW;
@@ -350,6 +354,10 @@ public final class ViewRootImpl implements ViewParent,
     private static final boolean DEBUG_TRACKBALL = false || LOCAL_LOGV;
     private static final boolean DEBUG_CONFIGURATION = false || LOCAL_LOGV;
     private static final boolean DEBUG_FPS = false;
+    // Agent on-demand observe diagnostics (settle steps, yields). Off by default;
+    // perfetto trace sections (agentObserve/agentSettlePass/agentRecordPhase2/
+    // agentYieldToForeground) carry the profiling signal regardless of this flag.
+    private static final boolean DEBUG_AGENT = false;
     private static final boolean DEBUG_INPUT_STAGES = false || LOCAL_LOGV;
     private static final boolean DEBUG_KEEP_SCREEN_ON = false || LOCAL_LOGV;
     private static final boolean DEBUG_CONTENT_CAPTURE = false || LOCAL_LOGV;
@@ -724,7 +732,8 @@ public final class ViewRootImpl implements ViewParent,
         // Since Choreographer is a thread-local singleton while we can have multiple
         // ViewRootImpl's, populate the frame information from the current viewRootImpl before
         // starting the draw
-        FrameInfo frameInfo = mChoreographer.mFrameInfo;
+        FrameInfo frameInfo = mAgentTraversalActive
+                ? mAgentTraversalFrameInfo : mChoreographer.mFrameInfo;
         mViewFrameInfo.populateFrameInfo(frameInfo);
         mViewFrameInfo.reset();
         mInputEventAssigner.notifyFrameProcessed();
@@ -772,10 +781,479 @@ public final class ViewRootImpl implements ViewParent,
 
     private final boolean mAtomicTraversalBarrier = atomicTraversalBarrier();
 
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, Integer>
+            sComputerControlRendering = new java.util.concurrent.ConcurrentHashMap<>();
+    private int mComputerControlFlags;
+    private int mComputerControlLayer = -1;
+    private ThreadedRenderer mComputerControlRenderer;
+
+    /**
+     * Shared rate/animation/output controls; does not gate UI callbacks.
+     *
+     * @hide
+     */
+    public void configureComputerControlRendering(boolean enabled, boolean pixels) {
+        checkThread();
+        if (!isComputerControlRenderingTarget()) {
+            throw new IllegalStateException("Agent virtual display required");
+        }
+        // Output allowance is independent of callback scheduling. Managed roots
+        // can enable a pixel observation, then close output again without losing
+        // their pending update callbacks.
+        sComputerControlRendering.put(getDisplayId(), enabled ? (pixels ? 3 : 1) : 0);
+        WindowManagerGlobal.getInstance().refreshComputerControlRendering(getDisplayId());
+    }
+
+    private boolean isComputerControlRenderingTarget() {
+        // Origin is fixed for a root's lifetime, but the root can move displays.
+        return isAgentUi() && getDisplayId() != Display.DEFAULT_DISPLAY
+                && mDisplay.getType() == Display.TYPE_VIRTUAL;
+    }
+
+    private int getComputerControlRenderingFlags() {
+        // Ordinary roots on the VD and agent roots moved to a physical display
+        // retain their normal output and animation policy.
+        return isComputerControlRenderingTarget()
+                ? sComputerControlRendering.getOrDefault(getDisplayId(), 0) : 0;
+    }
+
+    private boolean isSecondUiRendererOutputAllowed() {
+        final int flags = getComputerControlRenderingFlags();
+        return (flags & 1) == 0 || (flags & 2) != 0;
+    }
+
+    void applyComputerControlRendering() {
+        checkThread();
+        final int flags = getComputerControlRenderingFlags();
+        if (flags == 0 && mComputerControlFlags == 0) return;
+        final boolean enabled = (flags & 1) != 0;
+        final boolean output = !mIsHardwareRendererOutputDisabled
+                && isSecondUiRendererOutputAllowed();
+        final int layer = mSurfaceControl.isValid() ? mSurfaceControl.getLayerId() : -1;
+        final ThreadedRenderer renderer = mAttachInfo.mThreadedRenderer;
+        if (flags != mComputerControlFlags || renderer != mComputerControlRenderer) {
+            if (renderer != null) {
+                renderer.setRendererDrawingEnabled(output);
+                if (output) {
+                    renderer.invalidateRoot();
+                    mFullRedrawNeeded = true;
+                    invalidate();
+                }
+            }
+            mComputerControlRenderer = renderer;
+        }
+        if (layer != -1 && (layer != mComputerControlLayer || flags != mComputerControlFlags)) {
+            try (SurfaceControl.Transaction t = new SurfaceControl.Transaction()) {
+                if (enabled) {
+                    t.setFrameRate(mSurfaceControl, 10.0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+                            .setFrameRateSelectionStrategy(mSurfaceControl,
+                                    SurfaceControl.FRAME_RATE_SELECTION_STRATEGY_OVERRIDE_CHILDREN);
+                } else {
+                    t.clearFrameRate(mSurfaceControl).setFrameRateSelectionStrategy(mSurfaceControl,
+                            SurfaceControl.FRAME_RATE_SELECTION_STRATEGY_PROPAGATE);
+                }
+                t.apply();
+            }
+            mComputerControlLayer = layer;
+        }
+        final boolean animationChange = ((flags ^ mComputerControlFlags) & 1) != 0;
+        mComputerControlFlags = flags;
+        if (animationChange) WindowManagerGlobal.getInstance()
+                .onAnimationDisableRequestChangedForViewRoot();
+    }
+
     boolean mWillDrawSoon;
     /** Set to true while in performTraversals for detecting when die(true) is called from internal
      * callbacks such as onMeasure, onPreDraw, onDraw and deferring doDie() until later. */
     boolean mIsInTraversal;
+    // Agent forced-traversal no-draw mode: record DisplayList + sync staging->active,
+    // but skip GPU draw (zero GPU/SF). Set only on the UI thread for the duration of
+    // a forceTraversalForAgent() call.
+    boolean mAgentNoDraw;
+    // A slack traversal is outside a physical Choreographer frame. Keep its clock
+    // and renderer metadata local so nested foreground frames cannot overwrite them.
+    private boolean mAgentTraversalActive;
+    private boolean mAgentTraversalCheckpointEnabled;
+    private final FrameInfo mAgentTraversalFrameInfo = new FrameInfo();
+    private long mAgentPixelDrawAttempts;
+    private long mAgentSyncOnlyDraws;
+    // Agent PERSISTENT no-draw (GPU bypass): when true, EVERY performDraw() on this
+    // window skips the GPU draw -- not only the on-demand observe frame (mAgentNoDraw),
+    // but also the app's own real-VSYNC-driven traversals while the window is unfrozen
+    // and active. This is the "unfreeze period has traversal but all GPU is bypassed"
+    // mode: the view tree still measures/layouts/records its DisplayList (so on-demand
+    // DL perception stays correct and the app's state machine advances on input), but
+    // the RenderThread never rasterizes a frame for this window (zero GPU / zero SF
+    // buffer queued). Independent of freeze. Gated to agent UIs only.
+    //
+    // AUTO follows the agent display's settings, including new Activities/dialogs.
+    // Other agent displays and physical windows retain their own settings.
+    // Bypass starts disabled; screenshot configurations must explicitly retain pixels.
+    static final int AGENT_NODRAW_AUTO = 0;
+    static final int AGENT_NODRAW_ON = 1;
+    static final int AGENT_NODRAW_OFF = -1;
+    int mAgentPersistentNoDrawOverride = AGENT_NODRAW_AUTO;
+    // Immutable settings are published per display. Each root applies a change on
+    // its own UI thread; navigation on that display inherits the latest settings.
+    private static final class AgentRenderingConfig {
+        // Preserve the existing agent decouple default; G1 explicitly disables it.
+        static final AgentRenderingConfig DEFAULT = new AgentRenderingConfig(true, false);
+        final boolean decouple;
+        final boolean noDraw;
+        AgentRenderingConfig(boolean decouple, boolean noDraw) {
+            this.decouple = decouple;
+            this.noDraw = noDraw;
+        }
+    }
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, AgentRenderingConfig>
+            sAgentRenderingConfigs = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile AgentRenderingConfig mAgentRenderingConfig = AgentRenderingConfig.DEFAULT;
+    // Retain the legacy first-frame/input-geometry bootstrap. The pure DL path
+    // can already record a new root without pixels; this guard is not a DL limit.
+    boolean mAgentHasDrawnOnce;
+    // Agent freeze: when true this window stops scheduling its own traversal/draw on
+    // real VSYNC (app self-rendering for this window halts, zero GPU). The agent still
+    // updates the DisplayList on demand via forceTraversalForAgent(), whose traversals run
+    // through the agent checkpoint wrapper. Gated to agent displays only (never display 0).
+    private volatile SecondUiOwner mSecondUiOwner;
+    // A navigation creates a new root; the display-bound agent UI keeps its open window.
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, SecondUiExecutionConfig>
+            sSecondUiExecutionConfigs = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final class SecondUiExecutionConfig {
+        final SecondUiUpdateWindow window = new SecondUiUpdateWindow();
+        long periodMillis;
+        boolean checkpointSafe;
+    }
+    private volatile SecondUiUpdateWindow mSecondUiWindow = new SecondUiUpdateWindow();
+    private boolean mSecondUiPending;
+    private boolean mSecondUiNecessaryLayout;
+    private long mSecondUiPeriodMillis = 100;
+    private long mSecondUiLastTick;
+    private volatile long mSecondUiObservationsCompleted;
+    private long mSecondUiObservationBudgetExhaustions;
+    private int mSecondUiLastObservationPasses;
+    private boolean mSecondUiLastObservationSettled;
+    private final ArrayList<SecondUiObservation> mSecondUiObservations = new ArrayList<>();
+    private final Runnable mSecondUiTrigger = this::triggerSecondUiUpdate;
+    private void triggerSecondUiUpdate() {
+        if (mSecondUiOwner == null || !mSecondUiOwner.alive()) return;
+        if (!mSecondUiWindow.isOpen() && !mSecondUiNecessaryLayout
+                && mSecondUiObservations.isEmpty()) return;
+        if (mAgentFrozen && !mSecondUiNecessaryLayout && mSecondUiObservations.isEmpty()) return;
+        SecondUiMainScheduler.get().traversal(this, this::runSecondUiUpdate);
+    }
+    private static final class SecondUiObservation {
+        // Bound work, not wall time: foreground scheduling can delay any pass.
+        static final int MAX_PASSES = 8;
+        static final int QUIET_PASSES = 2;
+        final long revision;
+        final boolean noDraw;
+        final Runnable ready;
+        int passes;
+        int quietPasses;
+        SecondUiObservation(long revision, boolean noDraw, Runnable ready) {
+            this.revision = revision; this.noDraw = noDraw; this.ready = ready;
+        }
+    }
+    /**
+     * Non-creating read for cross-thread callback registration.
+     *
+     * @hide
+     */
+    public SecondUiOwner peekSecondUiOwner() { return mSecondUiOwner; }
+    /**
+     * Stable root identity assigned from the trusted creation marker.
+     *
+     * @hide
+     */
+    public SecondUiOwner getSecondUiOwner() {
+        checkThread();
+        if (mSecondUiOwner == null) {
+            mSecondUiOwner = new SecondUiOwner(isAgentUi());
+            mSecondUiOwner.setFrameRequest(this::scheduleSecondUiUpdate);
+        }
+        return mSecondUiOwner;
+    }
+    /**
+     * Opt-in for adapted UI paths; arbitrary application observers are not inferred.
+     *
+     * @hide
+     */
+    public void configureSecondUiExecution(long periodMillis, boolean checkpointSafe) {
+        checkThread();
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            throw new IllegalStateException("Second UI execution requires shared Main");
+        }
+        if (!isAgentUi() || periodMillis < 1 || periodMillis > 60000) {
+            throw new IllegalArgumentException("Agent period");
+        }
+        SecondUiExecutionConfig config = sSecondUiExecutionConfigs.computeIfAbsent(
+                mDisplay.getDisplayId(), ignored -> new SecondUiExecutionConfig());
+        config.periodMillis = periodMillis;
+        config.checkpointSafe = checkpointSafe;
+        mSecondUiWindow = config.window;
+        SecondUiOwner owner = getSecondUiOwner();
+        unscheduleTraversals();
+        owner.managedFrames = true;
+        owner.setCheckpointSafe(checkpointSafe);
+        mSecondUiPeriodMillis = periodMillis;
+        mSecondUiPending = true;
+    }
+    /**
+     * Accepted action opens a window; host observation closes it separately.
+     *
+     * @hide
+     */
+    public void beginSecondUiAction() {
+        checkThread(); requireManagedSecondUi();
+        mAgentFrozen = false;
+        mSecondUiWindow.open();
+        scheduleSecondUiUpdate();
+    }
+    /**
+     * Observation without an action also schedules the work needed for a fresh result.
+     *
+     * @hide
+     */
+    public void requestSecondUiObservation(boolean noDraw, Runnable ready) {
+        checkThread(); requireManagedSecondUi();
+        mAgentFrozen = false;
+        mSecondUiObservations.add(new SecondUiObservation(mSecondUiWindow.open(), noDraw,
+                java.util.Objects.requireNonNull(ready)));
+        scheduleSecondUiUpdate();
+    }
+    /**
+     * Adapter for a layout dependency that cannot be postponed until observation.
+     *
+     * @hide
+     */
+    public void requestSecondUiNecessaryLayout() {
+        checkThread(); requireManagedSecondUi();
+        mSecondUiNecessaryLayout = true;
+        scheduleSecondUiUpdate();
+    }
+    private void requireManagedSecondUi() {
+        if (!getSecondUiOwner().managedFrames) throw new IllegalStateException("Not configured");
+    }
+    private void scheduleSecondUiUpdate() {
+        checkThread();
+        mSecondUiPending = true;
+        if (!mSecondUiWindow.isOpen() && !mSecondUiNecessaryLayout
+                && mSecondUiObservations.isEmpty()) return;
+        if (mAgentFrozen && !mSecondUiNecessaryLayout && mSecondUiObservations.isEmpty()) return;
+        mHandler.removeCallbacks(mSecondUiTrigger);
+        long due = Math.max(SystemClock.uptimeMillis(), mSecondUiLastTick + mSecondUiPeriodMillis);
+        mHandler.postAtTime(mSecondUiTrigger, due);
+    }
+    private void runSecondUiUpdate() {
+        if (!mSecondUiPending || mView == null || !mAdded) return;
+        if (!mSecondUiWindow.isOpen() && !mSecondUiNecessaryLayout
+                && mSecondUiObservations.isEmpty()) return;
+        if (mAgentFrozen && !mSecondUiNecessaryLayout && mSecondUiObservations.isEmpty()) return;
+        mSecondUiPending = false;
+        mSecondUiNecessaryLayout = false;
+        mSecondUiLastTick = SystemClock.uptimeMillis();
+        ArrayList<SecondUiObservation> observations = new ArrayList<>(mSecondUiObservations);
+        mSecondUiObservations.clear();
+        final long beforeUpdateTick = mAgentDirtyTick;
+        mChoreographer.doFrameForAgent(getSecondUiOwner(), mSecondUiPeriodMillis * 1_000_000L);
+        // Settle using command recording. A pixel request enables downstream work
+        // only at a completion candidate, not on every intermediate update.
+        forceTraversalForAgent(true, 0);
+        // A traversal can consume a RecyclerView update yet enqueue the binding or
+        // animation work that makes the new row visible. Return to the event loop
+        // between passes; a single recorded frame is not a settled observation.
+        boolean quiet = !mSecondUiPending && agentIsFrameworkStable()
+                && mAgentDirtyTick == beforeUpdateTick;
+        boolean pixelsAtCompletion = false;
+        for (SecondUiObservation observation : observations) {
+            observation.passes++;
+            observation.quietPasses = quiet ? observation.quietPasses + 1 : 0;
+            pixelsAtCompletion |= !observation.noDraw
+                    && (observation.quietPasses >= SecondUiObservation.QUIET_PASSES
+                            || observation.passes >= SecondUiObservation.MAX_PASSES);
+        }
+        if (pixelsAtCompletion) {
+            final long beforePixelsTick = mAgentDirtyTick;
+            forceTraversalForAgent(false, 0);
+            quiet &= !mSecondUiPending && agentIsFrameworkStable()
+                    && mAgentDirtyTick == beforePixelsTick;
+            if (!quiet) {
+                for (SecondUiObservation observation : observations) observation.quietPasses = 0;
+            }
+        }
+        for (SecondUiObservation observation : observations) {
+            final boolean settled = observation.quietPasses >= SecondUiObservation.QUIET_PASSES;
+            if (!settled && observation.passes < SecondUiObservation.MAX_PASSES) {
+                mSecondUiObservations.add(observation);
+                continue;
+            }
+            mSecondUiLastObservationPasses = observation.passes;
+            mSecondUiLastObservationSettled = settled;
+            if (!settled) mSecondUiObservationBudgetExhaustions++;
+            mAgentSettled = settled;
+            mSecondUiWindow.observed(observation.revision);
+            mSecondUiObservationsCompleted++;
+            observation.ready.run();
+        }
+        if (!mSecondUiObservations.isEmpty()
+                || (mSecondUiPending && mSecondUiWindow.isOpen())) scheduleSecondUiUpdate();
+    }
+
+    boolean mAgentFrozen;
+    // Agent dual-phase: skip draw-command recording in Phase 1 (measure+layout only).
+    boolean mAgentSkipRecord;
+    // Per-window invalidate counter: incremented on every invalidate() call.
+    // Used by forceTraversalForAgent to detect when the view tree has settled.
+    long mAgentDirtyTick;
+    // Per-window profiling counters for E3 experiment (reset via 'fresh reset').
+    // mAgentPhase1Count: measure+layout-only traversals during settle phase.
+    // mAgentPhase2Count: full record traversals (one per forceTraversalForAgent call).
+    // mAgentSettled: true if the last call exited via early-break, false if bound was hit.
+    int mAgentPhase1Count;
+    int mAgentPhase2Count;
+    boolean mAgentSettled;
+
+    // Assigned by the framework in the window-add result; fixed for this window's lifetime.
+    // UI scheduling reads this local marker without querying system_server.
+    private boolean mIsAgentUi;
+
+    // === Layer 1: agent-UI traversal decoupled from VSYNC (foreground-yielding) ===
+    // When active on an agent UI, a scheduled traversal is NOT bound to the shared
+    // VSYNC CALLBACK_TRAVERSAL queue (which would compete with the user's frame and
+    // post a sync barrier on the main looper). Instead it is posted as a deferred
+    // runnable that yields to the foreground: it runs the traversal only when the
+    // shared Choreographer has no foreground frame pending, re-posting otherwise.
+    // Continuation is automatic — if a traversal causes new invalidate/requestLayout,
+    // scheduleTraversals() re-arms the deferred runnable; "stable" = no more arming.
+    // This is independent of GPU bypass (Layer 2 / mAgentNoDraw): Layer 1 keeps normal
+    // GPU draw so the agent VirtualDisplay's ImageReader still receives frames.
+    //
+    // Decouple defaults ON for agent UIs. Explicit per-display settings persist
+    // across navigation; G1 uses undecouple to select the original frame clock.
+    static final int AGENT_DECOUPLE_AUTO = 0;
+    static final int AGENT_DECOUPLE_ON = 1;
+    static final int AGENT_DECOUPLE_OFF = -1;
+    int mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
+    boolean mAgentTraversalScheduled;   // a deferred agent traversal is posted
+    int mAgentDeferredCount;            // profiling: deferred traversals run
+    // Layer 1 (IdleHandler-driven decouple): the agent traversal runs in the
+    // main-thread idle slot — i.e. the gap after the foreground's VSYNC doFrame has
+    // dispatched all its callbacks and the looper is about to sleep. This is event-
+    // driven (no polling, no mFrameScheduled boolean check, no 2ms self-repost) and
+    // never schedules a VSYNC of its own, so the vanilla foreground frame pipeline is
+    // untouched. Anti-starvation: on perpetually-invalidating pages the looper may
+    // stay busy and the idle slot never arrive; if the agent traversal has been
+    // pending longer than AGENT_DECOUPLE_MAX_DEFER_MS, the next idle/timeout forces
+    // one synthetic frame so the agent window cannot be starved into an input-
+    // dispatch-timeout ANR. A short bounded delay is acceptable; indefinite is not.
+    long mAgentTraversalArmedAt;        // SystemClock.uptimeMillis() when armed
+    static final long AGENT_DECOUPLE_MAX_DEFER_MS = 48; // ~3 frames @60Hz: bound before forcing
+    // Layer 3: DL semantic-hash stability detection.
+    // When enabled, settle stability is judged by comparing the agent-consumable
+    // semantic fingerprint (text glyphs + device-space layout bounds, computed on
+    // the RenderThread) between consecutive passes, instead of (or in addition to)
+    // framework dirty flags. This settles "framework-perpetual" pages (spinners,
+    // periodic invalidates) as soon as their *content* stops changing.
+    boolean mAgentHashStabilityEnabled;
+    long mAgentLastSemanticHash;
+    boolean mAgentHasLastHash;
+
+    // Profiling-only readiness detector. Disabled by default and never controls when an
+    // observation stops. It correlates terminal input, a complete Java DisplayList pass,
+    // and the subsequent synchronous RenderThread staging-to-active handoff.
+    boolean mAgentDlProfileEnabled;
+    boolean mAgentDlProfileArmed;
+    boolean mAgentDlProfileActionActive;
+    boolean mAgentDlProfileTerminalDelivered;
+    boolean mAgentDlProfileRecordPassActive;
+    boolean mAgentDlProfilePendingSync;
+    long mAgentDlProfileActionGeneration;
+    long mAgentDlProfileActionStartNanos;
+    long mAgentDlProfileTerminalRecordGeneration;
+    long mAgentDlProfileRecordGeneration;
+    long mAgentDlProfileActiveGeneration;
+    long mAgentDlProfileActiveRecordGeneration;
+    long mAgentDlProfileLastRecordDurationNanos;
+    long mAgentDlProfileLastSyncDurationNanos;
+    long mAgentDlProfileRecordDurationTotalNanos;
+    long mAgentDlProfileSyncDurationTotalNanos;
+    long mAgentDlProfileSemanticDurationTotalNanos;
+    long mAgentDlProfileBookkeepingDurationTotalNanos;
+    long mAgentDlProfileRecordCount;
+    long mAgentDlProfileSyncCount;
+    long mAgentDlProfileSemanticCount;
+    long mAgentDlProfilePassRecordedNodes;
+    long mAgentDlProfilePassNodeSketch;
+    long mAgentDlProfileActiveRecordedNodes;
+    long mAgentDlProfileActiveNodeSketch;
+    long mAgentDlProfileActiveDirtyTick;
+    long mAgentDlProfileActiveRootId;
+    boolean mAgentDlProfileActiveRootValid;
+    int mAgentDlProfileLastSyncResult;
+    long mAgentDlProfileLastSemanticHash;
+    boolean mAgentDlProfileHasSemanticHash;
+    long mAgentDlProfileLastSampleDirtyTick;
+    long mAgentDlProfileLastSampleRootId;
+    int mAgentDlProfileQuietSlots;
+    long mAgentDlProfileReadyAtUs = -1;
+    long mAgentDlProfileQuiet1AtUs = -1;
+    long mAgentDlProfileQuiet2AtUs = -1;
+
+    private static final int AGENT_DL_PROFILE_SAMPLE_CAPACITY = 64;
+    private static final int AGENT_DL_PROFILE_SAMPLE_STRIDE = 15;
+    private static final int AGENT_DL_READY_TERMINAL = 1 << 0;
+    private static final int AGENT_DL_READY_POST_ACTION_RECORD = 1 << 1;
+    private static final int AGENT_DL_READY_ACTIVE_VALID = 1 << 2;
+    private static final int AGENT_DL_READY_INPUT_QUIET = 1 << 3;
+    private static final int AGENT_DL_READY_FRAMEWORK_QUIET = 1 << 4;
+    private static final int AGENT_DL_READY = 1 << 5;
+    private static final int AGENT_DL_HASH_REPEAT = 1 << 6;
+    private static final int AGENT_DL_HASH_SAMPLED = 1 << 7;
+    private static final int AGENT_DL_ROOT_CHANGED = 1 << 8;
+    long[] mAgentDlProfileSamples;
+    int mAgentDlProfileSampleCount;
+    int mAgentDlProfileSampleWrite;
+
+    // Only set while this thread is traversing an agent ViewRoot outside Choreographer#doFrame.
+    // View measure/layout/DisplayList recording use it to insert agent-only frame checkpoints;
+    // foreground ViewRoots never install this context and retain the vanilla traversal path.
+    private static final ThreadLocal<ViewRootImpl> sAgentNodeCheckpointRoot = new ThreadLocal<>();
+    long mAgentNodeCheckpointCount;
+    long mAgentNodeCheckpointFrameCount;
+    // Diagnostic-only wall-clock counters. The two clock reads perturb each poll;
+    // normal latency/resource trials leave this per-root option disabled.
+    final boolean mAgentCheckpointProfile = SystemProperties.getBoolean(
+            "debug.second_ui.checkpoint_profile", false);
+    long mAgentCheckpointNoHitNanos;
+    long mAgentCheckpointHitNanos;
+    long mAgentCheckpointDispatchNanos;
+
+    // === Agent on-demand idle-driven settle (foreground-yielding) ===
+    // Async counterpart of forceTraversalForAgent(): instead of running the whole
+    // settle loop synchronously (blocking the foreground), one settle pass is run
+    // per main-thread idle slot via mAgentSettleIdler. The IdleHandler only runs
+    // when the MessageQueue has no due messages, so the foreground's VSYNC doFrame
+    // always takes priority; each pass returns to the queue, re-checking for
+    // foreground work before the next pass. See docs/c3_ondemand_scheduling_design.md.
+    boolean mAgentObserveActive;        // an async observe session is in progress
+    boolean mAgentObserveNoDraw;        // noDraw flag captured for this session's Phase 2
+    int mAgentObserveBudget;            // max Phase 1 settle passes for this session
+    int mAgentObservePass;              // Phase 1 passes already run this session
+    long mAgentObserveLastTick;         // mAgentDirtyTick snapshot from previous pass
+    long mAgentObserveStartNanos;       // wall-clock start, for profiling
+    long mAgentObserveTimeoutMs;        // wall-clock fallback; 0 for legacy pass-bound mode
+    boolean mAgentObserveFreezeOnDone;  // traversal-only freeze after a consumable Phase 2
+    String mAgentObserveResult = "idle"; // active/readiness/timeout/budget/sync_failed
+    long mAgentObserveDurationMs;
+    Runnable mAgentObserveOnDone;       // optional callback fired (on UI thread) at Phase 2 end
+    Runnable mAgentSettleRunnable;      // the self-re-posting settle step
+    // Profiling: number of times a settle pass was deferred because the foreground
+    // had pending frame/traversal work (i.e. agent yielded to the foreground).
+    int mAgentYieldCount;
+    boolean mAgentLastSyncForAgentValid;
+    int mAgentLastSyncForAgentResult = -1;
+
     boolean mApplyInsetsRequested;
     boolean mLayoutRequested;
     boolean mFirst;
@@ -1903,6 +2381,9 @@ public final class ViewRootImpl implements ViewParent,
                 }
 
                 view.assignParent(this);
+                mIsAgentUi = (res & WindowManagerGlobal.ADD_FLAG_SECOND_UI) != 0;
+                if (mSecondUiOwner == null) mSecondUiOwner = new SecondUiOwner(mIsAgentUi);
+                mSecondUiOwner.setFrameRequest(this::scheduleSecondUiUpdate);
                 mAddedTouchMode = (res & WindowManagerGlobal.ADD_FLAG_IN_TOUCH_MODE) != 0;
                 mAppVisible = (res & WindowManagerGlobal.ADD_FLAG_APP_VISIBLE) != 0;
 
@@ -1932,6 +2413,23 @@ public final class ViewRootImpl implements ViewParent,
                 mFirstPostImeInputStage = earlyPostImeStage;
                 mPendingInputEventQueueLengthCounterName = "aq:pending:" + counterSuffix;
                 mAdded = true;
+                if (mIsAgentUi) {
+                    mAgentRenderingConfig = sAgentRenderingConfigs.getOrDefault(
+                            getDisplayId(), AgentRenderingConfig.DEFAULT);
+                }
+
+                // Configuration uses the public root identity, which is valid only after
+                // add-to-display and the input pipeline have completed. Navigation may
+                // inherit a managed update window; applying it before mAdded would reject
+                // this trusted agent root and abort the activity's resume transaction.
+                if (mIsAgentUi && Looper.myLooper() == Looper.getMainLooper()) {
+                    SecondUiExecutionConfig config = sSecondUiExecutionConfigs.get(
+                            mDisplay.getDisplayId());
+                    if (config != null) {
+                        configureSecondUiExecution(config.periodMillis, config.checkpointSafe);
+                        scheduleSecondUiUpdate();
+                    }
+                }
 
                 if (!mRemoved || !mAppVisible) {
                     AnimationHandler.requestAnimatorsEnabled(mAppVisible, this);
@@ -2205,7 +2703,7 @@ public final class ViewRootImpl implements ViewParent,
                 final ThreadedRenderer renderer = ThreadedRenderer.create(mContext, translucent,
                         attrs.getTitle().toString(), mIpcRenderingEnabled);
                 mAttachInfo.mThreadedRenderer = renderer;
-                if (mIsHardwareRendererOutputDisabled) {
+                if (mIsHardwareRendererOutputDisabled || !isSecondUiRendererOutputAllowed()) {
                     renderer.setRendererDrawingEnabled(false);
                 }
 
@@ -2709,6 +3207,9 @@ public final class ViewRootImpl implements ViewParent,
 
         @Override
         public void onDisplayRemoved(int displayId) {
+            sAgentRenderingConfigs.remove(displayId);
+            sComputerControlRendering.remove(displayId);
+            sSecondUiExecutionConfigs.remove(displayId);
         }
 
         @Override
@@ -2766,6 +3267,7 @@ public final class ViewRootImpl implements ViewParent,
         }
         mHdrRenderState.startListening();
         mContext.updateDisplay(mDisplay.getDisplayId());
+        refreshAgentRenderingConfig();
     }
 
     void pokeDrawLockIfNeeded() {
@@ -2863,6 +3365,7 @@ public final class ViewRootImpl implements ViewParent,
     @UnsupportedAppUsage
     void invalidate() {
         mDirty.set(0, 0, mWidth, mHeight);
+        mAgentDirtyTick++;
         if (!mWillDrawSoon) {
             scheduleTraversals();
         }
@@ -2927,6 +3430,12 @@ public final class ViewRootImpl implements ViewParent,
                 (int) (mWidth * appScale + 0.5f), (int) (mHeight * appScale + 0.5f));
         if (!intersected) {
             localDirty.setEmpty();
+        }
+        // Track partial invalidations as well as the full-root invalidate() path.
+        // This is an O(1) readiness signal; it deliberately avoids walking the
+        // View hierarchy or hashing the recorded DisplayList.
+        if (intersected || mIsAnimating) {
+            mAgentDirtyTick++;
         }
         if (!mWillDrawSoon && (intersected || mIsAnimating)) {
             scheduleTraversals();
@@ -3306,6 +3815,27 @@ public final class ViewRootImpl implements ViewParent,
     @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.R, trackingBug = 170729553)
     void scheduleTraversals() {
         checkThreadCompat();
+        // Detach/Insets cleanup can invalidate after dispatchDetachedFromWindow has
+        // already unscheduled this root. A dead owner's callback is deliberately
+        // skipped by Choreographer, so it must not leave a new sync barrier behind.
+        if (mRemoved) return;
+        if (mSecondUiOwner != null && mSecondUiOwner.managedFrames) {
+            scheduleSecondUiUpdate();
+            return;
+        }
+        // Agent-frozen window: do not subscribe to real VSYNC / schedule traversal.
+        // The DisplayList is advanced only on demand (idle省电, Layer-1 disabled).
+        if (mAgentFrozen) {
+            return;
+        }
+        // Layer 1: agent UI with decouple active — route the traversal off the shared
+        // VSYNC TRAVERSAL queue into a foreground-yielding deferred runnable instead of
+        // posting a sync barrier + CALLBACK_TRAVERSAL (which competes with the user frame).
+        // Decouple defaults ON for agent UIs (window property); see isAgentDecoupleActive().
+        if (isAgentDecoupleActive()) {
+            scheduleAgentDeferredTraversal();
+            return;
+        }
         if (!mTraversalScheduled) {
             mTraversalScheduled = true;
             // The following behavior is load-bearing for public API correctness.
@@ -3327,15 +3857,125 @@ public final class ViewRootImpl implements ViewParent,
             // the scheduled traversals have occurred unless the message is
             // specifically "asynchronous" - see Message#setAsynchronous
             postTraversalBarrier();
-            mChoreographer.postVsyncCallback(
-                    Choreographer.CALLBACK_TRAVERSAL, mTraversalCallback);
+            mChoreographer.postVsyncCallbackForSecondUi(
+                    Choreographer.CALLBACK_TRAVERSAL, mTraversalCallback,
+                    peekSecondUiOwner());
             notifyRendererOfFramePending();
             pokeDrawLockIfNeeded();
         }
     }
 
+    /** Share the operation scheduler's slack entry; never force past a due user frame. */
+    private void scheduleAgentDeferredTraversal() {
+        if (mAgentTraversalScheduled) return;
+        mAgentTraversalScheduled = true;
+        mAgentTraversalArmedAt = SystemClock.uptimeMillis();
+        SecondUiMainScheduler.get().traversal(this, this::runAgentDeferredTraversalNow);
+    }
+
+    /** Run one traversal selected by the common slack scheduler, outside doFrame. */
+    private void runAgentDeferredTraversalNow() {
+        mAgentTraversalScheduled = false;
+        if (mAgentFrozen || mView == null || !mAdded) {
+            return;
+        }
+        // Profiling: count how many times the traversal had to wait past one frame for
+        // its idle slot (replaces the old 2ms busy-spin yield counter).
+        final long waited = SystemClock.uptimeMillis() - mAgentTraversalArmedAt;
+        if (waited > AGENT_DECOUPLE_MAX_DEFER_MS) {
+            mAgentYieldCount++;
+        }
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentDeferredTraversal");
+        try {
+            // Run outside Choreographer#doFrame so an arrived physical-display frame can be
+            // dispatched inline at a node checkpoint without recursively entering an outer
+            // agent doFrame. Rendering depth is controlled independently by GPU bypass.
+            if (mTraversalScheduled) {
+                mTraversalScheduled = false;
+                removeTraversalBarrier();
+                mChoreographer.removeVsyncCallback(
+                        Choreographer.CALLBACK_TRAVERSAL, mTraversalCallback);
+            }
+            mFullRedrawNeeded = true;
+            performAgentNodeCheckpointTraversal();
+            mAgentDeferredCount++;
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    private void performAgentNodeCheckpointTraversal() {
+        SecondUiOwner owner = getSecondUiOwner();
+        if (!owner.agent) { owner.run(this::performTraversalsTraced); return; }
+        final ViewRootImpl previousRoot = sAgentNodeCheckpointRoot.get();
+        owner.beginTraversal();
+        final long now = System.nanoTime();
+        final long interval = mSecondUiPeriodMillis * 1_000_000L;
+        java.util.Arrays.fill(mAgentTraversalFrameInfo.frameInfo, 0L);
+        mAgentTraversalFrameInfo.setVsync(now, now, FrameInfo.INVALID_VSYNC_ID,
+                now + interval, now, interval, /* animationTime */ now);
+        mAgentTraversalFrameInfo.markPerformTraversalsStart();
+        mAgentTraversalActive = true;
+        // Only explicitly adapted notification paths can safely allow stack-internal yielding.
+        final boolean checkpoint = owner.checkpointSafe();
+        mAgentTraversalCheckpointEnabled = checkpoint;
+        try {
+            // Node profiling remains available when cooperative yielding is disabled.
+            sAgentNodeCheckpointRoot.set(this);
+            if (checkpoint) {
+                mChoreographer.beginAgentNodeCheckpointTraversal();
+            }
+            owner.run(this::performTraversalsTraced);
+        } finally {
+            try {
+                if (checkpoint) mChoreographer.endAgentNodeCheckpointTraversal();
+                if (previousRoot == null) sAgentNodeCheckpointRoot.remove();
+                else sAgentNodeCheckpointRoot.set(previousRoot);
+                agentDlProfileOnTraversalComplete();
+            } finally {
+                mAgentTraversalActive = false;
+                mAgentTraversalCheckpointEnabled = false;
+                owner.endTraversal();
+            }
+        }
+    }
+
+    static void agentNodeCheckpoint(View view) {
+        agentNodeCheckpoint(view, false);
+    }
+
+    static void agentNodeCheckpoint(View view, boolean displayListRecorded) {
+        final ViewRootImpl root = sAgentNodeCheckpointRoot.get();
+        if (root == null || view == null || view.mAttachInfo == null
+                || view.mAttachInfo.mViewRootImpl != root || !root.mIsInTraversal) {
+            return;
+        }
+        if (displayListRecorded && root.mAgentDlProfileEnabled
+                && root.mAgentDlProfileRecordPassActive) {
+            root.agentDlProfileOnNodeRecorded(view);
+        }
+        if (!root.mAgentTraversalCheckpointEnabled) return;
+        final long profileStart = root.mAgentCheckpointProfile ? System.nanoTime() : 0;
+        root.mAgentNodeCheckpointCount++;
+        final boolean hit = root.mChoreographer.doFrameAtAgentNodeCheckpoint(profileStart);
+        if (hit) {
+            root.mAgentNodeCheckpointFrameCount++;
+        }
+        if (profileStart != 0) {
+            final long elapsed = System.nanoTime() - profileStart;
+            if (hit) {
+                root.mAgentCheckpointHitNanos += elapsed;
+                root.mAgentCheckpointDispatchNanos +=
+                        root.mChoreographer.getLastAgentCheckpointDispatchNanos();
+            } else root.mAgentCheckpointNoHitNanos += elapsed;
+        }
+    }
+
     void unscheduleTraversals() {
         checkThreadCompat();
+        SecondUiMainScheduler.get().removeTraversal(this);
+        mHandler.removeCallbacks(mSecondUiTrigger);
+        mAgentTraversalScheduled = false;
         if (mTraversalScheduled) {
             mTraversalScheduled = false;
             removeTraversalBarrier();
@@ -3348,7 +3988,7 @@ public final class ViewRootImpl implements ViewParent,
         if (mTraversalScheduled) {
             mTraversalScheduled = false;
             removeTraversalBarrier();
-            performTraversals(frameTimeNanos);
+            getSecondUiOwner().run(() -> performTraversalsTraced(frameTimeNanos));
         }
     }
 
@@ -3377,6 +4017,1040 @@ public final class ViewRootImpl implements ViewParent,
         } else {
             mQueue.removeSyncBarrier(mTraversalBarrier);
         }
+    }
+
+    /**
+     * Force a single measure/layout/draw-record traversal on demand, bypassing VSYNC.
+     * When {@code noDraw} is true the DisplayList is recorded and synced to the
+     * RenderThread but the GPU draw is skipped (zero GPU/SurfaceFlinger work), which
+     * is what lets an agent read a fresh DisplayList from an unbound or STATE_OFF
+     * display. Must be called on the UI thread (use mHandler.runWithScissors from
+     * other threads).
+     * @hide
+     */
+    public void forceTraversalForAgent(boolean noDraw) {
+        forceTraversalForAgent(noDraw, 0);
+    }
+
+    /**
+     * Force on-demand traversal with an optional fake-VSYNC pump (dual-phase).
+     *
+     * <p><b>Phase 1 (settle):</b> Repeatedly synthesizes frame-clock signals via
+     * {@link Choreographer#doFrameForAgent(SecondUiOwner, long)} and runs measure+layout (skipping
+     * drawing-command recording) until the view tree settles—no new invalidation,
+     * no pending layout, no active hardware animations—or until {@code vsyncFrames}
+     * synthetic frames have been delivered, whichever comes first. This advances
+     * property animations, frame callbacks, and async content while paying only the
+     * CPU cost of measure and layout per iteration.
+     *
+     * <p><b>Phase 2 (record):</b> A single full traversal records drawing commands
+     * into the DisplayList and syncs to the RenderThread. {@code noDraw} keeps the
+     * renderer in sync-only mode (zero GPU/SurfaceFlinger work).
+     *
+     * <p>Must be called on the UI thread.
+     * @hide
+     */
+    public void forceTraversalForAgent(boolean noDraw, int vsyncFrames) {
+        // This API is dispatched with runWithScissors on the UI looper, so there is
+        // no concurrent traversal on this thread. Do not trust a stale
+        // mIsInTraversal bit left by an earlier aborted platform traversal.
+        if (mView == null || !mAdded) {
+            return;
+        }
+        final boolean prevNoDraw = mAgentNoDraw;
+        final boolean prevSkipRecord = mAgentSkipRecord;
+        final boolean hashMode = mAgentHashStabilityEnabled;
+        mAgentHasLastHash = false; // reset hash baseline for this observe
+        try {
+            // === Phase 1: pump animations + settle view tree ===
+            // In hash mode we MUST record during settle (skip-record produces no DL
+            // to fingerprint), so the hash reflects current content each pass.
+            mAgentNoDraw = true;
+            mAgentSkipRecord = !hashMode;
+            long lastTick = mAgentDirtyTick;
+            boolean settled = true;
+
+            for (int i = 0; i < vsyncFrames; i++) {
+                agentRunOneSettlePass();
+                boolean stable;
+                if (hashMode) {
+                    // Layer 3: settle when agent-consumable content stops changing,
+                    // even if framework dirty flags keep firing (spinner/periodic).
+                    stable = agentIsContentStable();
+                } else {
+                    // Framework-stable: no new invalidation, no pending layout/hw-anim.
+                    stable = (mAgentDirtyTick == lastTick) && agentIsFrameworkStable();
+                }
+                if (stable) {
+                    break;
+                }
+                lastTick = mAgentDirtyTick;
+                if (i == vsyncFrames - 1) settled = false;  // ran out of budget
+            }
+            mAgentSettled = settled;
+
+            // === Phase 2: view tree settled (or bound reached), record DL once ===
+            mAgentNoDraw = noDraw;
+            mAgentSkipRecord = false;
+            agentRecordPhase2();
+        } finally {
+            mAgentNoDraw = prevNoDraw;
+            mAgentSkipRecord = prevSkipRecord;
+        }
+    }
+
+    // ===================================================================================
+    // Agent on-demand shared helpers + idle-driven (foreground-yielding) settle.
+    // See docs/c3_ondemand_scheduling_design.md (§2 scheduling, §4 settle, §5 animation).
+    // ===================================================================================
+
+    /**
+     * Returns true if the agent view tree is framework-stable: no pending layout and
+     * no active hardware animations. (Caller separately compares mAgentDirtyTick to
+     * detect new invalidations between passes.)
+     */
+    private boolean agentIsFrameworkStable() {
+        return !mLayoutRequested
+                && (mAttachInfo == null
+                    || mAttachInfo.mPendingAnimatingRenderNodes == null
+                    || mAttachInfo.mPendingAnimatingRenderNodes.isEmpty());
+    }
+
+    /**
+     * Layer 3: current DL semantic fingerprint (text + layout), or 0 if unavailable.
+     * Computed synchronously on the RenderThread; requires a recorded DisplayList,
+     * so only meaningful after a recording traversal (not a skip-record pass).
+     */
+    private long agentSemanticHash() {
+        if (mAttachInfo != null && mAttachInfo.mThreadedRenderer != null) {
+            return mAttachInfo.mThreadedRenderer.computeSemanticHash();
+        }
+        return 0;
+    }
+
+    /**
+     * Layer 3: returns true if the agent-consumable content (text+layout) has not
+     * changed since the previous pass, i.e. the semantic fingerprint repeated.
+     * Updates the stored hash. The first call after reset always returns false
+     * (no prior hash to compare). Use to settle framework-perpetual pages.
+     */
+    private boolean agentIsContentStable() {
+        long h = agentSemanticHash();
+        boolean stable = mAgentHasLastHash && (h == mAgentLastSemanticHash);
+        mAgentLastSemanticHash = h;
+        mAgentHasLastHash = true;
+        return stable;
+    }
+
+    boolean isAgentDlProfileRecordingActive() {
+        return mAgentDlProfileEnabled && mAgentDlProfileActionActive;
+    }
+
+    /** Enables the profiling-only DL readiness observer. It never changes settle behavior. */
+    public void setAgentDlProfileEnabled(boolean enabled) {
+        mAgentDlProfileEnabled = enabled && isAgentUi();
+        if (mAgentDlProfileEnabled && mAgentDlProfileSamples == null) {
+            mAgentDlProfileSamples = new long[AGENT_DL_PROFILE_SAMPLE_CAPACITY
+                    * AGENT_DL_PROFILE_SAMPLE_STRIDE];
+        }
+        if (!mAgentDlProfileEnabled) {
+            mAgentDlProfileArmed = false;
+            mAgentDlProfileActionActive = false;
+            mAgentDlProfileRecordPassActive = false;
+            mAgentDlProfilePendingSync = false;
+        }
+    }
+
+    /** Arms the next touch/key action as a profiling epoch. */
+    public void armAgentDlProfile() {
+        if (!mAgentDlProfileEnabled || !isAgentUi()) {
+            return;
+        }
+        mAgentDlProfileArmed = true;
+        mAgentDlProfileActionActive = false;
+        mAgentDlProfileTerminalDelivered = false;
+        mAgentDlProfileSampleCount = 0;
+        mAgentDlProfileSampleWrite = 0;
+        mAgentDlProfileHasSemanticHash = false;
+        mAgentDlProfileQuietSlots = 0;
+        mAgentDlProfileReadyAtUs = -1;
+        mAgentDlProfileQuiet1AtUs = -1;
+        mAgentDlProfileQuiet2AtUs = -1;
+        mAgentDlProfileLastSampleDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileLastSampleRootId = 0;
+    }
+
+    private void agentDlProfileOnInputDispatched(InputEvent event) {
+        if (!mAgentDlProfileEnabled || !mAgentDlProfileArmed) {
+            return;
+        }
+        final boolean startsAction = event instanceof MotionEvent
+                ? ((MotionEvent) event).getActionMasked() == MotionEvent.ACTION_DOWN
+                : event instanceof KeyEvent
+                        && ((KeyEvent) event).getAction() == KeyEvent.ACTION_DOWN
+                        && ((KeyEvent) event).getRepeatCount() == 0;
+        if (!startsAction) {
+            return;
+        }
+        mAgentDlProfileActionGeneration++;
+        mAgentDlProfileActionActive = true;
+        mAgentDlProfileTerminalDelivered = false;
+        mAgentDlProfileActionStartNanos = System.nanoTime();
+        mAgentDlProfileTerminalRecordGeneration = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileSampleCount = 0;
+        mAgentDlProfileSampleWrite = 0;
+        mAgentDlProfileHasSemanticHash = false;
+        mAgentDlProfileQuietSlots = 0;
+        mAgentDlProfileReadyAtUs = -1;
+        mAgentDlProfileQuiet1AtUs = -1;
+        mAgentDlProfileQuiet2AtUs = -1;
+        mAgentDlProfileLastSampleDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileLastSampleRootId = 0;
+    }
+
+    private void agentDlProfileOnInputFinished(InputEvent event) {
+        if (!mAgentDlProfileEnabled || !mAgentDlProfileActionActive) {
+            return;
+        }
+        final boolean finishesAction = event instanceof MotionEvent
+                ? ((MotionEvent) event).getActionMasked() == MotionEvent.ACTION_UP
+                        || ((MotionEvent) event).getActionMasked() == MotionEvent.ACTION_CANCEL
+                : event instanceof KeyEvent && ((KeyEvent) event).getAction() == KeyEvent.ACTION_UP;
+        if (!finishesAction) {
+            return;
+        }
+        mAgentDlProfileTerminalDelivered = true;
+        mAgentDlProfileTerminalRecordGeneration = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileArmed = false;
+        Trace.instant(Trace.TRACE_TAG_VIEW, "agentDlProfileTerminalInput");
+    }
+
+    void agentDlProfileOnRecordPassBegin() {
+        if (!mAgentDlProfileEnabled) {
+            return;
+        }
+        mAgentDlProfileRecordPassActive = true;
+        mAgentDlProfilePassRecordedNodes = 0;
+        mAgentDlProfilePassNodeSketch = 0;
+    }
+
+    private void agentDlProfileOnNodeRecorded(View view) {
+        final long id = view.getUniqueDrawingId();
+        long mixed = id + 0x9e3779b97f4a7c15L;
+        mixed = (mixed ^ (mixed >>> 30)) * 0xbf58476d1ce4e5b9L;
+        mixed = (mixed ^ (mixed >>> 27)) * 0x94d049bb133111ebL;
+        mixed ^= mixed >>> 31;
+        mAgentDlProfilePassRecordedNodes++;
+        mAgentDlProfilePassNodeSketch ^= Long.rotateLeft(mixed,
+                (int) (mAgentDlProfilePassRecordedNodes & 63));
+    }
+
+    void agentDlProfileOnRecordPassComplete(boolean stagingRootValid, long rootId,
+            long durationNanos) {
+        if (!mAgentDlProfileEnabled) {
+            return;
+        }
+        mAgentDlProfileRecordGeneration++;
+        mAgentDlProfileRecordCount++;
+        mAgentDlProfileLastRecordDurationNanos = durationNanos;
+        mAgentDlProfileRecordDurationTotalNanos += durationNanos;
+        mAgentDlProfileActiveRecordGeneration = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileActiveRecordedNodes = mAgentDlProfilePassRecordedNodes;
+        mAgentDlProfileActiveNodeSketch = mAgentDlProfilePassNodeSketch;
+        mAgentDlProfileActiveDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileActiveRootId = rootId;
+        mAgentDlProfileActiveRootValid = stagingRootValid;
+    }
+
+    void agentDlProfileOnActiveSyncComplete(int syncResult, long durationNanos) {
+        if (!mAgentDlProfileEnabled) {
+            return;
+        }
+        // syncAndDrawFrame() is synchronous: this is the record generation that has
+        // crossed the RenderThread staging-to-active boundary, not a separate counter.
+        mAgentDlProfileActiveGeneration = mAgentDlProfileActiveRecordGeneration;
+        mAgentDlProfileSyncCount++;
+        mAgentDlProfileLastSyncDurationNanos = durationNanos;
+        mAgentDlProfileSyncDurationTotalNanos += durationNanos;
+        mAgentDlProfileLastSyncResult = syncResult;
+        mAgentDlProfilePendingSync = true;
+    }
+
+    private void agentDlProfileOnTraversalComplete() {
+        if (!mAgentDlProfileEnabled || !mAgentDlProfilePendingSync) {
+            return;
+        }
+        mAgentDlProfilePendingSync = false;
+        mAgentDlProfileRecordPassActive = false;
+        if (!mAgentDlProfileActionActive) {
+            return;
+        }
+
+        final long bookkeepingStart = System.nanoTime();
+        int readiness = 0;
+        if (mAgentDlProfileTerminalDelivered) {
+            readiness |= AGENT_DL_READY_TERMINAL;
+        }
+        if (mAgentDlProfileTerminalDelivered
+                && mAgentDlProfileActiveRecordGeneration
+                        > mAgentDlProfileTerminalRecordGeneration) {
+            readiness |= AGENT_DL_READY_POST_ACTION_RECORD;
+        }
+        if (mAgentDlProfileActiveRootValid) {
+            readiness |= AGENT_DL_READY_ACTIVE_VALID;
+        }
+        if (mPendingInputEventCount == 0 && !mProcessInputEventsScheduled) {
+            readiness |= AGENT_DL_READY_INPUT_QUIET;
+        }
+        if (!mTraversalScheduled && !mAgentTraversalScheduled && !mLayoutRequested) {
+            readiness |= AGENT_DL_READY_FRAMEWORK_QUIET;
+        }
+        final boolean rootChanged = mAgentDlProfileLastSampleRootId != 0
+                && mAgentDlProfileLastSampleRootId != mAgentDlProfileActiveRootId;
+        if (rootChanged) {
+            readiness |= AGENT_DL_ROOT_CHANGED;
+        }
+        final int required = AGENT_DL_READY_TERMINAL | AGENT_DL_READY_POST_ACTION_RECORD
+                | AGENT_DL_READY_ACTIVE_VALID | AGENT_DL_READY_INPUT_QUIET
+                | AGENT_DL_READY_FRAMEWORK_QUIET;
+        final int candidateRequired = AGENT_DL_READY_TERMINAL
+                | AGENT_DL_READY_POST_ACTION_RECORD | AGENT_DL_READY_ACTIVE_VALID
+                | AGENT_DL_READY_INPUT_QUIET;
+        final boolean ready = (readiness & required) == required;
+        final boolean candidateReady = (readiness & candidateRequired) == candidateRequired;
+        if (ready) {
+            readiness |= AGENT_DL_READY;
+        }
+
+        final boolean generationChanged = mAgentDlProfileActiveRecordedNodes != 0
+                || mAgentDlProfileActiveDirtyTick != mAgentDlProfileLastSampleDirtyTick
+                || rootChanged;
+        if (candidateReady && !generationChanged) {
+            mAgentDlProfileQuietSlots++;
+        } else {
+            mAgentDlProfileQuietSlots = 0;
+        }
+        long semanticDurationNanos = 0;
+        if (candidateReady && (!mAgentDlProfileHasSemanticHash || generationChanged
+                || mAgentDlProfileQuietSlots == 1)) {
+            final long hashStart = System.nanoTime();
+            final long hash = agentSemanticHash();
+            semanticDurationNanos = System.nanoTime() - hashStart;
+            if (mAgentDlProfileHasSemanticHash && hash == mAgentDlProfileLastSemanticHash) {
+                readiness |= AGENT_DL_HASH_REPEAT;
+            }
+            mAgentDlProfileLastSemanticHash = hash;
+            mAgentDlProfileHasSemanticHash = true;
+            mAgentDlProfileSemanticCount++;
+            mAgentDlProfileSemanticDurationTotalNanos += semanticDurationNanos;
+            readiness |= AGENT_DL_HASH_SAMPLED;
+        } else if (candidateReady && mAgentDlProfileHasSemanticHash && !generationChanged) {
+            readiness |= AGENT_DL_HASH_REPEAT;
+        }
+        final long sinceActionUs = mAgentDlProfileActionStartNanos == 0 ? -1
+                : (System.nanoTime() - mAgentDlProfileActionStartNanos) / 1000;
+        if (ready && mAgentDlProfileReadyAtUs < 0) {
+            mAgentDlProfileReadyAtUs = sinceActionUs;
+        }
+        if (mAgentDlProfileQuietSlots >= 1 && mAgentDlProfileQuiet1AtUs < 0) {
+            mAgentDlProfileQuiet1AtUs = sinceActionUs;
+        }
+        if (mAgentDlProfileQuietSlots >= 2 && mAgentDlProfileQuiet2AtUs < 0) {
+            mAgentDlProfileQuiet2AtUs = sinceActionUs;
+        }
+        agentDlProfileAppendSample(sinceActionUs, readiness, semanticDurationNanos);
+        mAgentDlProfileLastSampleDirtyTick = mAgentDlProfileActiveDirtyTick;
+        mAgentDlProfileLastSampleRootId = mAgentDlProfileActiveRootId;
+        mAgentDlProfileBookkeepingDurationTotalNanos +=
+                System.nanoTime() - bookkeepingStart - semanticDurationNanos;
+    }
+
+    private void agentDlProfileAppendSample(long sinceActionUs, int readiness,
+            long semanticDurationNanos) {
+        if (mAgentDlProfileSamples == null) {
+            return;
+        }
+        final int slot = mAgentDlProfileSampleWrite;
+        final int base = slot * AGENT_DL_PROFILE_SAMPLE_STRIDE;
+        mAgentDlProfileSamples[base] = sinceActionUs;
+        mAgentDlProfileSamples[base + 1] = mAgentDlProfileActionGeneration;
+        mAgentDlProfileSamples[base + 2] = mAgentDlProfileRecordGeneration;
+        mAgentDlProfileSamples[base + 3] = mAgentDlProfileActiveGeneration;
+        mAgentDlProfileSamples[base + 4] = mAgentDlProfileActiveRecordedNodes;
+        mAgentDlProfileSamples[base + 5] = mAgentDlProfileActiveNodeSketch;
+        mAgentDlProfileSamples[base + 6] = mAgentDlProfileActiveDirtyTick;
+        mAgentDlProfileSamples[base + 7] = mAgentDlProfileActiveRootId;
+        mAgentDlProfileSamples[base + 8] = readiness;
+        mAgentDlProfileSamples[base + 9] = mAgentDlProfileQuietSlots;
+        mAgentDlProfileSamples[base + 10] = mAgentDlProfileLastSemanticHash;
+        mAgentDlProfileSamples[base + 11] = mAgentDlProfileLastRecordDurationNanos;
+        mAgentDlProfileSamples[base + 12] = mAgentDlProfileLastSyncDurationNanos;
+        mAgentDlProfileSamples[base + 13] = semanticDurationNanos;
+        mAgentDlProfileSamples[base + 14] = mAgentDlProfileLastSyncResult;
+        mAgentDlProfileSampleWrite = (slot + 1) % AGENT_DL_PROFILE_SAMPLE_CAPACITY;
+        if (mAgentDlProfileSampleCount < AGENT_DL_PROFILE_SAMPLE_CAPACITY) {
+            mAgentDlProfileSampleCount++;
+        }
+    }
+
+    /**
+     * Run one Phase-1 settle pass on the agent window: advance this window's own
+     * animations, then one measure+layout traversal with DisplayList recording
+     * skipped (mAgentSkipRecord). Caller must have set mAgentNoDraw/mAgentSkipRecord.
+     */
+    private void agentRunOneSettlePass() {
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentSettlePass");
+        try {
+            // Extract only callbacks explicitly owned by this root. Shared animation
+            // callbacks with unknown ownership remain on the physical display clock.
+            mChoreographer.doFrameForAgent(getSecondUiOwner(), mSecondUiPeriodMillis * 1_000_000L);
+            if (mTraversalScheduled) {
+                mTraversalScheduled = false;
+                removeTraversalBarrier();
+            }
+            mFullRedrawNeeded = true;
+            performAgentNodeCheckpointTraversal();
+            mAgentPhase1Count++;
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    /** Phase-2: one full traversal that records the DisplayList and syncs to RT. */
+    private void agentRecordPhase2() {
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentRecordPhase2");
+        try {
+            // Phase 2 runs with mAgentNoDraw set by the caller: performDraw routes
+            // through syncForAgent (record + RT sync, no GPU draw), which does NOT
+            // call Choreographer.getFrameTimeNanos(), so no frame-in-progress context
+            // is required here.
+            if (mTraversalScheduled) {
+                mTraversalScheduled = false;
+                removeTraversalBarrier();
+            }
+            mAgentLastSyncForAgentValid = false;
+            mAgentLastSyncForAgentResult = -1;
+            mFullRedrawNeeded = true;
+            performAgentNodeCheckpointTraversal();
+            mAgentPhase2Count++;
+        } finally {
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    /**
+     * True if the foreground (main display) has pending frame work this looper is
+     * about to service. Used by the idle-driven settle to yield: when the foreground
+     * has a scheduled frame, the agent defers its next pass so the foreground VSYNC
+     * doFrame runs first.
+     */
+    private boolean agentForegroundHasPendingWork() {
+        // mChoreographer is the shared per-thread instance; if a frame is scheduled on
+        // it, a foreground doFrame is pending. Also honor any pending traversal that is
+        // not our own frozen agent window.
+        return mChoreographer != null && mChoreographer.isFrameScheduledForAgentCheck();
+    }
+
+    /**
+     * Begin an asynchronous, foreground-yielding on-demand observe. Runs at most
+     * {@code vsyncFrames} Phase-1 settle passes — one per main-thread idle slot — then
+     * a single Phase-2 record pass, then invokes {@code onDone} (on the UI thread).
+     *
+     * <p>Unlike {@link #forceTraversalForAgent}, this never blocks the foreground: each
+     * settle pass runs only when the MessageQueue has no due messages, and yields back
+     * to the queue between passes so foreground VSYNC frames are serviced first.
+     *
+     * <p>Must be called on the UI thread.
+     * @hide
+     */
+    public void beginAgentObserve(boolean noDraw, int vsyncFrames, Runnable onDone) {
+        beginAgentObserveInternal(noDraw, Math.max(1, vsyncFrames), 0, false, onDone);
+    }
+
+    /**
+     * Begin a cheap action-to-observation settle. Framework dirty/readiness may end the
+     * window early; {@code timeoutMs} retains the old fixed wait as a hard fallback.
+     * A successful final DisplayList record/sync is followed by traversal-only freeze.
+     *
+     * <p>The caller starts this after action injection has completed. This deliberately
+     * defines readiness as "the action has been consumed and a current UI snapshot is
+     * available", not equality with UI content that may arrive asynchronously later.
+     * @hide
+     */
+    public void beginAgentReadyObserve(boolean noDraw, long timeoutMs, Runnable onDone) {
+        if (!isAgentUi() || mView == null || !mAdded || !mAppVisible
+                || mView.getVisibility() != View.VISIBLE) {
+            if (onDone != null) onDone.run();
+            return;
+        }
+        setAgentTraversalFrozen(false);
+        beginAgentObserveInternal(noDraw, 0, Math.max(1, timeoutMs), true, onDone);
+    }
+
+    private void beginAgentObserveInternal(boolean noDraw, int passBudget, long timeoutMs,
+            boolean freezeOnDone, Runnable onDone) {
+        if (mView == null || !mAdded) {
+            if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: skip (view=" + (mView != null)
+                    + " added=" + mAdded + ")");
+            if (onDone != null) onDone.run();
+            return;
+        }
+        if (mAgentObserveActive) {
+            // Already running; ignore re-entrant request but still release the caller.
+            if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: already active, releasing caller");
+            if (onDone != null) onDone.run();
+            return;
+        }
+        if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: begin noDraw=" + noDraw
+                + " budget=" + passBudget + " timeoutMs=" + timeoutMs
+                + " freezeOnDone=" + freezeOnDone);
+        mAgentObserveActive = true;
+        mAgentObserveNoDraw = noDraw;
+        mAgentObserveBudget = passBudget;
+        mAgentObservePass = 0;
+        mAgentObserveLastTick = mAgentDirtyTick;
+        mAgentObserveStartNanos = System.nanoTime();
+        mAgentObserveTimeoutMs = timeoutMs;
+        mAgentObserveFreezeOnDone = freezeOnDone;
+        mAgentObserveResult = "active";
+        mAgentObserveDurationMs = 0;
+        mAgentObserveOnDone = onDone;
+        mAgentSettled = true;
+        mAgentHasLastHash = false; // reset hash baseline for this observe
+        Trace.asyncTraceBegin(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
+
+        if (mAgentSettleRunnable == null) {
+            mAgentSettleRunnable = this::agentOnSettleStep;
+        }
+        // Post the first pass. Each pass self-continues by re-posting, returning to the
+        // looper between passes so the foreground's doFrame (also a queued message) is
+        // serviced first when due.
+        mHandler.post(mAgentSettleRunnable);
+    }
+
+    /**
+     * One step of the posted-continuation settle. Runs at most one Phase-1 pass, then
+     * either re-posts itself (more passes needed) or records Phase 2 and finishes. Yields
+     * to the foreground by deferring (re-post) when a foreground frame is scheduled.
+     */
+    private void agentOnSettleStep() {
+        if (DEBUG_AGENT) Log.i(mTag, "AgentObserve: step pass=" + mAgentObservePass
+                + " active=" + mAgentObserveActive + " yields=" + mAgentYieldCount);
+        if (!mAgentObserveActive || mView == null || !mAdded) {
+            if (mAgentObserveActive) mAgentObserveResult = "detached";
+            agentFinishObserve();
+            return;
+        }
+        // Yield: if the foreground has a frame scheduled, defer this pass so the
+        // foreground doFrame is serviced first. Re-post with a small delay to avoid a
+        // busy loop while the foreground frame is pending.
+        final boolean deadlineReached = mAgentObserveTimeoutMs > 0
+                && (System.nanoTime() - mAgentObserveStartNanos) / 1_000_000
+                        >= mAgentObserveTimeoutMs;
+        if (agentForegroundHasPendingWork() && !deadlineReached) {
+            mAgentYieldCount++;
+            Trace.instant(Trace.TRACE_TAG_VIEW, "agentYieldToForeground");
+            mHandler.postDelayed(mAgentSettleRunnable, 4);
+            return;
+        }
+        final boolean prevNoDraw = mAgentNoDraw;
+        final boolean prevSkipRecord = mAgentSkipRecord;
+        // The production ready-settle path is intentionally O(1): never enable the
+        // profiling semantic hash even if a previous experiment left hash mode on.
+        final boolean hashMode = mAgentHashStabilityEnabled && mAgentObserveTimeoutMs == 0;
+        boolean done = false;
+        try {
+            // Phase 1 pass. In hash mode, record during settle so the content
+            // fingerprint reflects the current frame.
+            mAgentNoDraw = true;
+            mAgentSkipRecord = !hashMode;
+            agentRunOneSettlePass();
+            mAgentObservePass++;
+
+            final boolean stable;
+            if (hashMode) {
+                stable = agentIsContentStable();
+            } else {
+                stable = (mAgentDirtyTick == mAgentObserveLastTick)
+                        && agentIsFrameworkStable()
+                        && (mAgentObserveTimeoutMs == 0
+                                || (!mTraversalScheduled && !mAgentTraversalScheduled));
+            }
+            mAgentObserveLastTick = mAgentDirtyTick;
+
+            final long elapsedMs = (System.nanoTime() - mAgentObserveStartNanos) / 1_000_000;
+            final boolean timedOut = mAgentObserveTimeoutMs > 0
+                    && elapsedMs >= mAgentObserveTimeoutMs;
+            final boolean budgetExhausted = mAgentObserveBudget > 0
+                    && mAgentObservePass >= mAgentObserveBudget;
+            if (stable || timedOut || budgetExhausted) {
+                // A candidate and both fallback paths publish one final complete DL.
+                // In readiness mode, re-check O(1) framework state after recording:
+                // record callbacks can themselves schedule more UI work.
+                mAgentNoDraw = mAgentObserveNoDraw;
+                mAgentSkipRecord = false;
+                final long beforeRecordTick = mAgentDirtyTick;
+                agentRecordPhase2();
+                final boolean syncReady = mAgentLastSyncForAgentValid
+                        && mAgentLastSyncForAgentResult >= 0
+                        && (mAgentLastSyncForAgentResult
+                                & (SYNC_LOST_SURFACE_REWARD_IF_FOUND
+                                        | SYNC_CONTEXT_IS_STOPPED)) == 0;
+                final boolean quietAfterRecord = mAgentDirtyTick == beforeRecordTick
+                        && agentIsFrameworkStable() && !mTraversalScheduled
+                        && !mAgentTraversalScheduled;
+                final boolean readinessReady = stable && syncReady
+                        && (!mAgentObserveFreezeOnDone || quietAfterRecord);
+
+                if (readinessReady || timedOut || budgetExhausted) {
+                    mAgentSettled = readinessReady;
+                    if (!syncReady) {
+                        mAgentObserveResult = "sync_failed";
+                    } else if (readinessReady) {
+                        mAgentObserveResult = "readiness";
+                    } else if (timedOut) {
+                        mAgentObserveResult = "timeout";
+                    } else {
+                        mAgentObserveResult = "budget";
+                    }
+                    if (syncReady && mAgentObserveFreezeOnDone) {
+                        setAgentTraversalFrozen(true);
+                    }
+                    done = true;
+                }
+            }
+        } finally {
+            mAgentNoDraw = prevNoDraw;
+            mAgentSkipRecord = prevSkipRecord;
+        }
+
+        if (done) {
+            agentFinishObserve();
+        } else {
+            // Readiness is sampled at approximately one 60-Hz UI period. This avoids
+            // turning an idle queue into a tight synthetic-frame loop.
+            mHandler.postDelayed(mAgentSettleRunnable,
+                    mAgentObserveTimeoutMs > 0 ? 16 : 0);
+        }
+    }
+
+    private void agentFinishObserve() {
+        if (!mAgentObserveActive) {
+            return;
+        }
+        mAgentObserveActive = false;
+        mAgentObserveDurationMs = (System.nanoTime() - mAgentObserveStartNanos) / 1_000_000;
+        Trace.asyncTraceEnd(Trace.TRACE_TAG_VIEW, "agentObserve", System.identityHashCode(this));
+        final Runnable onDone = mAgentObserveOnDone;
+        mAgentObserveOnDone = null;
+        if (mAgentSettleRunnable != null) {
+            mHandler.removeCallbacks(mAgentSettleRunnable);
+        }
+        if (onDone != null) {
+            onDone.run();
+        }
+    }
+
+    /** O(1) completion marker for the sync-only RenderThread handoff. */
+    void agentOnSyncForAgentComplete(boolean rootDisplayListValid, int syncResult) {
+        mAgentLastSyncForAgentValid = rootDisplayListValid;
+        mAgentLastSyncForAgentResult = syncResult;
+    }
+
+    /**
+     * Returns true if the view tree has no pending traversal/layout work, i.e. the
+     * DisplayList obtained right now reflects a settled UI. Note this does not detect
+     * asynchronous work (network/decode) that has not yet posted back to the UI thread.
+     * @hide
+     */
+    public boolean isViewTreeStable() {
+        return !mTraversalScheduled && !mLayoutRequested && !mIsInTraversal
+                && (mAttachInfo == null || mAttachInfo.mPendingAnimatingRenderNodes == null
+                        || mAttachInfo.mPendingAnimatingRenderNodes.isEmpty());
+    }
+
+    /**
+     * Freeze/unfreeze only this agent window's real-VSYNC-driven traversal scheduling.
+     * Unlike {@link #setAgentFrozen}, this method does not destroy HardwareRenderer
+     * content. It exists for the CPU scheduling experiment where GPU-resource release
+     * and reconstruction would be a confounding variable.
+     * @hide
+     */
+    public void setAgentTraversalFrozen(boolean frozen) {
+        if (frozen && !isAgentUi()) {
+            return;
+        }
+        if (mAgentFrozen == frozen) {
+            return;
+        }
+        mAgentFrozen = frozen;
+        if (!frozen) {
+            scheduleTraversals();
+        }
+    }
+
+    /**
+     * Freeze/unfreeze this window's real-VSYNC-driven self-rendering. Only honored on
+     * agent displays (never the main display 0) so the user's UI is never frozen. While
+     * frozen, scheduleTraversals() is a no-op (the app stops rendering this window on
+     * VSYNC, zero GPU); the agent advances the DisplayList on demand via
+     * forceTraversalForAgent(). Unfreezing schedules a traversal to resume normal rendering.
+     * Must be called on the UI thread.
+     * @hide
+     */
+    public void setAgentFrozen(boolean frozen) {
+        if (frozen && !isAgentUi()) {
+            return; // never freeze a main (user) UI window
+        }
+        if (mAgentFrozen == frozen) {
+            return;
+        }
+        mAgentFrozen = frozen;
+        if (frozen) {
+            // Agent-UI-only GPU memory release. When an agent window freezes it
+            // will not render until unfrozen, so its GPU-resident resources
+            // (this window's HardwareLayers, prefetched layers, pinned images)
+            // are dead weight. clearContent() -> nDestroyHardwareResources is
+            // PER-CONTEXT (this window's RenderProxy only); it must NOT be
+            // confused with the static HardwareRenderer.trimMemory()/trimCaches()
+            // which are process-global and would harm a co-process user UI
+            // (C1 foreground+VD shared process). Re-assert the agent-UI guard
+            // so this can never run for the user's display-0 window.
+            if (isAgentUi() && mAttachInfo != null
+                    && mAttachInfo.mThreadedRenderer != null) {
+                try {
+                    mAttachInfo.mThreadedRenderer.clearContent();
+                } catch (Throwable t) {
+                    // best-effort; freezing must still succeed
+                }
+            }
+        } else {
+            scheduleTraversals();
+        }
+    }
+
+    /**
+     * Layer 1: whether decoupled (foreground-yielding) traversal is currently active
+     * for this window. Defaults ON for any agent UI (window property, follows derived
+     * windows); a manual override can force it on/off for experiments (e.g. B-GUI
+     * forces it OFF to use the original VSYNC-bound path).
+     * @hide
+     */
+    public boolean isAgentDecoupleActive() {
+        // Preserve the legacy first-frame input-geometry bootstrap. Managed
+        // observations can record DisplayLists independently of this pixel guard.
+        if (!mAgentHasDrawnOnce) {
+            return false;
+        }
+        switch (mAgentDecoupleOverride) {
+            case AGENT_DECOUPLE_ON:  return isAgentUi();
+            case AGENT_DECOUPLE_OFF: return false;
+            default: return mAgentRenderingConfig.decouple && isAgentUi();
+        }
+    }
+
+    /**
+     * Layer 1 manual override. {@code enabled==true} forces decouple on (agent UI only),
+     * {@code false} forces it off (used by B-GUI to keep the VSYNC-bound traversal).
+     * To return to the default window-property behavior use {@link #setAgentDecoupleAuto()}.
+     * No-op-on-effect for a main (user) UI window, which is never decoupled.
+     * @hide
+     */
+    public void setAgentDecoupleEnabled(boolean enabled) {
+        updateAgentRenderingConfig(true, enabled);
+    }
+
+    /**
+     * Layer 1: clear the manual override and return to the default (auto = on for
+     * agent UIs).
+     * @hide
+     */
+    public void setAgentDecoupleAuto() {
+        setAgentDecoupleEnabled(AgentRenderingConfig.DEFAULT.decouple);
+    }
+
+    /**
+     * Layer 3: enable/disable DL semantic-hash stability detection for on-demand
+     * settle. When enabled, settle passes record the DisplayList and the loop exits
+     * when the agent-consumable content fingerprint repeats (settles spinner/periodic
+     * pages); when disabled, framework dirty-flag stability is used.
+     * @hide
+     */
+    public void setAgentHashStabilityEnabled(boolean enabled) {
+        mAgentHashStabilityEnabled = enabled;
+    }
+
+    /**
+     * Whether this agent window currently skips rasterisation.
+     *
+     * @hide
+     */
+    public boolean isAgentPersistentNoDrawActive() {
+        // Preserve the legacy first-frame input-geometry bootstrap.
+        if (!mAgentHasDrawnOnce) {
+            return false;
+        }
+        switch (mAgentPersistentNoDrawOverride) {
+            case AGENT_NODRAW_ON:  return isAgentUi();
+            case AGENT_NODRAW_OFF: return false;
+            default:
+                return mAgentRenderingConfig.noDraw && isAgentUi();
+        }
+    }
+
+    /**
+     * Set persistent GPU bypass for current and future agent roots on this display.
+     * Application-thread notifications update existing roots; physical roots ignore it.
+     * Independent traversal freeze and managed update windows remain in effect.
+     * @hide
+     */
+    public void setAgentPersistentNoDraw(boolean enabled) {
+        updateAgentRenderingConfig(false, enabled);
+    }
+
+    private void updateAgentRenderingConfig(boolean decouple, boolean enabled) {
+        checkThread();
+        if (!isAgentUi()) return;
+        final int displayId = getDisplayId();
+        sAgentRenderingConfigs.compute(displayId, (id, previous) -> {
+            AgentRenderingConfig old = previous != null ? previous : AgentRenderingConfig.DEFAULT;
+            return decouple ? new AgentRenderingConfig(enabled, old.noDraw)
+                    : new AgentRenderingConfig(old.decouple, enabled);
+        });
+        WindowManagerGlobal.getInstance().refreshAgentRenderingConfig(displayId);
+    }
+
+    // Called on this root's thread, including for dialogs on the selected display.
+    // Read the latest value when a posted notification runs, never replay stale settings.
+    void refreshAgentRenderingConfig() {
+        checkThread();
+        if (!isAgentUi()) return;
+        final AgentRenderingConfig old = mAgentRenderingConfig;
+        final AgentRenderingConfig next = sAgentRenderingConfigs.getOrDefault(
+                getDisplayId(), AgentRenderingConfig.DEFAULT);
+        mAgentRenderingConfig = next;
+        mAgentDecoupleOverride = AGENT_DECOUPLE_AUTO;
+        mAgentPersistentNoDrawOverride = AGENT_NODRAW_AUTO;
+        if (old.decouple != next.decouple && (mTraversalScheduled || mAgentTraversalScheduled)) {
+            unscheduleTraversals();
+            scheduleTraversals();
+        }
+        if (old.noDraw == next.noDraw) return;
+        if (next.noDraw) {
+            // Release this window's GPU-resident resources now; dead weight while we
+            // never rasterize. PER-CONTEXT (this window's RenderProxy only), agent-UI
+            // guarded -- never the static process-global trim.
+            if (isAgentUi() && mAttachInfo != null
+                    && mAttachInfo.mThreadedRenderer != null) {
+                try {
+                    mAttachInfo.mThreadedRenderer.clearContent();
+                } catch (Throwable t) {
+                    // best-effort
+                }
+            }
+        }
+        // Re-record after clearing resources, or repaint when leaving bypass.
+        // A separate traversal freeze/update window remains under caller control.
+        mFullRedrawNeeded = true;
+        invalidate();
+    }
+
+    /**
+     * Follow the latest rendering configuration for this agent display.
+     * @hide
+     */
+    public void setAgentPersistentNoDrawAuto() {
+        checkThread();
+        refreshAgentRenderingConfig();
+    }
+
+    /**
+     * Whether this window belongs to an agent UI (launched by an agent via the
+     * agent-display API), as opposed to a main UI (user-launched). Layer-1 callback
+     * rerouting, freeze, and on-demand observe all key off this. The classification
+     * follows the framework-owned launch origin assigned when the window is added.
+     * This is a scheduling identity, not an action-authorization decision.
+     * @hide
+     */
+    public boolean isAgentUi() {
+        return mAdded && mIsAgentUi;
+    }
+
+    /**
+     * Returns agent profiling stats as a compact JSON object:
+     * {"settled":bool,"phase1_traversals":N,"phase2_traversals":N}
+     * settled=true  → last forceTraversalForAgent exited via early-break (view tree stable)
+     * settled=false → ran out of vsyncFrames budget (perpetual animation or too few frames)
+     * phase1_traversals → cumulative measure+layout-only passes since last resetAgentStats()
+     * phase2_traversals → cumulative full-record passes since last resetAgentStats()
+     * @hide
+     */
+    public String getAgentStatsJson() {
+        return "{\"window_id\":\"ViewRootImpl@"
+                + Integer.toHexString(System.identityHashCode(this)) + "\""
+                + ",\"display\":" + getDisplayId()
+                + ",\"agent_ui\":" + isAgentUi()
+                + ",\"host_visibility\":" + getHostVisibility()
+                + ",\"has_view\":" + (mView != null)
+                + ",\"added\":" + mAdded
+                + ",\"in_traversal\":" + mIsInTraversal
+                + ",\"has_drawn_once\":" + mAgentHasDrawnOnce
+                + ",\"traversal_scheduled\":" + mTraversalScheduled
+                + ",\"agent_traversal_scheduled\":" + mAgentTraversalScheduled
+                + ",\"checkpoint_ownership_violations\":"
+                + mChoreographer.getSecondUiCheckpointOwnershipViolations()
+                + ",\"second_ui_managed\":" + (mSecondUiOwner != null && mSecondUiOwner.managedFrames)
+                + ",\"second_ui_window_open\":" + mSecondUiWindow.isOpen()
+                + ",\"second_ui_observations_completed\":" + mSecondUiObservationsCompleted
+                + ",\"second_ui_observation_budget_exhaustions\":" + mSecondUiObservationBudgetExhaustions
+                + ",\"second_ui_last_observation_passes\":" + mSecondUiLastObservationPasses
+                + ",\"second_ui_last_observation_settled\":" + mSecondUiLastObservationSettled
+                + ",\"pixel_draw_attempts\":" + mAgentPixelDrawAttempts
+                + ",\"sync_only_draws\":" + mAgentSyncOnlyDraws
+                + ",\"frozen\":" + mAgentFrozen
+                + ",\"computer_control_flags\":" + mComputerControlFlags
+                + ",\"persistent_nodraw\":" + isAgentPersistentNoDrawActive()
+                + ",\"persistent_nodraw_override\":" + mAgentPersistentNoDrawOverride
+                + ",\"decouple\":" + isAgentDecoupleActive()
+                + ",\"decouple_override\":" + mAgentDecoupleOverride
+                + ",\"deferred_traversals\":" + mAgentDeferredCount
+                + ",\"hash_stability\":" + mAgentHashStabilityEnabled
+                + ",\"last_hash\":\"" + Long.toHexString(mAgentLastSemanticHash) + "\""
+                + ",\"settled\":" + mAgentSettled
+                + ",\"phase1_traversals\":" + mAgentPhase1Count
+                + ",\"phase2_traversals\":" + mAgentPhase2Count
+                + ",\"yield_count\":" + mAgentYieldCount
+                + ",\"node_checkpoints\":" + mAgentNodeCheckpointCount
+                + ",\"checkpoint_frames\":" + mAgentNodeCheckpointFrameCount
+                + ",\"checkpoint_profile\":" + mAgentCheckpointProfile
+                + ",\"checkpoint_no_hit_ns\":" + mAgentCheckpointNoHitNanos
+                + ",\"checkpoint_hit_ns\":" + mAgentCheckpointHitNanos
+                + ",\"checkpoint_dispatch_ns\":" + mAgentCheckpointDispatchNanos
+                + ",\"observe_active\":" + mAgentObserveActive
+                + ",\"observe_result\":\"" + mAgentObserveResult + "\""
+                + ",\"observe_duration_ms\":" + mAgentObserveDurationMs
+                + ",\"observe_timeout_ms\":" + mAgentObserveTimeoutMs
+                + ",\"observe_passes\":" + mAgentObservePass
+                + ",\"last_sync_valid\":" + mAgentLastSyncForAgentValid
+                + ",\"last_sync_result\":" + mAgentLastSyncForAgentResult
+                + ",\"dl_profile\":" + getAgentDlProfileJson() + "}";
+    }
+
+    private String getAgentDlProfileJson() {
+        final StringBuilder out = new StringBuilder(512 + mAgentDlProfileSampleCount * 96);
+        out.append("{\"enabled\":").append(mAgentDlProfileEnabled)
+                .append(",\"armed\":").append(mAgentDlProfileArmed)
+                .append(",\"action_active\":").append(mAgentDlProfileActionActive)
+                .append(",\"terminal_delivered\":")
+                .append(mAgentDlProfileTerminalDelivered)
+                .append(",\"action_generation\":")
+                .append(mAgentDlProfileActionGeneration)
+                .append(",\"record_generation\":")
+                .append(mAgentDlProfileRecordGeneration)
+                .append(",\"active_generation\":")
+                .append(mAgentDlProfileActiveGeneration)
+                .append(",\"last_sync_result\":")
+                .append(mAgentDlProfileLastSyncResult)
+                .append(",\"ready_at_us\":").append(mAgentDlProfileReadyAtUs)
+                .append(",\"quiet1_at_us\":").append(mAgentDlProfileQuiet1AtUs)
+                .append(",\"quiet2_at_us\":").append(mAgentDlProfileQuiet2AtUs)
+                .append(",\"record_count\":").append(mAgentDlProfileRecordCount)
+                .append(",\"record_total_ns\":")
+                .append(mAgentDlProfileRecordDurationTotalNanos)
+                .append(",\"sync_count\":").append(mAgentDlProfileSyncCount)
+                .append(",\"sync_total_ns\":").append(mAgentDlProfileSyncDurationTotalNanos)
+                .append(",\"semantic_count\":").append(mAgentDlProfileSemanticCount)
+                .append(",\"semantic_total_ns\":")
+                .append(mAgentDlProfileSemanticDurationTotalNanos)
+                .append(",\"bookkeeping_total_ns\":")
+                .append(mAgentDlProfileBookkeepingDurationTotalNanos)
+                .append(",\"sample_columns\":[\"time_us\",\"action_gen\",\"record_gen\","
+                        + "\"active_gen\",\"recorded_nodes\",\"node_sketch\",\"dirty_tick\","
+                        + "\"root_id\",\"readiness_mask\",\"quiet_slots\",\"semantic_hash\","
+                        + "\"record_ns\",\"sync_ns\",\"semantic_ns\",\"sync_result\"],"
+                        + "\"samples\":[");
+        if (mAgentDlProfileSamples != null) {
+            final int start = (mAgentDlProfileSampleWrite - mAgentDlProfileSampleCount
+                    + AGENT_DL_PROFILE_SAMPLE_CAPACITY) % AGENT_DL_PROFILE_SAMPLE_CAPACITY;
+            for (int i = 0; i < mAgentDlProfileSampleCount; i++) {
+                if (i != 0) out.append(',');
+                final int slot = (start + i) % AGENT_DL_PROFILE_SAMPLE_CAPACITY;
+                final int base = slot * AGENT_DL_PROFILE_SAMPLE_STRIDE;
+                out.append('[');
+                for (int j = 0; j < AGENT_DL_PROFILE_SAMPLE_STRIDE; j++) {
+                    if (j != 0) out.append(',');
+                    out.append(mAgentDlProfileSamples[base + j]);
+                }
+                out.append(']');
+            }
+        }
+        return out.append("]}").toString();
+    }
+
+    /**
+     * Reset per-window agent profiling counters. Called when agent passes 'reset'
+     * subparam to 'dumpsys gfxinfo ... displaylist fresh reset'.
+     * @hide
+     */
+    public void resetAgentStats() {
+        mAgentPhase1Count = 0;
+        mAgentPhase2Count = 0;
+        mAgentSettled = false;
+        mAgentYieldCount = 0;
+        mAgentDeferredCount = 0;
+        mAgentNodeCheckpointCount = 0;
+        mAgentNodeCheckpointFrameCount = 0;
+        mAgentCheckpointNoHitNanos = 0;
+        mAgentCheckpointHitNanos = 0;
+        mAgentCheckpointDispatchNanos = 0;
+        mAgentObserveResult = "idle";
+        mAgentObserveDurationMs = 0;
+        mAgentObserveTimeoutMs = 0;
+        mAgentObservePass = 0;
+        mAgentLastSyncForAgentValid = false;
+        mAgentLastSyncForAgentResult = -1;
+        resetAgentDlProfileStats();
+    }
+
+    private void resetAgentDlProfileStats() {
+        mAgentDlProfileArmed = false;
+        mAgentDlProfileActionActive = false;
+        mAgentDlProfileTerminalDelivered = false;
+        mAgentDlProfileRecordPassActive = false;
+        mAgentDlProfilePendingSync = false;
+        mAgentDlProfileActionGeneration = 0;
+        mAgentDlProfileActionStartNanos = 0;
+        mAgentDlProfileTerminalRecordGeneration = 0;
+        mAgentDlProfileRecordGeneration = 0;
+        mAgentDlProfileActiveGeneration = 0;
+        mAgentDlProfileActiveRecordGeneration = 0;
+        mAgentDlProfileLastRecordDurationNanos = 0;
+        mAgentDlProfileLastSyncDurationNanos = 0;
+        mAgentDlProfileRecordDurationTotalNanos = 0;
+        mAgentDlProfileSyncDurationTotalNanos = 0;
+        mAgentDlProfileSemanticDurationTotalNanos = 0;
+        mAgentDlProfileBookkeepingDurationTotalNanos = 0;
+        mAgentDlProfileRecordCount = 0;
+        mAgentDlProfileSyncCount = 0;
+        mAgentDlProfileSemanticCount = 0;
+        mAgentDlProfilePassRecordedNodes = 0;
+        mAgentDlProfilePassNodeSketch = 0;
+        mAgentDlProfileActiveRecordedNodes = 0;
+        mAgentDlProfileActiveNodeSketch = 0;
+        mAgentDlProfileActiveDirtyTick = 0;
+        mAgentDlProfileActiveRootId = 0;
+        mAgentDlProfileActiveRootValid = false;
+        mAgentDlProfileLastSyncResult = 0;
+        mAgentDlProfileLastSemanticHash = 0;
+        mAgentDlProfileHasSemanticHash = false;
+        mAgentDlProfileLastSampleDirtyTick = mAgentDirtyTick;
+        mAgentDlProfileLastSampleRootId = 0;
+        mAgentDlProfileQuietSlots = 0;
+        mAgentDlProfileReadyAtUs = -1;
+        mAgentDlProfileQuiet1AtUs = -1;
+        mAgentDlProfileQuiet2AtUs = -1;
+        mAgentDlProfileSampleCount = 0;
+        mAgentDlProfileSampleWrite = 0;
     }
 
     private void applyKeepScreenOnFlag(WindowManager.LayoutParams params) {
@@ -3919,6 +5593,23 @@ public final class ViewRootImpl implements ViewParent,
     int dipToPx(int dip) {
         final DisplayMetrics displayMetrics = mContext.getResources().getDisplayMetrics();
         return (int) (displayMetrics.density * dip + 0.5f);
+    }
+
+    /** Deferred traversals use the explicit agent frame clock. */
+    private void performTraversalsTraced() {
+        final long frameTimeNanos = mAgentTraversalActive
+                ? mAgentTraversalFrameInfo.frameInfo[FrameInfo.VSYNC] : System.nanoTime();
+        performTraversalsTraced(frameTimeNanos);
+    }
+
+    /** Attribute tree work without replacing Android 17's traversal timing. */
+    private void performTraversalsTraced(long frameTimeNanos) {
+        final boolean tracing = Trace.isTagEnabled(Trace.TRACE_TAG_VIEW);
+        if (tracing) Trace.traceBegin(Trace.TRACE_TAG_VIEW,
+                "SecondUiTraversal " + (mIsAgentUi ? "agent" : "user")
+                + " display=" + getDisplayId());
+        try { performTraversals(frameTimeNanos); }
+        finally { if (tracing) Trace.traceEnd(Trace.TRACE_TAG_VIEW); }
     }
 
     private void performTraversals(long frameTimeNanos) {
@@ -5938,7 +7629,37 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     private boolean performDraw(@Nullable SurfaceSyncGroup surfaceSyncGroup) {
+        applyComputerControlRendering();
         mLastPerformDrawSkippedReason = null;
+        if (mAgentSkipRecord) {
+            // Phase 1 of dual-phase agent traversal: measure+layout done, skip record entirely.
+            return true;
+        }
+        if (mAgentNoDraw || isAgentPersistentNoDrawActive()) {
+            // Agent no-draw path: record the DisplayList and sync staging->active on the
+            // RenderThread, but skip the GPU draw. Works even when the display is STATE_OFF
+            // or the surface is unbound, so we deliberately bypass the screen_off guard below.
+            //
+            // Two ways to enter here:
+            //   mAgentNoDraw                    -- transient, set for the duration of one
+            //                                      on-demand forceTraversalForAgent() frame.
+            //   isAgentPersistentNoDrawActive() -- persistent GPU bypass: ANY traversal
+            //                                      (incl. the app's own real-VSYNC frames
+            //                                      while unfrozen) skips the GPU draw. AUTO
+            //                                      = isAgentUi(), so it applies to every
+            //                                      agent-UI window automatically, including
+            //                                      sub-activities navigated to after task
+            //                                      start. Never the user's display-0 window.
+            if (mView != null && mAttachInfo.mThreadedRenderer != null) {
+                // ViewGroup passes this timestamp to legacy View animations while recording.
+                // draw() normally advances it; the sync-only path must do so as well.
+                // An agent observation may run outside a Choreographer frame callback.
+                mAttachInfo.mDrawingTime = SystemClock.uptimeMillis();
+                mAttachInfo.mThreadedRenderer.syncForAgent(mView, mAttachInfo, this);
+                mAgentSyncOnlyDraws++;
+            }
+            return true;
+        }
         if (mAttachInfo.mDisplayState == Display.STATE_OFF && !mReportNextDraw) {
             mLastPerformDrawSkippedReason = "screen_off";
             if (!mLastDrawScreenOff) {
@@ -5968,8 +7689,15 @@ public final class ViewRootImpl implements ViewParent,
 
         try {
             usingAsyncReport = draw(fullRedrawNeeded, surfaceSyncGroup, mSyncBuffer);
+            if (isAgentUi()) mAgentPixelDrawAttempts++;
             if (mAttachInfo.mThreadedRenderer != null && !usingAsyncReport) {
                 mAttachInfo.mThreadedRenderer.setFrameCallback(null);
+            }
+            // This window has now completed at least one real draw, so its DisplayList
+            // is built. Persistent no-draw may safely skip subsequent draws for an
+            // agent UI (see isAgentPersistentNoDrawActive()).
+            if (!mAgentHasDrawnOnce && isAgentUi()) {
+                mAgentHasDrawnOnce = true;
             }
         } finally {
             mIsDrawing = false;
@@ -7712,7 +9440,8 @@ public final class ViewRootImpl implements ViewParent,
                     }
                     mIsHardwareRendererOutputDisabled = disabled;
                     if (mAttachInfo.mThreadedRenderer != null) {
-                        mAttachInfo.mThreadedRenderer.setRendererDrawingEnabled(!disabled);
+                        mAttachInfo.mThreadedRenderer.setRendererDrawingEnabled(
+                                !disabled && isSecondUiRendererOutputAllowed());
                         if (!disabled) {
                             invalidate();
                             mAttachInfo.mThreadedRenderer.invalidateRoot();
@@ -10917,6 +12646,9 @@ public final class ViewRootImpl implements ViewParent,
 
     void doDie() {
         checkThread();
+        if (mSecondUiOwner != null) mSecondUiOwner.destroy();
+        mHandler.removeCallbacks(mSecondUiTrigger);
+        SecondUiMainScheduler.get().removeTraversal(this);
         if (LOCAL_LOGV) Log.v(mTag, "DIE in " + this + " of " + mSurface);
         synchronized (this) {
             if (mRemoved) {
@@ -10968,6 +12700,9 @@ public final class ViewRootImpl implements ViewParent,
         handleSyncRequestWhenNoAsyncDraw(mActiveSurfaceSyncGroup, mHasPendingTransactions,
                 mPendingTransaction, "shutting down VRI");
         mHasPendingTransactions = false;
+        // Also cover roots that never reached mAdded/dispatchDetachedFromWindow.
+        // Only this root's recorded barrier/callbacks are removed.
+        unscheduleTraversals();
         WindowManagerGlobal.getInstance().doRemoveView(this);
     }
 
@@ -11293,6 +13028,7 @@ public final class ViewRootImpl implements ViewParent,
     private void deliverInputEvent(QueuedInputEvent q) {
         Trace.asyncTraceBegin(Trace.TRACE_TAG_VIEW, "deliverInputEvent",
                 q.mEvent.getId());
+        agentDlProfileOnInputDispatched(q.mEvent);
 
         if (Trace.isTagEnabled(Trace.TRACE_TAG_VIEW)) {
             Trace.traceBegin(Trace.TRACE_TAG_VIEW, "deliverInputEvent src=0x"
@@ -11347,6 +13083,7 @@ public final class ViewRootImpl implements ViewParent,
     private void finishInputEvent(QueuedInputEvent q) {
         Trace.asyncTraceEnd(Trace.TRACE_TAG_VIEW, "deliverInputEvent",
                 q.mEvent.getId());
+        agentDlProfileOnInputFinished(q.mEvent);
 
         if (q.mReceiver != null) {
             boolean handled = (q.mFlags & QueuedInputEvent.FLAG_FINISHED_HANDLED) != 0;
@@ -11407,8 +13144,8 @@ public final class ViewRootImpl implements ViewParent,
         // scheduling it again.
         if (!mConsumeBatchedInputScheduled && !mConsumeBatchedInputImmediatelyScheduled) {
             mConsumeBatchedInputScheduled = true;
-            mChoreographer.postVsyncCallback(Choreographer.CALLBACK_INPUT,
-                    mConsumedBatchedInputCallback);
+            mChoreographer.postVsyncCallbackForSecondUi(Choreographer.CALLBACK_INPUT,
+                    mConsumedBatchedInputCallback, getSecondUiOwner());
             if (mAttachInfo.mThreadedRenderer != null) {
                 mAttachInfo.mThreadedRenderer.notifyCallbackPending();
             }
@@ -11638,7 +13375,12 @@ public final class ViewRootImpl implements ViewParent,
 
         private void postIfNeededLocked() {
             if (!mPosted) {
-                mChoreographer.postCallback(Choreographer.CALLBACK_ANIMATION, this, null);
+                // This runnable belongs to this root, including when a worker calls
+                // View.postInvalidateOnAnimation(). Read the already assigned owner;
+                // creating one here would touch Main-thread state from that worker.
+                mChoreographer.postCallbackDelayedForSecondUi(
+                        Choreographer.CALLBACK_ANIMATION, this, null, 0,
+                        peekSecondUiOwner());
                 mPosted = true;
             }
         }
@@ -14754,7 +16496,8 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     public boolean isDisablingViewAnimationsRequested() {
-        return mIsDisablingViewAnimationsRequested;
+        return mIsDisablingViewAnimationsRequested
+                || (getComputerControlRenderingFlags() & 1) != 0;
     }
 
     /**

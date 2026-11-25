@@ -432,6 +432,10 @@ final class ActivityRecord extends WindowToken {
     final String packageName;
     // the intent component, or target of an alias.
     final ComponentName mActivityComponent;
+
+    // Assigned once at launch; navigation inherits the same registered root identity.
+    boolean mSecondUiOriginAssigned;
+    SecondUiOriginRegistry.Origin mSecondUiOrigin;
     // Input application handle used by the input dispatcher.
     private InputApplicationHandle mInputApplicationHandle;
 

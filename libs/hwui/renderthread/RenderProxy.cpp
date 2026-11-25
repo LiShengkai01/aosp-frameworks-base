@@ -238,6 +238,10 @@ int RenderProxy::syncAndDrawFrame() {
     return mDrawFrameTask.drawFrame();
 }
 
+void RenderProxy::setSyncOnlyNextFrame() {
+    mDrawFrameTask.setSyncOnlyNextFrame();
+}
+
 void RenderProxy::destroy() {
     // destroyCanvasAndSurface() needs a fence as when it returns the
     // underlying BufferQueue is going to be released from under
@@ -366,6 +370,22 @@ void RenderProxy::dumpProfileInfo(int fd, int dumpFlags) {
             mContext->resetFrameStats();
         }
     });
+}
+
+void RenderProxy::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                                  int surfaceInsetX, int surfaceInsetY) {
+    mRenderThread.queue().runSync([&]() {
+        mContext->dumpDisplayList(
+                fd, surfaceOriginX, surfaceOriginY, surfaceInsetX, surfaceInsetY);
+    });
+}
+
+uint64_t RenderProxy::computeSemanticHash() {
+    uint64_t result = 0;
+    mRenderThread.queue().runSync([&]() {
+        result = mContext->computeSemanticHash();
+    });
+    return result;
 }
 
 void RenderProxy::resetProfileInfo() {

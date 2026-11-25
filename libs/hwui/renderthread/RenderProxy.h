@@ -118,6 +118,7 @@ public:
     void setRenderSdrHdrRatio(float ratio);
     int64_t* frameInfo();
     void forceDrawNextFrame();
+    void setSyncOnlyNextFrame();
     int syncAndDrawFrame();
     void destroy();
 
@@ -145,6 +146,9 @@ public:
     void notifyGpuLoadUp();
 
     void dumpProfileInfo(int fd, int dumpFlags);
+    void dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                         int surfaceInsetX, int surfaceInsetY);
+    uint64_t computeSemanticHash();
     // Not exported, only used for testing
     void resetProfileInfo();
     uint32_t frameTimePercentile(int p);
@@ -171,7 +175,6 @@ public:
     void addFrameMetricsObserver(sp<FrameMetricsObserver>&& observer);
     void removeFrameMetricsObserver(sp<FrameMetricsObserver>&& observer);
     void setForceDark(ForceDarkType type);
-    void setDrawingEnabled(bool enabled);
 
     static void copySurfaceInto(ANativeWindow* window, std::shared_ptr<CopyRequest>&& request);
     static void prepareToDraw(Bitmap& bitmap);
@@ -183,6 +186,7 @@ public:
 
     static int preload();
 
+    void setDrawingEnabled(bool enabled);
     static void setRtAnimationsEnabled(bool enabled);
 
     void setRtAnimationsEnabledForContext(bool enabled);

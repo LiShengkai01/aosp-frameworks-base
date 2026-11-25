@@ -102,6 +102,7 @@ public:
     void discardStagingDisplayList();
 
     void output();
+    void exportDisplayList(std::ostream& output, uint32_t level) const;
     int getUsageSize();
     int getAllocatedSize();
 
@@ -266,6 +267,7 @@ private:
     DisplayList mStagingDisplayList;
 
     int64_t mDamageGenerationId = 0;
+    bool mLayerUpdateDeferred = false;
 
     friend class AnimatorManager;
     AnimatorManager mAnimatorManager;

@@ -52,6 +52,7 @@ import static android.content.pm.ActivityInfo.DOCUMENT_LAUNCH_ALWAYS;
 import static android.content.pm.ActivityInfo.FLAG_SHOW_FOR_ALL_USERS;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_INSTANCE_PER_TASK;
+import static android.content.pm.ActivityInfo.LAUNCH_MULTIPLE;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_TASK;
 import static android.content.pm.ActivityInfo.LAUNCH_SINGLE_TOP;
 import static android.content.pm.ActivityInfo.launchModeToString;
@@ -2862,9 +2863,36 @@ class ActivityStarter {
 
         mLaunchMode = r.launchMode;
 
+        // Isolate an agent entry from user tasks. Navigation from a valid agent
+        // source keeps its task unless the application explicitly requests a new one.
+        final int preferredDisplayId = mPreferredTaskDisplayArea != null
+                ? mPreferredTaskDisplayArea.getDisplayId() : -1;
+        mService.assignSecondUiOriginLocked(r, sourceRecord, preferredDisplayId);
+        final boolean isAgent =
+                mService.isSecondUiActivityOnDisplayLocked(r, preferredDisplayId);
+        final boolean inheritsAgentTask = isAgent && sourceRecord != null
+                && sourceRecord.getDisplayId() == preferredDisplayId
+                && sourceRecord.mSecondUiOrigin == r.mSecondUiOrigin
+                && mService.isSecondUiActivityOnDisplayLocked(sourceRecord, preferredDisplayId);
+        Slog.i("AgentDisplay", "setInitialState: activity=" + r.shortComponentName
+                + " displayId=" + preferredDisplayId + " isAgent=" + isAgent
+                + " origLaunchMode=" + r.launchMode);
+        if (isAgent) {
+            mLaunchMode = LAUNCH_MULTIPLE;
+            Slog.i("AgentDisplay", "Overriding launch mode; inheritsAgentTask="
+                    + inheritsAgentTask);
+        }
+
         mLaunchFlags = adjustLaunchFlagsToDocumentMode(
                 r, LAUNCH_SINGLE_INSTANCE == mLaunchMode,
                 LAUNCH_SINGLE_TASK == mLaunchMode, mIntent.getFlags());
+        if (isAgent && !inheritsAgentTask) {
+            mLaunchFlags |= FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_MULTIPLE_TASK;
+        } else if (isAgent
+                && (mLaunchFlags & (FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_NEW_DOCUMENT)) != 0) {
+            // Respect an explicit new-task request without reusing a user task.
+            mLaunchFlags |= FLAG_ACTIVITY_MULTIPLE_TASK;
+        }
         mLaunchTaskBehind = r.mLaunchTaskBehind
                 && !isLaunchModeOneOf(LAUNCH_SINGLE_TASK, LAUNCH_SINGLE_INSTANCE)
                 && (mLaunchFlags & FLAG_ACTIVITY_NEW_DOCUMENT) != 0;
@@ -3149,6 +3177,13 @@ class ActivityStarter {
         // an explicit task to launch in to, and we can find a task that was started with this
         // same component, then instead of launching bring that one to the front.
         putIntoExistingTask &= mInTask == null && mStartActivity.resultTo == null;
+        // Agent Display exemption: allow new singleTask instance on agent displays.
+        if (putIntoExistingTask && mOptions != null
+                && mOptions.getLaunchDisplayId() != INVALID_DISPLAY
+                && mService.isSecondUiActivityOnDisplayLocked(
+                        mStartActivity, mOptions.getLaunchDisplayId())) {
+            return null;
+        }
         ActivityRecord intentActivity = null;
         if (putIntoExistingTask) {
             if (LAUNCH_SINGLE_INSTANCE == mLaunchMode) {

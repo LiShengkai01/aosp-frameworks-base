@@ -81,6 +81,9 @@ public:
     // TODO: Remove this? Currently this is used to signal to stop preparing
     // textures if we run out of cache space.
     bool prepareTextures;
+    // Synchronize CPU-side drawing commands for an agent observation without
+    // preparing textures, mesh buffers, or hardware layers for rasterization.
+    bool syncOnly = false;
     renderthread::CanvasContext& canvasContext;
     // TODO: buildLayer uses this to suppress running any animations, but this
     // should probably be refactored somehow. The reason this is done is

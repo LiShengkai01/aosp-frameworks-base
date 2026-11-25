@@ -2829,6 +2829,7 @@ class RootWindowContainer extends WindowContainer<DisplayContent>
         }
 
         synchronized (mService.mGlobalLock) {
+            mService.onSecondUiDisplayRemovedLocked(displayId);
             final DisplayContent displayContent = getDisplayContent(displayId);
             if (displayContent == null) {
                 return;

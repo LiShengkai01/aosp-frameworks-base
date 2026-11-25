@@ -54,6 +54,7 @@
 #include "effects/GainmapRenderer.h"
 #include "pipeline/skia/AnimatedDrawables.h"
 #include "pipeline/skia/FunctorDrawable.h"
+#include "pipeline/skia/RenderNodeDrawable.h"
 #include "renderthread/CanvasContext.h"
 
 namespace android {
@@ -360,7 +361,15 @@ struct DrawDrawable final : Op {
     // same content if retained outside the duration of the frame. Therefore we resolve
     // them now and do not allow the canvas to take a reference to the drawable and potentially
     // keep it alive for longer than the frames duration (e.g. SKP serialization).
-    void draw(SkCanvas* c, const SkMatrix&) const { drawable->draw(c, &matrix); }
+    void draw(SkCanvas* c, const SkMatrix&) const {
+        if (skiapipeline::RenderNodeDrawable::isObservationReplay()) {
+            // Observation canvases replay synchronously and do not retain the
+            // drawable. Give them a chance to report external content first.
+            c->drawDrawable(drawable.get(), &matrix);
+        } else {
+            drawable->draw(c, &matrix);
+        }
+    }
 };
 struct DrawPicture final : Op {
     static const auto kType = Type::DrawPicture;
@@ -641,6 +650,12 @@ struct DrawSkMesh final : Op {
     mutable bool isGpuBased;
     mutable GrDirectContext::DirectContextID contextId;
     void draw(SkCanvas* c, const SkMatrix&) const {
+        if (skiapipeline::RenderNodeDrawable::isObservationReplay()) {
+            // The observer has no GPU context. Preserve the mesh command for
+            // explicit reporting instead of uploading buffers during replay.
+            c->drawMesh(cpuMesh, blender, paint);
+            return;
+        }
 #ifdef __ANDROID__
         GrDirectContext* directContext = c->recordingContext()->asDirectContext();
 
@@ -686,7 +701,15 @@ struct DrawMesh final : Op {
     sk_sp<SkBlender> blender;
     SkPaint paint;
 
-    void draw(SkCanvas* c, const SkMatrix&) const { c->drawMesh(mesh.getSkMesh(), blender, paint); }
+    void draw(SkCanvas* c, const SkMatrix&) const {
+        if (skiapipeline::RenderNodeDrawable::isObservationReplay()) {
+            // getSkMesh() requires previously uploaded GPU buffers. G4 may
+            // deliberately omit that work; retain the known region instead.
+            c->drawAnnotation(mesh.getBounds(), "hwui.mesh.shader_required", nullptr);
+            return;
+        }
+        c->drawMesh(mesh.getSkMesh(), blender, paint);
+    }
 
     [[nodiscard]] std::optional<SkRect> getConservativeBounds() const { return mesh.getBounds(); }
 };
@@ -800,7 +823,8 @@ private:
 
 public:
     void draw(SkCanvas* c, const SkMatrix&) const {
-        if (!needsCompositedLayer(c)) {
+        if (skiapipeline::RenderNodeDrawable::isObservationReplay()
+                || !needsCompositedLayer(c)) {
             c->drawDrawable(drawable.get());
             return;
         }

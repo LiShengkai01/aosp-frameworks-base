@@ -119,6 +119,12 @@ public:
         }
     }
 
+    void exportOps(std::ostream& output, uint32_t level) const {
+        if (mImpl) {
+            mImpl->exportOps(output, level);
+        }
+    }
+
     [[nodiscard]] bool hasFunctor() const {
         return mImpl && mImpl->hasFunctor();
     }
@@ -184,6 +190,7 @@ private:
         size_t getUsedSize() const { return 0; }
         size_t getAllocatedSize() const { return 0; }
         void output(std::ostream& output, uint32_t level) const { }
+        void exportOps(std::ostream& output, uint32_t level) const { }
         bool hasFunctor() const { return false; }
         bool prepareListAndChildren(
                 TreeObserver& observer, TreeInfo& info, bool functorsNeedLayer,
@@ -301,6 +308,10 @@ public:
 
     void output(std::ostream& output, uint32_t level) const {
         apply([&](const auto& it) { it.output(output, level); });
+    }
+
+    void exportOps(std::ostream& output, uint32_t level) const {
+        apply([&](const auto& it) { it.exportOps(output, level); });
     }
 
     [[nodiscard]] bool hasFunctor() const {

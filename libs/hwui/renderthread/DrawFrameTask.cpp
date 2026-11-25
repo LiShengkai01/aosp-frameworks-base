@@ -99,13 +99,20 @@ void DrawFrameTask::run() {
     bool canUnblockUiThread;
     bool canDrawThisFrame;
     bool solelyTextureViewUpdates;
+    const bool syncOnly = mSyncOnlyFrame;
+    mSyncOnlyFrame = false;
     {
         TreeInfo info(TreeInfo::MODE_FULL, *mContext);
+        info.syncOnly = syncOnly;
+        if (syncOnly) info.prepareTextures = false;
         info.forceDrawFrame = mForceDrawFrame;
         mForceDrawFrame = false;
         canUnblockUiThread = syncFrameState(info);
         canDrawThisFrame = !info.out.skippedFrameReason.has_value();
         solelyTextureViewUpdates = info.out.solelyTextureViewUpdates;
+
+        // CPU-side staging state has been synchronized; pixel work is deferred.
+        if (syncOnly) canDrawThisFrame = false;
 
         if (mFrameCommitCallback) {
             mContext->addFrameCommitListener(std::move(mFrameCommitCallback));
@@ -144,10 +151,14 @@ void DrawFrameTask::run() {
         // Do a flush in case syncFrameState performed any texture uploads. Since we skipped
         // the draw() call, those uploads (or deletes) will end up sitting in the queue.
         // Do them now
-        if (GrDirectContext* grContext = mRenderThread->getGrContext()) {
-            grContext->flushAndSubmit();
+        if (!syncOnly) {
+            if (GrDirectContext* grContext = mRenderThread->getGrContext()) {
+                grContext->flushAndSubmit();
+            }
         }
 #endif
+        // These are CPU CommonPool futures (e.g. frame callbacks), not a GPU
+        // submission. Preserve their completion ordering for sync-only frames.
         // wait on fences so tasks don't overlap next frame
         context->waitOnFences();
     }
@@ -160,7 +171,7 @@ void DrawFrameTask::run() {
         unblockUiThread();
     }
 
-    if (pipeline->hasHardwareBuffer()) {
+    if (!syncOnly && pipeline->hasHardwareBuffer()) {
         auto fence = pipeline->flush();
         hardwareBufferParams.invokeRenderCallback(std::move(fence), 0);
     }
@@ -175,25 +186,29 @@ bool DrawFrameTask::syncFrameState(TreeInfo& info) {
     int64_t frameInterval = mFrameInfo[static_cast<int>(FrameInfoIndex::FrameInterval)];
     mRenderThread->timeLord().vsyncReceived(vsync, intendedVsync, vsyncId, frameDeadline,
             frameInterval);
-    bool canDraw = mContext->makeCurrent();
-    mContext->unpinImages();
+    bool canDraw = true;
+    if (!info.syncOnly) {
+        canDraw = mContext->makeCurrent();
+        mContext->unpinImages();
+    }
 
 #ifdef __ANDROID__
-    for (size_t i = 0; i < mLayers.size(); i++) {
-        if (mLayers[i]) {
-            mLayers[i]->apply();
+    if (!info.syncOnly) {
+        for (size_t i = 0; i < mLayers.size(); i++) {
+            if (mLayers[i]) mLayers[i]->apply();
         }
     }
 #endif
 
-    mLayers.clear();
+    // Retain deduplicated TextureView updates until pixels are requested.
+    if (!info.syncOnly) mLayers.clear();
     mContext->setContentDrawBounds(mContentDrawBounds);
     mContext->prepareTree(info, mFrameInfo, mSyncQueued, mTargetNode);
 
     // This is after the prepareTree so that any pending operations
     // (RenderNode tree state, prefetched layers, etc...) will be flushed.
     bool hasTarget = mContext->hasOutputTarget();
-    if (CC_UNLIKELY(!hasTarget || !canDraw)) {
+    if (!info.syncOnly && CC_UNLIKELY(!hasTarget || !canDraw)) {
         if (!hasTarget) {
             mSyncResult |= SyncResult::LostSurfaceRewardIfFound;
             info.out.skippedFrameReason = SkippedFrameReason::NoOutputTarget;
@@ -213,7 +228,7 @@ bool DrawFrameTask::syncFrameState(TreeInfo& info) {
         mSyncResult |= SyncResult::FrameDropped;
     }
     // If prepareTextures is false, we ran out of texture cache space
-    return info.prepareTextures;
+    return info.syncOnly || info.prepareTextures;
 }
 
 void DrawFrameTask::unblockUiThread() {

@@ -433,4 +433,8 @@ interface IActivityTaskManager {
      * {@code originalPackageName} if no redirection is found.
      */
     String getDestinationPackage(in String originalPackageName);
+
+    /** Privileged experiment registration. Non-primary displays are not implicitly agent UIs. */
+    void registerAgentDisplay(int displayId);
+    void unregisterAgentDisplay(int displayId);
 }

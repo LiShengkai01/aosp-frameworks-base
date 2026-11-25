@@ -411,6 +411,9 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
     /** The starting activities which are waiting for their processes to attach. */
     final ArrayList<ActivityRecord> mStartingProcessActivities = new ArrayList<>();
 
+    /** Server-owned registration and launch provenance, guarded by mGlobalLock. */
+    final SecondUiOriginRegistry mSecondUiOrigins = new SecondUiOriginRegistry();
+
     /* Global service lock used by the package the owns this service. */
     @SystemServerLock(LockGuard.INDEX_WINDOW)
     final WindowManagerGlobalLock mGlobalLock = new WindowManagerGlobalLock();
@@ -8449,5 +8452,72 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
             sIsPip2ExperimentEnabled = Flags.enablePip2() && (!isTv || Flags.enablePip2OnTv());
         }
         return sIsPip2ExperimentEnabled;
+    }
+
+    private void enforceSecondUiRegistrationPermission() {
+        final int uid = Binder.getCallingUid();
+        if (uid == android.os.Process.ROOT_UID || uid == android.os.Process.SYSTEM_UID
+                || uid == android.os.Process.SHELL_UID) {
+            return;
+        }
+        mContext.enforceCallingOrSelfPermission(MANAGE_ACTIVITY_TASKS,
+                "Second UI display registration");
+    }
+
+    @Override
+    public void registerAgentDisplay(int displayId) {
+        enforceSecondUiRegistrationPermission();
+        synchronized (mGlobalLock) {
+            mSecondUiOrigins.register(secondUiDisplayIdentityLocked(displayId));
+        }
+    }
+
+    @Override
+    public void unregisterAgentDisplay(int displayId) {
+        enforceSecondUiRegistrationPermission();
+        synchronized (mGlobalLock) {
+            mSecondUiOrigins.unregister(displayId);
+        }
+    }
+
+    void onSecondUiDisplayRemovedLocked(int displayId) {
+        mSecondUiOrigins.unregister(displayId);
+    }
+
+    private SecondUiOriginRegistry.DisplayIdentity secondUiDisplayIdentityLocked(int displayId) {
+        if (displayId <= Display.DEFAULT_DISPLAY) return null;
+        final DisplayContent display = mRootWindowContainer.getDisplayContent(displayId);
+        if (display == null) return null;
+        final android.view.DisplayInfo info = display.getDisplayInfo();
+        return new SecondUiOriginRegistry.DisplayIdentity(displayId,
+                info.type == Display.TYPE_VIRTUAL, info.uniqueId, info.ownerUid);
+    }
+
+    /** Valid registration only; neither display != 0 nor a reused ID proves origin. */
+    boolean isAgentDisplay(int displayId) {
+        synchronized (mGlobalLock) {
+            return mSecondUiOrigins.isRegistered(secondUiDisplayIdentityLocked(displayId));
+        }
+    }
+
+    void assignSecondUiOriginLocked(ActivityRecord activity, ActivityRecord source,
+            int preferredDisplayId) {
+        if (activity.mSecondUiOriginAssigned) return;
+        activity.mSecondUiOriginAssigned = true;
+        final int launchingUid = activity.launchedFromUid;
+        final boolean privilegedLauncher = launchingUid == android.os.Process.ROOT_UID
+                || launchingUid == android.os.Process.SYSTEM_UID
+                || launchingUid == android.os.Process.SHELL_UID
+                || mContext.checkPermission(MANAGE_ACTIVITY_TASKS, -1, launchingUid)
+                        == PackageManager.PERMISSION_GRANTED;
+        activity.mSecondUiOrigin = mSecondUiOrigins.inheritOrCreate(
+                source == null ? null : source.mSecondUiOrigin, source != null,
+                secondUiDisplayIdentityLocked(preferredDisplayId), activity.token,
+                launchingUid, privilegedLauncher);
+    }
+
+    boolean isSecondUiActivityOnDisplayLocked(ActivityRecord activity, int displayId) {
+        return activity != null && mSecondUiOrigins.isOriginValid(activity.mSecondUiOrigin,
+                secondUiDisplayIdentityLocked(displayId));
     }
 }

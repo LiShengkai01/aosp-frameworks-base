@@ -969,6 +969,21 @@ public final class MessageQueue {
     }
 
     /**
+     * Whether a message deliverable under the existing barriers is due now.
+     * Only the owning Looper may inspect its delivery order. Does not dequeue a
+     * message or remove a synchronization barrier. New arrivals can follow this
+     * check, so callers must yield after one indivisible operation.
+     * @hide
+     */
+    public boolean hasDueMessageForSecondUi() {
+        if (Looper.myLooper() == null || Looper.myLooper().getQueue() != this) {
+            throw new IllegalStateException("Owning Looper required");
+        }
+        Message next = sUseDeliQueue ? nextMessage(true, true) : legacyPeekOrPoll(true);
+        return next != null && next.when <= SystemClock.uptimeMillis();
+    }
+
+    /**
      * Returns true if the looper has no pending messages which are due to be processed
      * and is not blocked on a sync barrier.
      *

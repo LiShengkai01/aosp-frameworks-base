@@ -1,0 +1,9 @@
+package: "android.app"
+container: "system"
+
+flag {
+    namespace: "system_performance"
+    name: "second_ui_operation_control"
+    description: "Experimental process-local operation contracts, FIFO and tracked work for Second UI."
+    bug: "0"
+}

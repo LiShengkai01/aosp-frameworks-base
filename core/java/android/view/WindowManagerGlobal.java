@@ -33,6 +33,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.res.Configuration;
 import android.content.res.TypedArray;
 import android.graphics.HardwareRenderer;
+import android.graphics.Rect;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
@@ -121,6 +122,8 @@ public final class WindowManagerGlobal {
 
     public static final int ADD_FLAG_IN_TOUCH_MODE = 0x1;
     public static final int ADD_FLAG_APP_VISIBLE = 0x2;
+    /** Framework-assigned UI scheduling identity in the window-add response. */
+    public static final int ADD_FLAG_SECOND_UI = 0x4;
 
     public static final int ADD_OKAY = 0;
     public static final int ADD_BAD_APP_TOKEN = -1;
@@ -236,13 +239,13 @@ public final class WindowManagerGlobal {
                 sWindowManagerService = IWindowManager.Stub.asInterface(
                         ServiceManager.getService("window"));
                 if (currentAnimatorScaleUsesSharedMemory()) {
-                    ValueAnimator.setDurationScale(
+                    getInstance().onAnimatorScaleChanged(
                             ApplicationSharedMemory.getInstance().getCurrentAnimatorScale());
                 } else {
                     // Can be null if this is called before WindowManagerService is initialized.
                     if (sWindowManagerService != null) {
                         try {
-                            ValueAnimator.setDurationScale(
+                            getInstance().onAnimatorScaleChanged(
                                 sWindowManagerService.getCurrentAnimatorScale());
                         } catch (RemoteException e) {
                             throw e.rethrowFromSystemServer();
@@ -672,24 +675,317 @@ public final class WindowManagerGlobal {
         ThreadedRenderer.trimCaches(level);
     }
 
+    // Publish rendering settings to current roots without holding mLock while
+    // executing application-thread work. Future roots inherit the display config.
+    void refreshAgentRenderingConfig(int displayId) {
+        final ViewRootImpl[] roots;
+        synchronized (mLock) { roots = mRoots.toArray(new ViewRootImpl[0]); }
+        for (ViewRootImpl root : roots) {
+            if (root.getDisplayId() != displayId || !root.isAgentUi()) continue;
+            Runnable apply = () -> {
+                if (root.getDisplayId() == displayId) root.refreshAgentRenderingConfig();
+            };
+            if (root.mThread == Thread.currentThread()) apply.run();
+            else root.mHandler.post(apply);
+        }
+    }
+
+    void refreshComputerControlRendering(int displayId) {
+        final ViewRootImpl[] roots;
+        synchronized (mLock) { roots = mRoots.toArray(new ViewRootImpl[0]); }
+        for (ViewRootImpl root : roots) {
+            if (root.getDisplayId() == displayId) {
+                if (root.mThread == Thread.currentThread()) root.applyComputerControlRendering();
+                else root.mHandler.post(root::applyComputerControlRendering);
+            }
+        }
+    }
+
     public void dumpGfxInfo(FileDescriptor fd, String[] args) {
         FileOutputStream fout = new FileOutputStream(fd);
         PrintWriter pw = new FastPrintWriter(fout);
         try {
+            // 'dumpsys gfxinfo <pkg> displaylist fresh [nodraw] [vsync[N]] [reset]':
+            // fresh     -> force on-demand traversal (dual-phase: settle then record)
+            // nodraw    -> skip GPU draw (sync-only, zero GPU/SF)
+            // vsyncN    -> pump up to N synthetic VSYNC frames during Phase 1 settle
+            // freeze    -> freeze agent window (stop real-VSYNC-driven self-rendering)
+            // unfreeze  -> unfreeze agent window
+            // gpubypass -> persistent no-draw: EVERY traversal (incl. app's own VSYNC
+            //              frames while unfrozen) skips GPU draw. Independent of freeze.
+            // nogpubypass-> disable persistent no-draw (resume real drawing)
+            // reset     -> reset per-window agent profiling counters before fresh
+            // agentctl  -> apply controls and return without dumping any state
+            // agentstate-> return compact control state without renderer data
+            // traversalfreeze / traversalunfreeze -> toggle only traversal scheduling;
+            //              unlike freeze, never release/reconstruct GPU resources
+            // dlprofile / nodlprofile -> enable/disable profiling-only DL readiness observer
+            // dlprofilearm -> bind the next touch/key action to a profiling epoch
+            // readysettle -> dirty/readiness early return with readywaitN-ms fallback;
+            //                final record/sync is followed by traversal-only freeze
+            boolean fresh = false, noDraw = false, reset = false;
+            int selectedDisplay = -1; // omitted: legacy all-display read/control scope
+            int ccMode = 0; // 1=pause output, 2=screenshot output, -1=restore
+            long secondPeriod = 0;
+            boolean secondAction = false, secondObserve = false;
+            int vsyncFrames = 0;
+            int freeze = 0; // 0=none, 1=freeze, -1=unfreeze
+            int traversalFreeze = 0; // pure scheduling gate for CPU experiments
+            boolean agentControl = false;
+            boolean agentState = false;
+            boolean asyncSettle = false; // use idle-driven foreground-yielding settle
+            boolean readySettle = false;
+            long readyWaitMs = 2000;
+            int decouple = 0; // 0=none, 1=enable Layer-1, -1=disable
+            int hashStable = 0; // 0=none, 1=enable Layer-3 hash stability, -1=disable
+            int gpuBypass = 0; // 0=none, 1=enable persistent no-draw, -1=disable
+            int dlProfile = 0; // 0=none, 1=enable, -1=disable readiness profiling
+            boolean dlProfileArm = false;
+            for (String arg : args) {
+                if (arg.startsWith("display=")) {
+                    if (selectedDisplay != -1) {
+                        throw new IllegalArgumentException("Duplicate display selector");
+                    }
+                    selectedDisplay = Integer.parseInt(arg.substring(8));
+                    if (selectedDisplay < 0) {
+                        throw new IllegalArgumentException("display must be non-negative");
+                    }
+                }
+                else if (arg.startsWith("secondperiod")) {
+                    secondPeriod = Long.parseLong(arg.substring(12));
+                    if (secondPeriod < 1 || secondPeriod > 60000) {
+                        throw new IllegalArgumentException("secondperiod must be 1..60000 ms");
+                    }
+                }
+                else if ("ccpause".equals(arg)) ccMode = 1;
+                else if ("ccpixels".equals(arg)) ccMode = 2;
+                else if ("ccoff".equals(arg)) ccMode = -1;
+                else if ("secondaction".equals(arg)) secondAction = true;
+                else if ("secondobserve".equals(arg)) secondObserve = true;
+                else if ("agentctl".equals(arg)) agentControl = true;
+                else if ("agentstate".equals(arg)) agentState = true;
+                else if ("fresh".equals(arg)) fresh = true;
+                else if ("nodraw".equals(arg)) noDraw = true;
+                else if ("reset".equals(arg)) reset = true;
+                else if ("freeze".equals(arg)) freeze = 1;
+                else if ("unfreeze".equals(arg)) freeze = -1;
+                else if ("traversalfreeze".equals(arg)) traversalFreeze = 1;
+                else if ("traversalunfreeze".equals(arg)) traversalFreeze = -1;
+                else if ("asyncsettle".equals(arg)) asyncSettle = true;
+                else if ("readysettle".equals(arg)) {
+                    readySettle = true;
+                    asyncSettle = true;
+                    fresh = true;
+                }
+                else if (arg.startsWith("readywait")) {
+                    String n = arg.substring(9);
+                    try { readyWaitMs = Long.parseLong(n); }
+                    catch (NumberFormatException e) { readyWaitMs = 2000; }
+                }
+                else if ("decouple".equals(arg)) decouple = 1;
+                else if ("undecouple".equals(arg)) decouple = -1;
+                else if ("autodecouple".equals(arg)) decouple = 2;
+                else if ("hashstable".equals(arg)) hashStable = 1;
+                else if ("nohashstable".equals(arg)) hashStable = -1;
+                else if ("gpubypass".equals(arg)) gpuBypass = 1;
+                else if ("nogpubypass".equals(arg)) gpuBypass = -1;
+                else if ("dlprofile".equals(arg)) dlProfile = 1;
+                else if ("nodlprofile".equals(arg)) dlProfile = -1;
+                else if ("dlprofilearm".equals(arg)) dlProfileArm = true;
+                else if (arg.startsWith("vsync")) {
+                    String n = arg.substring(5);
+                    try { vsyncFrames = n.isEmpty() ? 3 : Integer.parseInt(n); }
+                    catch (NumberFormatException e) { vsyncFrames = 3; }
+                }
+            }
+            final int targetDisplay = selectedDisplay;
+            if (ccMode != 0) {
+                if (targetDisplay < 1) throw new IllegalArgumentException("Explicit agent display required");
+                final ViewRootImpl[] targets;
+                synchronized (mLock) { targets = mRoots.toArray(new ViewRootImpl[0]); }
+                final int control = ccMode;
+                for (ViewRootImpl root : targets) {
+                    if (root.getDisplayId() == targetDisplay && root.isAgentUi()) {
+                        root.mHandler.runWithScissors(() -> root.configureComputerControlRendering(
+                                control != -1, control == 2), 2000);
+                        break;
+                    }
+                }
+            }
+
+            if (secondPeriod != 0 || secondAction || secondObserve) {
+                final ViewRootImpl[] targets;
+                synchronized (mLock) { targets = mRoots.toArray(new ViewRootImpl[0]); }
+                final long period = secondPeriod;
+                final boolean action = secondAction, observe = secondObserve, pixelsOmitted = noDraw;
+                for (ViewRootImpl root : targets) {
+                    root.mHandler.runWithScissors(() -> {
+                        if (targetDisplay != -1 && root.getDisplayId() != targetDisplay) return;
+                        if (!root.isAgentUi() || root.getView() == null
+                                || root.getHostVisibility() != View.VISIBLE) return;
+                        // Shell config cannot certify an application's synchronous observers.
+                        if (period != 0) root.configureSecondUiExecution(period, false);
+                        // Reject an out-of-order shell request without throwing on app Main.
+                        if (!root.getSecondUiOwner().managedFrames) return;
+                        if (action) root.beginSecondUiAction();
+                        if (observe) root.requestSecondUiObservation(pixelsOmitted, () -> { });
+                    }, 2000);
+                }
+            }
+            if (fresh || freeze != 0 || traversalFreeze != 0 || reset || decouple != 0
+                    || hashStable != 0
+                    || gpuBypass != 0 || dlProfile != 0 || dlProfileArm) {
+                final ViewRootImpl[] roots;
+                synchronized (mLock) {
+                    roots = mRoots.toArray(new ViewRootImpl[0]);
+                }
+                final boolean nd = noDraw;
+                final int vf = vsyncFrames;
+                final int fz = freeze;
+                final int tfz = traversalFreeze;
+                final boolean doFresh = fresh;
+                final boolean doReset = reset;
+                final boolean doAsync = asyncSettle;
+                final boolean doReadySettle = readySettle;
+                // agentctl is a control-plane command. For ready-settle, let it arm
+                // the asynchronous observer and return immediately; callers poll
+                // agentstate and dump the completed DisplayList separately. Waiting
+                // here can exceed ActivityManager's gfxinfo pipe timeout on busy apps.
+                final boolean nonBlockingReadyControl = agentControl && doReadySettle;
+                final long readyTimeoutMs = Math.max(1, readyWaitMs);
+                final int dec = decouple;
+                final int hs = hashStable;
+                final int gb = gpuBypass;
+                final int dlp = dlProfile;
+                final boolean dlpArm = dlProfileArm;
+                for (final ViewRootImpl root : roots) {
+                    try {
+                        if (!root.isAgentUi()
+                                || (targetDisplay != -1 && root.getDisplayId() != targetDisplay)) {
+                            continue;
+                        }
+                        if (doFresh && doAsync) {
+                            // Idle-driven (foreground-yielding) settle. It must NOT run
+                            // inside runWithScissors: that would block the UI thread and
+                            // prevent the MessageQueue from ever going idle (where the
+                            // settle passes run). Post the start and wait bounded on a
+                            // latch fired from the observe's onDone callback.
+                            if (doReset || fz == 1 || tfz != 0 || dec != 0 || hs != 0
+                                    || gb != 0 || dlp != 0 || dlpArm) {
+                                root.mHandler.runWithScissors(() -> {
+                                    if (doReset) root.resetAgentStats();
+                                    if (dec == 1) root.setAgentDecoupleEnabled(true);
+                                    if (dec == -1) root.setAgentDecoupleEnabled(false);
+                                    if (dec == 2) root.setAgentDecoupleAuto();
+                                    if (hs == 1) root.setAgentHashStabilityEnabled(true);
+                                    if (hs == -1) root.setAgentHashStabilityEnabled(false);
+                                    if (gb == 1) root.setAgentPersistentNoDraw(true);
+                                    if (gb == -1) root.setAgentPersistentNoDraw(false);
+                                    if (dlp == 1) root.setAgentDlProfileEnabled(true);
+                                    if (dlp == -1) root.setAgentDlProfileEnabled(false);
+                                    if (dlpArm) root.armAgentDlProfile();
+                                    if (fz == 1) root.setAgentFrozen(true);
+                                    if (tfz == 1) root.setAgentTraversalFrozen(true);
+                                    if (tfz == -1) root.setAgentTraversalFrozen(false);
+                                }, 1000);
+                            }
+                            // A navigation can leave the previous Activity's root in
+                            // mRoots while its replacement becomes visible. Hidden
+                            // roots are not consumable observations and may no longer
+                            // have a valid surface to sync, so never start a fresh
+                            // readiness epoch on them. Persistent mode controls above
+                            // still apply to every root.
+                            if (root.getHostVisibility() != View.VISIBLE) {
+                                continue;
+                            }
+                            final java.util.concurrent.CountDownLatch done =
+                                    new java.util.concurrent.CountDownLatch(1);
+                            root.mHandler.post(() -> {
+                                if (doReadySettle) {
+                                    root.beginAgentReadyObserve(
+                                            nd, readyTimeoutMs, done::countDown);
+                                } else {
+                                    root.beginAgentObserve(nd, vf, done::countDown);
+                                }
+                            });
+                            if (!nonBlockingReadyControl) {
+                                try {
+                                    done.await(doReadySettle ? readyTimeoutMs + 1000 : 3000,
+                                            java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            }
+                            if (fz == -1) {
+                                root.mHandler.runWithScissors(
+                                        () -> root.setAgentFrozen(false), 1000);
+                            }
+                        } else {
+                            root.mHandler.runWithScissors(() -> {
+                                if (doReset) root.resetAgentStats();
+                                if (dec == 1) root.setAgentDecoupleEnabled(true);
+                                if (dec == -1) root.setAgentDecoupleEnabled(false);
+                                if (dec == 2) root.setAgentDecoupleAuto();
+                                if (hs == 1) root.setAgentHashStabilityEnabled(true);
+                                if (hs == -1) root.setAgentHashStabilityEnabled(false);
+                                if (gb == 1) root.setAgentPersistentNoDraw(true);
+                                if (gb == -1) root.setAgentPersistentNoDraw(false);
+                                if (dlp == 1) root.setAgentDlProfileEnabled(true);
+                                if (dlp == -1) root.setAgentDlProfileEnabled(false);
+                                if (dlpArm) root.armAgentDlProfile();
+                                if (fz == 1) root.setAgentFrozen(true);
+                                if (tfz == 1) root.setAgentTraversalFrozen(true);
+                                if (doFresh) root.forceTraversalForAgent(nd, vf);
+                                if (fz == -1) root.setAgentFrozen(false);
+                                if (tfz == -1) root.setAgentTraversalFrozen(false);
+                            }, 2000);
+                        }
+                    } catch (Exception e) {
+                        // Best-effort; fall through to dumping whatever is current.
+                    }
+                }
+            }
+            if (agentControl) {
+                return;
+            }
+            if (agentState) {
+                synchronized (mLock) {
+                    pw.println("Agent control state:");
+                    for (int i = 0; i < mRoots.size(); i++) {
+                        if (targetDisplay != -1
+                                && mRoots.get(i).getDisplayId() != targetDisplay) continue;
+                        pw.println(mRoots.get(i).getAgentStatsJson());
+                    }
+                }
+                return;
+            }
             synchronized (mLock) {
                 final int count = mViews.size();
+                int selectedCount = 0;
 
                 pw.println("Profile data in ms:");
 
                 for (int i = 0; i < count; i++) {
                     ViewRootImpl root = mRoots.get(i);
+                    if (targetDisplay != -1 && root.getDisplayId() != targetDisplay) continue;
+                    selectedCount++;
                     String name = getWindowName(root);
-                    pw.printf("\n\t%s (visibility=%d)", name, root.getHostVisibility());
+                    // Append agent profiling stats to the window header so the agent
+                    // can parse settled/traversal counts per window without extra RPCs.
+                    pw.printf("\n\t%s (visibility=%d)%s", name, root.getHostVisibility(),
+                            root.getAgentStatsJson());
 
-                    ThreadedRenderer renderer =
-                            root.getView().mAttachInfo.mThreadedRenderer;
+                    ThreadedRenderer renderer = root.getView() == null ? null
+                            : root.getView().mAttachInfo.mThreadedRenderer;
                     if (renderer != null) {
-                        renderer.dumpGfxInfo(pw, fd, args);
+                        // HWUI coordinates are relative to the Window Surface.
+                        // Include its screen origin for dialogs and popup windows.
+                        final Rect surfaceInsets = root.mWindowAttributes.surfaceInsets;
+                        final int surfaceOriginX = root.mWinFrame.left - surfaceInsets.left;
+                        final int surfaceOriginY = root.mWinFrame.top - surfaceInsets.top;
+                        renderer.dumpGfxInfo(
+                                pw, fd, args, surfaceOriginX, surfaceOriginY,
+                                surfaceInsets.left, surfaceInsets.top);
                     }
                 }
 
@@ -699,6 +995,7 @@ public final class WindowManagerGlobal {
 
                 for (int i = 0; i < count; i++) {
                     ViewRootImpl root = mRoots.get(i);
+                    if (targetDisplay != -1 && root.getDisplayId() != targetDisplay) continue;
                     ViewRootImpl.GfxInfo info = root.getGfxInfo();
                     totals.add(info);
 
@@ -708,7 +1005,7 @@ public final class WindowManagerGlobal {
                     pw.printf("\n\n");
                 }
 
-                pw.printf("\nTotal %-15s: %d\n", "ViewRootImpl", count);
+                pw.printf("\nTotal %-15s: %d\n", "ViewRootImpl", selectedCount);
                 pw.printf("Total %-15s: %d\n", "attached Views", totals.viewCount);
                 pw.printf("Total %-15s: %.2f kB (used) / %.2f kB (capacity)\n\n", "RenderNode",
                         totals.renderNodeMemoryUsage / 1024.0f,

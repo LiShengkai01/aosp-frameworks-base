@@ -201,6 +201,14 @@ public:
     std::mutex& profilerLock() { return mFrameInfoMutex; }
 
     void dumpFrames(int fd);
+    void dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                         int surfaceInsetX, int surfaceInsetY);
+
+    // Layer-3 stability detection (C3): compute a cheap 64-bit fingerprint of the
+    // agent-consumable semantic content (text glyphs + device-space layout bounds)
+    // of the current frame. Stable under cosmetic churn (color/spinner/jitter);
+    // changes when text or layout changes. Runs on the RenderThread.
+    uint64_t computeSemanticHash();
     void resetFrameStats();
 
     void setName(const std::string&& name);
@@ -285,6 +293,7 @@ public:
     void setRtAnimationsEnabled(bool enabled) { mEnableRTAnimations = enabled; }
 
 private:
+    SkISize getObservationSize() const;
     CanvasContext(RenderThread& thread, bool translucent, RenderNode* rootRenderNode,
                   IContextFactory* contextFactory, std::unique_ptr<IRenderPipeline> renderPipeline,
                   pid_t uiThreadId, pid_t renderThreadId);

@@ -7951,6 +7951,18 @@ package android.app {
     field @NonNull public static final android.os.Parcelable.Creator<android.app.SearchableInfo> CREATOR;
   }
 
+  @FlaggedApi("android.app.second_ui_operation_control") public final class SecondUiBridge {
+    method public static int getAbiVersion();
+    method @NonNull public static String[] getCapabilities();
+    method @NonNull public static String registerContract(@NonNull String);
+    method public static void setCoordinationEnabled(boolean);
+    method @MainThread public static long submitMain(@NonNull String, @NonNull Runnable, @Nullable android.app.SecondUiBridge.CompletionListener);
+  }
+
+  @FlaggedApi("android.app.second_ui_operation_control") public static interface SecondUiBridge.CompletionListener {
+    method @MainThread public void onComplete(long, @Nullable Throwable);
+  }
+
   public abstract class Service extends android.content.ContextWrapper implements android.content.ComponentCallbacks2 {
     ctor public Service();
     method protected void dump(java.io.FileDescriptor, java.io.PrintWriter, String[]);

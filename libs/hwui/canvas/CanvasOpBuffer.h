@@ -120,6 +120,7 @@ public:
     }
 
     void output(std::ostream& output, uint32_t level) const;
+    void exportOps(std::ostream& output, uint32_t level) const;
 
 private:
     struct Contains {

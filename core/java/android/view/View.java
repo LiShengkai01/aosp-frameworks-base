@@ -21773,8 +21773,9 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
     public void postOnAnimation(Runnable action) {
         final AttachInfo attachInfo = mAttachInfo;
         if (attachInfo != null) {
-            attachInfo.mViewRootImpl.mChoreographer.postCallback(
-                    Choreographer.CALLBACK_ANIMATION, action, null);
+            attachInfo.mViewRootImpl.mChoreographer.postCallbackDelayedForSecondUi(
+                    Choreographer.CALLBACK_ANIMATION, action, null, 0,
+                    attachInfo.mViewRootImpl.peekSecondUiOwner());
         } else {
             // Postpone the runnable until we know
             // on which thread it needs to run.
@@ -21797,8 +21798,9 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
     public void postOnAnimationDelayed(Runnable action, long delayMillis) {
         final AttachInfo attachInfo = mAttachInfo;
         if (attachInfo != null) {
-            attachInfo.mViewRootImpl.mChoreographer.postCallbackDelayed(
-                    Choreographer.CALLBACK_ANIMATION, action, null, delayMillis);
+            attachInfo.mViewRootImpl.mChoreographer.postCallbackDelayedForSecondUi(
+                    Choreographer.CALLBACK_ANIMATION, action, null, delayMillis,
+                    attachInfo.mViewRootImpl.peekSecondUiOwner());
         } else {
             // Postpone the runnable until we know
             // on which thread it needs to run.
@@ -24305,6 +24307,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
     @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.R, trackingBug = 170729553)
     public RenderNode updateDisplayListIfDirty() {
         final RenderNode renderNode = mRenderNode;
+        boolean agentDisplayListRecorded = false;
         if (!canHaveDisplayList()) {
             // can't populate RenderNode, don't try
             return renderNode;
@@ -24376,6 +24379,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
             } finally {
                 renderNode.endRecording();
                 setDisplayListProperties(renderNode);
+                agentDisplayListRecorded = true;
             }
         } else {
             if ((mPrivateFlags4 & PFLAG4_HAS_VIEW_PROPERTY_INVALIDATION)
@@ -24391,6 +24395,10 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
         }
         mPrivateFlags4 &= ~PFLAG4_HAS_MOVED;
         mFrameContentVelocity = -1;
+        // The current RenderNode is closed here. An ancestor RecordingCanvas may remain on the
+        // stack; allowing a foreground frame at this boundary is the aggressive checkpoint whose
+        // reentrancy and latency are evaluated by the node-checkpoint experiment.
+        ViewRootImpl.agentNodeCheckpoint(this, agentDisplayListRecorded);
         return renderNode;
     }
 
@@ -26127,6 +26135,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
         }
 
         notifyAppearedOrDisappearedForContentCaptureIfNeeded(true);
+        ViewRootImpl.agentNodeCheckpoint(this);
     }
 
     private boolean hasParentWantsFocus() {
@@ -28866,6 +28875,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback,
 
         mMeasureCache.put(key, ((long) mMeasuredWidth) << 32 |
                 (long) mMeasuredHeight & 0xffffffffL); // suppress sign extension
+        ViewRootImpl.agentNodeCheckpoint(this);
     }
 
     /**

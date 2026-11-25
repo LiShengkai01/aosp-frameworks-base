@@ -18,6 +18,7 @@
 
 #include <apex/window.h>
 #include <com_android_graphics_libgui_flags.h>
+#include <cstdio>
 #include <fcntl.h>
 
 #include "system/window.h"
@@ -53,6 +54,9 @@
 #endif
 #include "pipeline/skia/SkiaOpenGLPipeline.h"
 #include "pipeline/skia/SkiaVulkanPipeline.h"
+#include "pipeline/skia/RenderNodeDrawable.h"
+#include "pipeline/skia/FlatExportOpsCanvas.h"
+#include "pipeline/skia/SemanticHashCanvas.h"
 #include "thread/CommonPool.h"
 #include "utils/GLUtils.h"
 #include "utils/TimeUtils.h"
@@ -72,13 +76,16 @@ namespace renderthread {
 namespace {
 class ScopedActiveContext {
 public:
-    ScopedActiveContext(CanvasContext* context) { sActiveContext = context; }
+    ScopedActiveContext(CanvasContext* context) : mPreviousContext(sActiveContext) {
+        sActiveContext = context;
+    }
 
-    ~ScopedActiveContext() { sActiveContext = nullptr; }
+    ~ScopedActiveContext() { sActiveContext = mPreviousContext; }
 
     static CanvasContext* getActiveContext() { return sActiveContext; }
 
 private:
+    CanvasContext* mPreviousContext;
     static CanvasContext* sActiveContext;
 };
 
@@ -508,7 +515,7 @@ void CanvasContext::prepareTree(TreeInfo& info, int64_t* uiFrameInfo, int64_t sy
     mRenderThread.removeFrameCallback(this);
 
     // Make sure we have a valid device info
-    if (!DeviceInfo::get()->hasMaxTextureSize()) {
+    if (!info.syncOnly && !DeviceInfo::get()->hasMaxTextureSize()) {
         (void)mRenderThread.requireGrContext();
     }
 
@@ -568,10 +575,16 @@ void CanvasContext::prepareTree(TreeInfo& info, int64_t* uiFrameInfo, int64_t sy
     mAnimationContext->runRemainingAnimations(info);
     GL_CHECKPOINT(MODERATE);
 
+    mIsDirty = true;
+    if (info.syncOnly) {
+        // No buffer reservation or RT-only follow-up frame is needed for a DL
+        // contract. Invalidate delayed image callbacks posted by an older frame.
+        mGenerationID++;
+        mCurrentFrameInfo->setSkippedFrameReason(SkippedFrameReason::DrawingOff);
+        return;
+    }
     freePrefetchedLayers();
     GL_CHECKPOINT(MODERATE);
-
-    mIsDirty = true;
 
     if (CC_UNLIKELY(!hasOutputTarget())) {
         info.out.skippedFrameReason = SkippedFrameReason::NoOutputTarget;
@@ -1212,6 +1225,92 @@ DeferredLayerUpdater* CanvasContext::createTextureLayer() {
 void CanvasContext::dumpFrames(int fd) {
     mJankTracker.dumpStats(fd);
     mJankTracker.dumpFrames(fd);
+}
+
+SkISize CanvasContext::getObservationSize() const {
+    // A sync-only first observation never reaches draw()/computeDirtyRect(),
+    // which initialize mLastFrameWidth/Height. ThreadedRenderer::setup() has
+    // already set the root's right/bottom to the current surface dimensions;
+    // prepareTree() promotes these properties even without a GPU frame. Use
+    // these active bounds for initial and resized windows, without acquiring
+    // a buffer or changing the renderer's last-presented-frame bookkeeping.
+    if (!mRenderNodes.empty()) {
+        const auto& root = mRenderNodes.front()->properties();
+        const int width = static_cast<int>(root.getRight());
+        const int height = static_cast<int>(root.getBottom());
+        if (width > 0 && height > 0) return SkISize::Make(width, height);
+    }
+    return SkISize::Make(std::max(mLastFrameWidth, 1), std::max(mLastFrameHeight, 1));
+}
+
+void CanvasContext::dumpDisplayList(int fd, int surfaceOriginX, int surfaceOriginY,
+                                    int surfaceInsetX, int surfaceInsetY) {
+    // Replay ops (e.g. non-antialiased DrawPoints) consult the active context
+    // for pixel snapping, even when the target canvas does not rasterize.
+    ScopedActiveContext activeContext(this);
+    // Preserve normal node ordering/transforms, but expand cached RenderLayers
+    // into their active commands. Normal GPU replay can replace them with image
+    // snapshots and would hide their text from a command observer.
+    const SkISize size = getObservationSize();
+    const int width = size.width(), height = size.height();
+    std::ostringstream oss;
+    oss << "{\"frame\":\"flat_render\",\"width\":" << width
+        << ",\"height\":" << height
+        << ",\"exportVersion\":2,\"layerContent\":\"active_commands\""
+        << ",\"coordinateSpace\":\"screen\""
+        << ",\"surfaceOrigin\":[" << surfaceOriginX << "," << surfaceOriginY << "]"
+        << ",\"surfaceInsets\":[" << surfaceInsetX << "," << surfaceInsetY << "]"
+        << ",\"surfaceBoundsOnScreen\":[" << surfaceOriginX << "," << surfaceOriginY
+        << "," << surfaceOriginX + width
+        << "," << surfaceOriginY + height << "]"
+        << ",\"nodes\":[";
+
+    bool firstNode = true;
+    for (const sp<RenderNode>& node : mRenderNodes) {
+        if (!firstNode) oss << ",";
+        firstNode = false;
+        oss << "{\"name\":\"";
+        skiapipeline::FlatExportOpsCanvas::writeEscaped(oss, node->getName());
+        oss << "\",\"ops\":[";
+        if (!node->nothingToDraw()) {
+            // Create a FlatExportOpsCanvas with frame dimensions. SkCanvas with
+            // explicit dimensions creates a "no-draw" canvas where draw ops
+            // route through onDraw* virtuals (our overrides) without any GPU
+            // rasterization.
+            skiapipeline::FlatExportOpsCanvas canvas(
+                    oss, width, height,
+                    surfaceOriginX - surfaceInsetX,
+                    surfaceOriginY - surfaceInsetY);
+            // Wrap the RenderNode in a RenderNodeDrawable and force-draw onto
+            // our canvas. forceDraw() is what SkiaPipeline uses internally;
+            // it handles RenderLayer composition and recursively renders
+            // child RenderNodes by calling canvas->drawDrawable(child), which
+            // our FlatExportOpsCanvas captures as nested drawDrawable ops.
+            skiapipeline::RenderNodeDrawable drawable(node.get(), &canvas, false);
+            drawable.forceDrawForObservation(&canvas);
+        }
+        oss << "]}";
+    }
+    oss << "]}\n";
+    std::string result = oss.str();
+    dprintf(fd, "%s", result.c_str());
+}
+
+uint64_t CanvasContext::computeSemanticHash() {
+    ScopedActiveContext activeContext(this);
+    // Walk the same RenderNode tree as dumpDisplayList(), but fold only the
+    // agent-stable semantic content (text glyphs + device-space layout bounds)
+    // into a 64-bit fingerprint without JSON serialization.
+    const SkISize size = getObservationSize();
+    skiapipeline::SemanticHashCanvas canvas(size.width(), size.height());
+    for (const sp<RenderNode>& node : mRenderNodes) {
+        if (node->nothingToDraw()) {
+            continue;
+        }
+        skiapipeline::RenderNodeDrawable drawable(node.get(), &canvas, false);
+        drawable.forceDrawForObservation(&canvas);
+    }
+    return canvas.hash();
 }
 
 void CanvasContext::resetFrameStats() {

@@ -1026,6 +1026,63 @@ public class HardwareRenderer {
     }
 
     /**
+     * Dumps the current DisplayList ops as structured JSON to the given file descriptor.
+     * This outputs the raw rendering operations (drawRect, drawText, drawImage, etc.)
+     * with full parameters, not the View tree or accessibility information.
+     * @hide
+     */
+    public void dumpDisplayList(FileDescriptor fd) {
+        dumpDisplayList(fd, 0, 0);
+    }
+
+    /**
+     * Dumps the current DisplayList in global logical-screen coordinates.
+     *
+     * @param surfaceOriginX x coordinate of the rendering surface on screen
+     * @param surfaceOriginY y coordinate of the rendering surface on screen
+     * @hide
+     */
+    public void dumpDisplayList(FileDescriptor fd, int surfaceOriginX, int surfaceOriginY) {
+        dumpDisplayList(fd, surfaceOriginX, surfaceOriginY, 0, 0);
+    }
+
+    /**
+     * Dumps the current DisplayList in global logical-screen coordinates.
+     *
+     * @param surfaceOriginX x coordinate of the rendering surface on screen
+     * @param surfaceOriginY y coordinate of the rendering surface on screen
+     * @param surfaceInsetX left inset applied while recording the root DisplayList
+     * @param surfaceInsetY top inset applied while recording the root DisplayList
+     * @hide
+     */
+    public void dumpDisplayList(FileDescriptor fd, int surfaceOriginX, int surfaceOriginY,
+            int surfaceInsetX, int surfaceInsetY) {
+        nDumpDisplayList(mNativeProxy, fd, surfaceOriginX, surfaceOriginY,
+                surfaceInsetX, surfaceInsetY);
+    }
+
+    /**
+     * Layer-3 stability detection (C3): returns a 64-bit fingerprint of the
+     * agent-consumable semantic content (text glyphs + device-space layout bounds)
+     * of the last recorded frame. Stable under cosmetic churn; changes when text
+     * or layout changes. Runs synchronously on the RenderThread.
+     * @hide
+     */
+    public long computeSemanticHash() {
+        return nComputeSemanticHash(mNativeProxy);
+    }
+
+    /**
+     * Marks the next frame to sync the staging DisplayList to active but skip the
+     * GPU draw (zero GPU/SurfaceFlinger work). Used by the agent no-draw path so a
+     * forced traversal updates the DisplayList without rasterizing.
+     * @hide
+     */
+    public void setSyncOnlyNextFrame() {
+        nSetSyncOnlyNextFrame(mNativeProxy);
+    }
+
+    /**
      * To avoid unnecessary overdrawing of the main content all additionally passed render nodes
      * will be prevented to overdraw this area. It will be synchronized with the draw call.
      * This should be updated in the content view's draw call.
@@ -1879,6 +1936,11 @@ public class HardwareRenderer {
 
     private static native void nDumpProfileInfo(long nativeProxy, FileDescriptor fd,
             @DumpFlags int dumpFlags);
+
+    private static native void nDumpDisplayList(long nativeProxy, FileDescriptor fd,
+            int surfaceOriginX, int surfaceOriginY, int surfaceInsetX, int surfaceInsetY);
+    private static native long nComputeSemanticHash(long nativeProxy);
+    private static native void nSetSyncOnlyNextFrame(long nativeProxy);
 
     private static native void nDumpGlobalProfileInfo(FileDescriptor fd, @DumpFlags int dumpFlags);
 

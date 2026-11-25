@@ -693,15 +693,33 @@ public final class ThreadedRenderer extends HardwareRenderer {
 
     /** @hide */
     public static void handleDumpGfxInfo(FileDescriptor fd, String[] args) {
-        dumpGlobalProfileInfo(fd, dumpArgsToFlags(args));
+        boolean agentCommand = false;
+        for (String arg : args) {
+            if ("agentctl".equals(arg) || "agentstate".equals(arg)) {
+                agentCommand = true;
+                break;
+            }
+        }
+        if (!agentCommand) {
+            dumpGlobalProfileInfo(fd, dumpArgsToFlags(args));
+        }
         WindowManagerGlobal.getInstance().dumpGfxInfo(fd, args);
     }
 
     /**
      * Outputs extra debugging information in the specified file descriptor.
      */
-    void dumpGfxInfo(PrintWriter pw, FileDescriptor fd, String[] args) {
+    void dumpGfxInfo(PrintWriter pw, FileDescriptor fd, String[] args,
+            int surfaceOriginX, int surfaceOriginY, int surfaceInsetX, int surfaceInsetY) {
         pw.flush();
+        // Check if displaylist dump is requested: 'dumpsys gfxinfo <pkg> displaylist'
+        for (String arg : args) {
+            if ("displaylist".equals(arg)) {
+                dumpDisplayList(fd, surfaceOriginX, surfaceOriginY,
+                        surfaceInsetX, surfaceInsetY);
+                return;
+            }
+        }
         dumpProfileInfo(fd, dumpArgsToFlags(args));
     }
 
@@ -824,6 +842,48 @@ public final class ThreadedRenderer extends HardwareRenderer {
      * @param view The view to draw.
      * @param attachInfo AttachInfo tied to the specified view.
      */
+    /**
+     * Agent no-draw sync: record the View tree's DisplayList and sync it to the
+     * RenderThread (staging->active) but skip the GPU draw. Mirrors {@link #draw}
+     * minus the actual frame draw, giving an up-to-date DisplayList with zero
+     * GPU/SurfaceFlinger work.
+     */
+    void syncForAgent(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
+        final ViewRootImpl root = attachInfo.mViewRootImpl;
+        final boolean profileDlReadiness = root.isAgentDlProfileRecordingActive();
+        root.mViewFrameInfo.markDrawStart();
+        if (profileDlReadiness) {
+            root.agentDlProfileOnRecordPassBegin();
+        }
+        final long recordStartNanos = profileDlReadiness ? System.nanoTime() : 0;
+        updateRootDisplayList(view, callbacks);
+        if (profileDlReadiness) {
+            root.agentDlProfileOnRecordPassComplete(
+                    mRootNode.hasDisplayList(), view.getUniqueDrawingId(),
+                    System.nanoTime() - recordStartNanos);
+        }
+        if (attachInfo.mPendingAnimatingRenderNodes != null) {
+            final int count = attachInfo.mPendingAnimatingRenderNodes.size();
+            for (int i = 0; i < count; i++) {
+                registerAnimatingRenderNode(
+                        attachInfo.mPendingAnimatingRenderNodes.get(i));
+            }
+            attachInfo.mPendingAnimatingRenderNodes.clear();
+            attachInfo.mPendingAnimatingRenderNodes = null;
+        }
+        final FrameInfo frameInfo = root.getUpdatedFrameInfo();
+        // Skip GPU draw; the DrawFrameTask still runs syncFrameState which pushes the
+        // staging DisplayList to active.
+        setSyncOnlyNextFrame();
+        final long syncStartNanos = profileDlReadiness ? System.nanoTime() : 0;
+        final int syncResult = syncAndDrawFrame(frameInfo);
+        root.agentOnSyncForAgentComplete(mRootNode.hasDisplayList(), syncResult);
+        if (profileDlReadiness) {
+            root.agentDlProfileOnActiveSyncComplete(
+                    syncResult, System.nanoTime() - syncStartNanos);
+        }
+    }
+
     void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
         attachInfo.mViewRootImpl.mViewFrameInfo.markDrawStart();
 

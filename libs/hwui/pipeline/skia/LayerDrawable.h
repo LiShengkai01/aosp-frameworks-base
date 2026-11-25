@@ -30,6 +30,7 @@ namespace skiapipeline {
  */
 class LayerDrawable : public SkDrawable {
 public:
+    const char* getTypeName() const override { return "LayerDrawable"; }
     explicit LayerDrawable(DeferredLayerUpdater* layerUpdater) : mLayerUpdater(layerUpdater) {}
 
     static bool DrawLayer(GrRecordingContext* context,

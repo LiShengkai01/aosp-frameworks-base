@@ -18,6 +18,9 @@ package android.view;
 
 import static android.view.flags.Flags.bufferStuffingMultiRecovery;
 import static android.view.flags.Flags.bufferStuffingRecoveryThreshold;
+
+import com.android.internal.secondui.SecondUiOwner;
+import com.android.internal.secondui.SecondUiMainScheduler;
 import static android.view.flags.Flags.FLAG_EXPECTED_PRESENTATION_TIME_API;
 
 import android.annotation.FlaggedApi;
@@ -31,6 +34,7 @@ import android.graphics.Insets;
 import android.hardware.display.DisplayManagerGlobal;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 import android.os.SystemClock;
@@ -43,6 +47,8 @@ import android.util.TimeUtils;
 import android.view.animation.AnimationUtils;
 
 import com.android.internal.annotations.VisibleForTesting;
+
+import com.android.internal.annotations.GuardedBy;
 
 import java.io.PrintWriter;
 import java.util.Locale;
@@ -205,6 +211,9 @@ public final class Choreographer {
     private final FrameDisplayEventReceiver mDisplayEventReceiver;
 
     private CallbackRecord mCallbackPool;
+    private SecondUiOwner mAgentFrameOwner;
+    private boolean mSecondUiInFrame;
+    private long mSecondUiCheckpointOwnershipViolations;
 
     @UnsupportedAppUsage
     private final CallbackQueue[] mCallbackQueues;
@@ -229,7 +238,7 @@ public final class Choreographer {
     private int mFPSDivisor = 1;
     private final DisplayEventReceiver.VsyncEventData mLastVsyncEventData =
             new DisplayEventReceiver.VsyncEventData();
-    private final FrameData mFrameData = new FrameData();
+    private FrameData mFrameData = new FrameData();
     private volatile boolean mInDoFrameCallback = false;
 
     private static class BufferStuffingState {
@@ -386,6 +395,31 @@ public final class Choreographer {
         setFPSDivisor(SystemProperties.getInt(ThreadedRenderer.DEBUG_FPS_DIVISOR, 1));
     }
 
+    // Agent node-checkpoint prototype. A receiver on the main Looper cannot publish VSYNC
+    // while an agent traversal occupies that Looper, so a side receiver mirrors requested
+    // app VSYNCs into this mailbox. Only the main thread consumes the mailbox.
+    private HandlerThread mAgentCheckpointVsyncThread;
+    private AgentCheckpointDisplayEventReceiver mAgentCheckpointDisplayEventReceiver;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointTraversalActive;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointVsyncScheduled;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointVsyncPending;
+    @GuardedBy("mLock")
+    private boolean mAgentCheckpointFrameDispatching;
+    @GuardedBy("mLock")
+    private long mAgentCheckpointVsyncTimestampNanos;
+    @GuardedBy("mLock")
+    private int mAgentCheckpointVsyncFrame;
+    @GuardedBy("mLock")
+    private final DisplayEventReceiver.VsyncEventData mAgentCheckpointVsyncEventData =
+            new DisplayEventReceiver.VsyncEventData();
+    @GuardedBy("mLock")
+    private long mLastAgentCheckpointVsyncId = FrameInfo.INVALID_VSYNC_ID;
+    @GuardedBy("mLock")
+    private long mLastAgentCheckpointVsyncTimestampNanos = Long.MIN_VALUE;
+
     @RavenwoodReplace(blockedBy = DisplayManagerGlobal.class,
             reason = "just use fixed refresh rate")
     private static float getRefreshRate() {
@@ -459,6 +493,28 @@ public final class Choreographer {
 
     private void dispose() {
         mDisplayEventReceiver.dispose();
+        final AgentCheckpointDisplayEventReceiver checkpointReceiver;
+        final HandlerThread checkpointThread;
+        synchronized (mLock) {
+            checkpointReceiver = mAgentCheckpointDisplayEventReceiver;
+            checkpointThread = mAgentCheckpointVsyncThread;
+            mAgentCheckpointDisplayEventReceiver = null;
+            mAgentCheckpointVsyncThread = null;
+            mAgentCheckpointTraversalActive = false;
+            mAgentCheckpointVsyncPending = false;
+            for (CallbackQueue queue : mCallbackQueues) {
+                if (queue.hasDuePhysicalCallbacksLocked(SystemClock.uptimeMillis())) {
+                    mFrameScheduled = true;
+                    break;
+                }
+            }
+        }
+        if (checkpointReceiver != null) {
+            checkpointReceiver.dispose();
+        }
+        if (checkpointThread != null) {
+            checkpointThread.quitSafely();
+        }
     }
 
     /**
@@ -621,6 +677,30 @@ public final class Choreographer {
 
     private void postCallbackDelayedInternal(int callbackType,
             Object action, Object token, long delayMillis) {
+        postCallbackDelayedForSecondUi(callbackType, action, token, delayMillis,
+                null); // Generic callbacks may belong to a shared AnimationHandler.
+    }
+
+    /**
+     * Owner-tagged Android 17 VSync callbacks retain their native dispatch token.
+     *
+     * @hide
+     */
+    public void postVsyncCallbackForSecondUi(int callbackType, VsyncCallback callback,
+            SecondUiOwner owner) {
+        postCallbackDelayedForSecondUi(callbackType, callback, VSYNC_CALLBACK_TOKEN, 0, owner);
+    }
+
+    /**
+     * Explicit owner tagging also supports posting from a worker thread.
+     *
+     * @hide
+     */
+    public void postCallbackDelayedForSecondUi(int callbackType, Object action, Object token,
+            long delayMillis, SecondUiOwner owner) {
+        if (action == null || callbackType < 0 || callbackType > CALLBACK_COMMIT) {
+            throw new IllegalArgumentException("Invalid callback");
+        }
         if (DEBUG_FRAMES) {
             Log.d(TAG, "PostCallback: type=" + callbackType
                     + ", action=" + action + ", token=" + token
@@ -630,7 +710,17 @@ public final class Choreographer {
         synchronized (mLock) {
             final long now = SystemClock.uptimeMillis();
             final long dueTime = now + delayMillis;
-            mCallbackQueues[callbackType].addCallbackLocked(dueTime, action, token);
+            if (mAgentCheckpointFrameDispatching && owner == null && dueTime <= now) {
+                // This violates the opt-in callback-closure contract. Keep the work for
+                // normal dispatch, mark this trial invalid, and disable subsequent yields.
+                mSecondUiCheckpointOwnershipViolations++;
+            }
+            mCallbackQueues[callbackType].addCallbackLocked(dueTime, action, token, owner);
+            if (owner != null && owner.agent && owner.managedFrames) {
+                // This only schedules a future owner trigger; it never executes View code here.
+                mHandler.postDelayed(owner::requestFrame, Math.max(0, delayMillis));
+                return;
+            }
 
             if (dueTime <= now) {
                 scheduleFrameLocked(now);
@@ -1103,6 +1193,8 @@ public final class Choreographer {
                 break;
         }
 
+        final boolean previousInFrame = mSecondUiInFrame;
+        mSecondUiInFrame = true;
         try {
             FrameTimeline timeline = mFrameData.update(offsetFrameTimeNanos, vsyncEventData);
             if (Trace.isTagEnabled(Trace.TRACE_TAG_VIEW)) {
@@ -1200,6 +1292,7 @@ public final class Choreographer {
 
             mFrameInfo.markInputHandlingStart();
             doCallbacks(Choreographer.CALLBACK_INPUT);
+            if (!mAgentCheckpointFrameDispatching) SecondUiMainScheduler.onInputPhaseEnd();
 
             mFrameInfo.markAnimationsStart();
             doCallbacks(Choreographer.CALLBACK_ANIMATION);
@@ -1210,6 +1303,7 @@ public final class Choreographer {
 
             doCallbacks(Choreographer.CALLBACK_COMMIT);
         } finally {
+            mSecondUiInFrame = previousInFrame;
             AnimationUtils.unlockAnimationClock();
             mInDoFrameCallback = false;
             if (resynced) {
@@ -1228,6 +1322,7 @@ public final class Choreographer {
 
     void doCallbacks(int callbackType) {
         CallbackRecord callbacks;
+        final boolean callbacksWereRunning = mCallbacksRunning;
         long frameTimeNanos = mFrameData.mFrameTimeNanos;
         synchronized (mLock) {
             // We use "now" to determine when callbacks become due because it's possible
@@ -1235,7 +1330,7 @@ public final class Choreographer {
             // in a following phase, such as an input event that causes an animation to start.
             final long now = System.nanoTime();
             callbacks = mCallbackQueues[callbackType].extractDueCallbacksLocked(
-                    now / TimeUtils.NANOS_PER_MS);
+                    now / TimeUtils.NANOS_PER_MS, mAgentFrameOwner, mAgentCheckpointFrameDispatching);
             if (callbacks == null) {
                 return;
             }
@@ -1249,11 +1344,13 @@ public final class Choreographer {
                             + ", action=" + c.action + ", token=" + c.token
                             + ", latencyMillis=" + (SystemClock.uptimeMillis() - c.dueTime));
                 }
-                c.run(mFrameData);
+                final CallbackRecord current = c;
+                if (c.owner == null) c.run(mFrameData);
+                else if (c.owner.alive()) c.owner.run(() -> current.run(mFrameData));
             }
         } finally {
             synchronized (mLock) {
-                mCallbacksRunning = false;
+                mCallbacksRunning = callbacksWereRunning;
                 do {
                     final CallbackRecord next = callbacks.next;
                     recycleCallbackLocked(callbacks);
@@ -1262,6 +1359,201 @@ public final class Choreographer {
             }
             Trace.traceEnd(Trace.TRACE_TAG_VIEW);
         }
+    }
+
+    /**
+     * Owner-scoped update; never consumes another root's callbacks or physical VSYNC.
+     *
+     * @hide
+     */
+    public void doFrameForAgent(SecondUiOwner owner, long intervalNanos) {
+        owner.checkThread();
+        if (mAgentFrameOwner != null || mCallbacksRunning || mSecondUiInFrame) {
+            throw new IllegalStateException("Agent frame cannot reenter another frame");
+        }
+        final FrameData savedData = mFrameData;
+        final long savedFrameTime = mLastFrameTimeNanos;
+        final long savedInterval = mLastFrameIntervalNanos;
+        mAgentFrameOwner = owner;
+        mFrameData = new FrameData();
+        DisplayEventReceiver.VsyncEventData data = new DisplayEventReceiver.VsyncEventData();
+        data.frameInterval = intervalNanos;
+        final long now = System.nanoTime();
+        mFrameData.update(now, data);
+        mLastFrameTimeNanos = now;
+        mLastFrameIntervalNanos = intervalNanos;
+        try {
+            // Extract each phase at its own boundary, including Insets and Commit.
+            for (int phase = CALLBACK_INPUT; phase <= CALLBACK_COMMIT; phase++) {
+                doCallbacks(phase);
+            }
+        } finally {
+            mAgentFrameOwner = null;
+            mFrameData = savedData;
+            mLastFrameTimeNanos = savedFrameTime;
+            mLastFrameIntervalNanos = savedInterval;
+        }
+    }
+
+    /**
+     * Used only after the Looper has dispatched due messages.
+     *
+     * @hide
+     */
+    public boolean isForegroundFrameDueForSecondUi() {
+        synchronized (mLock) {
+            return mAgentCheckpointVsyncPending
+                    || mDisplayEventReceiver != null && mDisplayEventReceiver.mHavePendingVsync
+                    || mFrameScheduled && mLastFrameIntervalNanos > 0
+                    && System.nanoTime() >= mLastFrameTimeNanos + mLastFrameIntervalNanos;
+        }
+    }
+
+    /**
+     * Whether a frame is currently scheduled on this (shared, per-thread) Choreographer.
+     * Used by the agent on-demand idle-driven settle to yield to the foreground: if a
+     * foreground frame is pending, the agent defers its next settle pass.
+     * @hide
+     */
+    public boolean isFrameScheduledForAgentCheck() {
+        synchronized (mLock) {
+            return mFrameScheduled;
+        }
+    }
+
+    /**
+     * Begin an agent traversal that may service an arrived foreground VSYNC inline.
+     *
+     * @hide
+     */
+    public void beginAgentNodeCheckpointTraversal() {
+        ensureAgentCheckpointDisplayEventReceiver();
+        synchronized (mLock) {
+            mAgentCheckpointTraversalActive = true;
+            mAgentCheckpointVsyncPending = false;
+            // Keep the side receiver subscribed while the agent owns the main Looper. A frame
+            // request posted from another thread cannot run MSG_DO_SCHEDULE_VSYNC until the
+            // traversal returns, but it does set mFrameScheduled under mLock immediately.
+            scheduleAgentCheckpointVsyncLocked();
+        }
+    }
+
+    /**
+     * End an agent node-checkpoint traversal and restore the vanilla VSYNC path.
+     *
+     * @hide
+     */
+    public void endAgentNodeCheckpointTraversal() {
+        synchronized (mLock) {
+            mAgentCheckpointTraversalActive = false;
+            mAgentCheckpointVsyncPending = false;
+            for (CallbackQueue queue : mCallbackQueues) {
+                if (queue.hasDuePhysicalCallbacksLocked(SystemClock.uptimeMillis())) {
+                    mFrameScheduled = true;
+                    break;
+                }
+            }
+            if (mFrameScheduled && mDisplayEventReceiver != null) {
+                mDisplayEventReceiver.scheduleVsync();
+            }
+        }
+    }
+
+    /**
+     * Runs one already-arrived foreground frame while preserving the caller's agent traversal
+     * stack. This is deliberately a frame-only pump; it does not dispatch arbitrary Looper work.
+     * @hide
+     */
+    public boolean doFrameAtAgentNodeCheckpoint() {
+        return doFrameAtAgentNodeCheckpoint(0);
+    }
+
+    private long mLastAgentCheckpointDispatchNanos;
+
+    long getLastAgentCheckpointDispatchNanos() {
+        return mLastAgentCheckpointDispatchNanos;
+    }
+
+    boolean doFrameAtAgentNodeCheckpoint(long profileEntryNanos) {
+        final long timestampNanos;
+        final int frame;
+        final DisplayEventReceiver.VsyncEventData data;
+        synchronized (mLock) {
+            if (!mAgentCheckpointTraversalActive || mAgentCheckpointFrameDispatching
+                    || mAgentFrameOwner != null || mCallbacksRunning || mSecondUiInFrame
+                    || !mAgentCheckpointVsyncPending || !mFrameScheduled) {
+                return false;
+            }
+            if (mSecondUiCheckpointOwnershipViolations != 0) return false;
+            final long now = SystemClock.uptimeMillis();
+            for (CallbackQueue queue : mCallbackQueues) {
+                // Do not report a partially executed foreground frame as a completed one.
+                if (queue.hasDueUnownedCallbacksLocked(now)) return false;
+            }
+            // Most checkpoints have no due foreground frame. Allocate the copied
+            // timeline only after admission, not once per visited view-tree node.
+            data = new DisplayEventReceiver.VsyncEventData();
+            mAgentCheckpointVsyncPending = false;
+            mAgentCheckpointFrameDispatching = true;
+            timestampNanos = mAgentCheckpointVsyncTimestampNanos;
+            frame = mAgentCheckpointVsyncFrame;
+            data.copyFrom(mAgentCheckpointVsyncEventData);
+            mLastAgentCheckpointVsyncId = data.preferredFrameTimeline().vsyncId;
+            mLastAgentCheckpointVsyncTimestampNanos = timestampNanos;
+        }
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "agentNodeCheckpoint#doFrame");
+        try {
+            if (profileEntryNanos != 0) {
+                mLastAgentCheckpointDispatchNanos = System.nanoTime() - profileEntryNanos;
+            }
+            doFrame(timestampNanos, frame, data);
+            return true;
+        } finally {
+            synchronized (mLock) {
+                mAgentCheckpointFrameDispatching = false;
+            }
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+
+    /**
+     * Nonzero means the opted-in ownership contract was violated; reject that trial.
+     *
+     * @hide
+     */
+    public long getSecondUiCheckpointOwnershipViolations() {
+        synchronized (mLock) { return mSecondUiCheckpointOwnershipViolations; }
+    }
+
+    private void ensureAgentCheckpointDisplayEventReceiver() {
+        synchronized (mLock) {
+            if (mAgentCheckpointDisplayEventReceiver != null || !USE_VSYNC) {
+                return;
+            }
+        }
+        final HandlerThread thread = new HandlerThread("AgentCheckpointVsync");
+        thread.start();
+        final AgentCheckpointDisplayEventReceiver receiver =
+                new AgentCheckpointDisplayEventReceiver(thread.getLooper());
+        synchronized (mLock) {
+            if (mAgentCheckpointDisplayEventReceiver == null) {
+                mAgentCheckpointVsyncThread = thread;
+                mAgentCheckpointDisplayEventReceiver = receiver;
+                return;
+            }
+        }
+        receiver.dispose();
+        thread.quitSafely();
+    }
+
+    @GuardedBy("mLock")
+    private void scheduleAgentCheckpointVsyncLocked() {
+        if (!mAgentCheckpointTraversalActive || mAgentCheckpointVsyncScheduled
+                || mAgentCheckpointDisplayEventReceiver == null) {
+            return;
+        }
+        mAgentCheckpointVsyncScheduled = true;
+        mAgentCheckpointDisplayEventReceiver.scheduleVsync();
     }
 
     void doScheduleVsync() {
@@ -1287,7 +1579,12 @@ public final class Choreographer {
     private void scheduleVsyncLocked() {
         try {
             Trace.traceBegin(Trace.TRACE_TAG_VIEW, "Choreographer#scheduleVsyncLocked");
-            mDisplayEventReceiver.scheduleVsync();
+            if (mAgentCheckpointTraversalActive
+                    && mAgentCheckpointDisplayEventReceiver != null) {
+                scheduleAgentCheckpointVsyncLocked();
+            } else {
+                mDisplayEventReceiver.scheduleVsync();
+            }
         } finally {
             Trace.traceEnd(Trace.TRACE_TAG_VIEW);
         }
@@ -1297,7 +1594,7 @@ public final class Choreographer {
         return Looper.myLooper() == mLooper;
     }
 
-    private CallbackRecord obtainCallbackLocked(long dueTime, Object action, Object token) {
+    private CallbackRecord obtainCallbackLocked(long dueTime, Object action, Object token, SecondUiOwner owner) {
         CallbackRecord callback = mCallbackPool;
         if (callback == null) {
             callback = new CallbackRecord();
@@ -1308,12 +1605,14 @@ public final class Choreographer {
         callback.dueTime = dueTime;
         callback.action = action;
         callback.token = token;
+        callback.owner = owner;
         return callback;
     }
 
     private void recycleCallbackLocked(CallbackRecord callback) {
         callback.action = null;
         callback.token = null;
+        callback.owner = null;
         callback.next = mCallbackPool;
         mCallbackPool = callback;
     }
@@ -1597,7 +1896,8 @@ public final class Choreographer {
                 if (Trace.isTagEnabled(Trace.TRACE_TAG_VIEW)) {
                     Trace.traceBegin(Trace.TRACE_TAG_VIEW,
                             "Choreographer#onVsync "
-                                    + vsyncEventData.preferredFrameTimeline().vsyncId);
+                                    + vsyncEventData.preferredFrameTimeline().vsyncId
+                                    + " source=" + timestampNanos);
                 }
                 // Post the vsync event to the Handler.
                 // The idea is to prevent incoming vsync events from completely starving
@@ -1637,13 +1937,52 @@ public final class Choreographer {
         @Override
         public void run() {
             mHavePendingVsync = false;
+            synchronized (mLock) {
+                final long vsyncId = mLastVsyncEventData.preferredFrameTimeline().vsyncId;
+                final boolean consumedAtAgentCheckpoint =
+                        (vsyncId != FrameInfo.INVALID_VSYNC_ID
+                                && vsyncId <= mLastAgentCheckpointVsyncId)
+                        || mTimestampNanos <= mLastAgentCheckpointVsyncTimestampNanos;
+                if (consumedAtAgentCheckpoint) {
+                    if (mFrameScheduled && !mAgentCheckpointTraversalActive) {
+                        mDisplayEventReceiver.scheduleVsync();
+                    }
+                    return;
+                }
+            }
             doFrame(mTimestampNanos, mFrame, mLastVsyncEventData);
+        }
+    }
+
+    private final class AgentCheckpointDisplayEventReceiver extends DisplayEventReceiver {
+        AgentCheckpointDisplayEventReceiver(Looper looper) {
+            super(looper, /* eventRegistration */ 0, /* layerHandle */ 0L);
+        }
+
+        @Override
+        public void onVsync(long timestampNanos, long physicalDisplayId, int frame,
+                VsyncEventData vsyncEventData) {
+            synchronized (mLock) {
+                mAgentCheckpointVsyncScheduled = false;
+                if (!mAgentCheckpointTraversalActive) {
+                    return;
+                }
+                if (mFrameScheduled) {
+                    mAgentCheckpointVsyncTimestampNanos =
+                            Math.min(timestampNanos, System.nanoTime());
+                    mAgentCheckpointVsyncFrame = frame;
+                    mAgentCheckpointVsyncEventData.copyFrom(vsyncEventData);
+                    mAgentCheckpointVsyncPending = true;
+                }
+                scheduleAgentCheckpointVsyncLocked();
+            }
         }
     }
 
     private static final class CallbackRecord {
         public CallbackRecord next;
         public long dueTime;
+        public SecondUiOwner owner;
         /** Runnable or FrameCallback or VsyncCallback object. */
         public Object action;
         /** Denotes the action type. */
@@ -1660,12 +1999,10 @@ public final class Choreographer {
 
         void run(FrameData frameData) {
             frameData.setInCallback(true);
-            if (token == VSYNC_CALLBACK_TOKEN) {
-                ((VsyncCallback) action).onVsync(frameData);
-            } else {
-                run(frameData.getFrameTimeNanos());
-            }
-            frameData.setInCallback(false);
+            try {
+                if (token == VSYNC_CALLBACK_TOKEN) ((VsyncCallback) action).onVsync(frameData);
+                else run(frameData.getFrameTimeNanos());
+            } finally { frameData.setInCallback(false); }
         }
     }
 
@@ -1676,29 +2013,43 @@ public final class Choreographer {
             return mHead != null && mHead.dueTime <= now;
         }
 
-        public CallbackRecord extractDueCallbacksLocked(long now) {
-            CallbackRecord callbacks = mHead;
-            if (callbacks == null || callbacks.dueTime > now) {
-                return null;
+        public boolean hasDueUnownedCallbacksLocked(long now) {
+            for (CallbackRecord c = mHead; c != null && c.dueTime <= now; c = c.next) {
+                if (c.owner == null) return true;
             }
+            return false;
+        }
 
-            CallbackRecord last = callbacks;
-            CallbackRecord next = last.next;
-            while (next != null) {
-                if (next.dueTime > now) {
-                    last.next = null;
-                    break;
-                }
-                last = next;
-                next = next.next;
+        public boolean hasDuePhysicalCallbacksLocked(long now) {
+            for (CallbackRecord c = mHead; c != null && c.dueTime <= now; c = c.next) {
+                if (c.owner == null || !c.owner.agent || !c.owner.managedFrames) return true;
             }
-            mHead = next;
-            return callbacks;
+            return false;
+        }
+
+        public CallbackRecord extractDueCallbacksLocked(long now, SecondUiOwner agent,
+                boolean checkpoint) {
+            CallbackRecord head = null, tail = null, previous = null;
+            for (CallbackRecord current = mHead; current != null && current.dueTime <= now;) {
+                CallbackRecord next = current.next;
+                boolean selected = agent != null ? current.owner == agent
+                        : checkpoint ? current.owner != null && !current.owner.agent
+                        : current.owner == null || !current.owner.agent
+                                || !current.owner.managedFrames;
+                if (selected) {
+                    if (previous == null) mHead = next; else previous.next = next;
+                    current.next = null;
+                    if (tail == null) head = current; else tail.next = current;
+                    tail = current;
+                } else previous = current;
+                current = next;
+            }
+            return head;
         }
 
         @UnsupportedAppUsage
-        public void addCallbackLocked(long dueTime, Object action, Object token) {
-            CallbackRecord callback = obtainCallbackLocked(dueTime, action, token);
+        public void addCallbackLocked(long dueTime, Object action, Object token, SecondUiOwner owner) {
+            CallbackRecord callback = obtainCallbackLocked(dueTime, action, token, owner);
             CallbackRecord entry = mHead;
             if (entry == null) {
                 mHead = callback;
